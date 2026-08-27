@@ -48,6 +48,9 @@ fn main() {
         udp_packet_size: 1024,
         client_runtime: 0,
         server_runtime: 0,
+        jitter_millis: 0,
+        client_jitter_millis: 0,
+        server_jitter_millis: 0,
     }));
     let stopping = Arc::new(AtomicBool::new(false));
     let running = Arc::new(AtomicBool::new(false));
@@ -90,6 +93,7 @@ fn main() {
     let mut remote = DEFAULT_REMOTE.to_string();
     let mut run_id = 0u64;
     let mut cli_mode = true;
+    let mut clean_confirmation = false;
     enable_raw_mode().expect("cannot enable terminal input");
     print_prompt(server_enabled, client_enabled, false);
     loop {
@@ -98,16 +102,42 @@ fn main() {
         }
         match event::read().unwrap() {
             Event::Key(KeyEvent {
+                code: KeyCode::Char(choice),
+                ..
+            }) if clean_confirmation => {
+                match choice.to_ascii_lowercase() {
+                    'y' => {
+                        clean_confirmation = false;
+                        match sql.clean() {
+                            Ok(()) => cli_textout::line(
+                                "local SQLite data cleaned; run ID counter preserved",
+                            ),
+                            Err(error) => cli_textout::line(format!("clean failed: {error}")),
+                        }
+                    }
+                    'n' => {
+                        clean_confirmation = false;
+                        cli_textout::line("clean cancelled");
+                    }
+                    _ => cli_textout::line("Please answer Y or N."),
+                }
+                print_prompt(
+                    server_enabled,
+                    client_enabled,
+                    running.load(Ordering::Relaxed),
+                );
+            }
+            Event::Key(KeyEvent {
                 code: KeyCode::Char('c'),
                 modifiers,
                 ..
             }) if modifiers.contains(KeyModifiers::CONTROL) => {
-                stopping.store(true, Ordering::Relaxed);
+                cli_textout::line("");
                 running.store(false, Ordering::Relaxed);
                 monitor_running.store(false, Ordering::Relaxed);
                 disable_raw_mode().ok();
                 clear_input_line();
-                println!("\nexiting\n");
+                cli_textout::line("exiting");
                 break;
             }
             Event::Key(KeyEvent {
@@ -116,7 +146,7 @@ fn main() {
                 stopping.store(true, Ordering::Relaxed);
                 running.store(false, Ordering::Relaxed);
                 cli_mode = true;
-                println!("\nstopped");
+                cli_textout::line("stopped");
                 print_prompt(server_enabled, client_enabled, false);
             }
             Event::Key(KeyEvent {
@@ -126,7 +156,7 @@ fn main() {
                 let mut out = output.lock().unwrap();
                 let _ = writeln!(out, "{}", if cli_mode { "HIDE" } else { "SHOW" });
                 let _ = out.flush();
-                print!("\r\x1b[2K\r\n");
+                cli_textout::raw("\r\x1b[2K\r\n");
                 if cli_mode {
                     print_prompt(
                         server_enabled,
@@ -142,59 +172,66 @@ fn main() {
             }) if cli_mode => {
                 let line = input.trim().to_string();
                 input.clear();
-                print!("\r\n");
+                cli_textout::raw("\r\n");
                 writeln!(cli_log, "{} {}", core::timestamp(), line).unwrap();
                 cli_log.flush().unwrap();
                 match line.split_whitespace().collect::<Vec<_>>().as_slice() {
-                    ["client"] => {
-                        println!("client: enable | disable | remote <ip> | runtime <seconds>")
-                    }
+                    ["client"] => cli_textout::line(
+                        "client: enable | disable | remote <ip> | runtime <seconds>",
+                    ),
                     ["client", "enable"] => {
                         client_enabled = true;
-                        println!("client enabled");
+                        cli_textout::line("client enabled");
                     }
                     ["client", "disable"] => {
                         client_enabled = false;
                         stopping.store(true, Ordering::Relaxed);
-                        println!("Client stopped");
+                        cli_textout::line("Client stopped");
                     }
                     ["client", "remote", host] => {
                         remote = (*host).into();
-                        println!("client remote set to {remote}");
+                        cli_textout::line(format!("client remote set to {remote}"));
                     }
                     ["client", "http", "check", url] => client_http_check(&log_dir, url),
                     ["client", "runtime", seconds] => set_runtime(&config, true, seconds),
-                    ["server"] => println!("server: enable | disable | runtime <seconds>"),
+                    ["server"] => cli_textout::line("server: enable | disable | runtime <seconds>"),
                     ["server", "enable"] => {
                         server_enabled = true;
-                        println!("server enabled");
+                        cli_textout::line("server enabled");
                     }
                     ["server", "disable"] => {
                         server_enabled = false;
                         stopping.store(true, Ordering::Relaxed);
-                        println!("Server stopped");
+                        cli_textout::line("Server stopped");
                     }
                     ["server", "runtime", seconds] => set_runtime(&config, false, seconds),
                     ["configure", rest @ ..] => match configure(&config, rest) {
-                        Ok(()) => println!("configuration updated"),
-                        Err(error) => eprintln!("configure error: {error}"),
+                        Ok(()) => cli_textout::line("configuration updated"),
+                        Err(error) => cli_textout::line(format!("configure error: {error}")),
                     },
                     ["metrics", "add", "sql", connection] => {
                         match ExternalSqlMetrics::connect(connection) {
                             Ok(sink) => {
                                 *external.lock().unwrap() = Some(Arc::new(sink));
-                                println!("external SQL metrics enabled");
+                                cli_textout::line("external SQL metrics enabled");
                             }
-                            Err(error) => eprintln!("metrics error: {error}"),
+                            Err(error) => cli_textout::line(format!("metrics error: {error}")),
                         }
                     }
                     ["monitor", "IP", target] | ["monitor", "ip", target] => {
                         let target = normalize_http_target(target);
                         *monitor_target.lock().unwrap() = Some(target.clone());
-                        println!("monitor target set to {target}");
+                        cli_textout::line(format!("monitor target set to {target}"));
                     }
                     ["selftest"] => {
                         run_selftest(&config, &stopping, &running, &metrics, &sql, &log_dir)
+                    }
+                    ["clean"] => {
+                        cli_textout::line(
+                            "Are you sure? This will delete all data from runs on this instance of netmark.",
+                        );
+                        cli_textout::line("Confirm with Y or N.");
+                        clean_confirmation = true;
                     }
                     ["monitor", "start"] => monitor_running.store(true, Ordering::Relaxed),
                     ["monitor", "stop"] => monitor_running.store(false, Ordering::Relaxed),
@@ -228,7 +265,7 @@ fn main() {
                         running.store(true, Ordering::Relaxed);
                         gate.start();
                         cli_mode = false;
-                        println!("started run {run_id}");
+                        cli_textout::line(format!("started run {run_id}"));
                     }
                     ["stop"] => {
                         stopping.store(true, Ordering::Relaxed);
@@ -236,16 +273,19 @@ fn main() {
                         cli_mode = true;
                         write_run_event(&log_dir, run_id, "Completed");
                         sql.complete_run(run_id, "ok");
-                        println!("stopped");
+                        cli_textout::line("stopped");
                     }
-                    ["status"] => println!(
-                        "{}",
-                        traffic_status(&metrics, running.load(Ordering::Relaxed))
-                    ),
+                    ["status"] => {
+                        cli_textout::line(traffic_status(&metrics, running.load(Ordering::Relaxed)))
+                    }
                     ["sql", "enable"] => match sql.enable() {
-                        Ok(()) => println!("sql enabled"),
-                        Err(error) => eprintln!("sql error: {error}"),
+                        Ok(()) => cli_textout::line("sql enabled"),
+                        Err(error) => cli_textout::line(format!("sql error: {error}")),
                     },
+                    ["sql", "disable"] => {
+                        sql.disable();
+                        cli_textout::line("local SQL disabled");
+                    }
                     ["show", "run", value] => {
                         if let Ok(id) = value.parse() {
                             let _ = sql.show_run(id);
@@ -253,12 +293,12 @@ fn main() {
                     }
                     ["list"] => match sql.list_runs() {
                         Ok(()) => {}
-                        Err(error) => eprintln!("sql error: {error}"),
+                        Err(error) => cli_textout::line(format!("sql error: {error}")),
                     },
                     ["help"] => print_help(&stdout_guard, &output),
                     ["quit"] | ["exit"] => break,
                     [] => {}
-                    _ => eprintln!("unknown command; type 'help' for commands"),
+                    _ => cli_textout::line("unknown command; type 'help' for commands"),
                 }
                 if cli_mode {
                     redraw_prompt(
@@ -274,16 +314,14 @@ fn main() {
                 ..
             }) if cli_mode && !modifiers.contains(KeyModifiers::CONTROL) => {
                 input.push(character);
-                print!("{character}");
-                io::stdout().flush().unwrap();
+                cli_textout::raw(character.to_string());
             }
             Event::Key(KeyEvent {
                 code: KeyCode::Backspace,
                 ..
             }) if cli_mode => {
                 if input.pop().is_some() {
-                    print!("\x08 \x08");
-                    io::stdout().flush().unwrap();
+                    cli_textout::raw("\x08 \x08");
                 }
             }
             _ => {}
@@ -296,7 +334,7 @@ fn main() {
     write_run_event(&log_dir, run_id, "Completed");
     sql.complete_run(run_id, "aborted");
     clear_input_line();
-    print!("\r\n");
+    cli_textout::raw("\r\n");
 }
 
 fn set_runtime(config: &Arc<Mutex<Config>>, client: bool, value: &str) {
@@ -307,9 +345,9 @@ fn set_runtime(config: &Arc<Mutex<Config>>, client: bool, value: &str) {
             } else {
                 config.lock().unwrap().server_runtime = value;
             }
-            println!("runtime set to {value} seconds");
+            cli_textout::line(format!("runtime set to {value} seconds"));
         }
-        Err(_) => eprintln!("runtime must be a non-negative integer"),
+        Err(_) => cli_textout::line("runtime must be a non-negative integer"),
     }
 }
 fn normalize_http_target(target: &str) -> String {
@@ -328,7 +366,7 @@ fn run_selftest(
     log_dir: &std::path::Path,
 ) {
     if running.swap(true, Ordering::Relaxed) {
-        println!("already running");
+        cli_textout::line("already running");
         return;
     }
     let run_id = sql.next_run_id(1);
@@ -337,8 +375,8 @@ fn run_selftest(
         config.packet_type = PacketType::Udp;
         config.rate = 1;
         config.udp_packet_size = 1024;
-        config.client_runtime = 1;
-        config.server_runtime = 1;
+        config.client_runtime = 10;
+        config.server_runtime = 10;
     }
     stopping.store(false, Ordering::Relaxed);
     metrics.snapshot();
@@ -361,21 +399,35 @@ fn run_selftest(
     );
     sql.start_run(run_id);
     gate.start();
-    println!("selftest started run {run_id}");
+    cli_textout::line(format!("selftest started run {run_id}"));
     let stop = Arc::clone(stopping);
     let state = Arc::clone(running);
     let sql_state = Arc::clone(sql);
     let logs = log_dir.to_path_buf();
     thread::spawn(move || {
-        thread::sleep(Duration::from_secs(2));
+        thread::sleep(Duration::from_secs(11));
         stop.store(true, Ordering::Relaxed);
         state.store(false, Ordering::Relaxed);
         sql_state.complete_run(run_id, "ok");
         write_run_event(&logs, run_id, "Completed");
-        println!("selftest completed run {run_id}");
+        cli_textout::line(format!("selftest completed run {run_id}"));
     });
 }
 fn configure(config: &Arc<Mutex<Config>>, args: &[&str]) -> Result<(), String> {
+    if let ["jitter", value] = args {
+        let value = value.parse().map_err(|_| "jitter must be milliseconds")?;
+        config.lock().unwrap().jitter_millis = value;
+        return Ok(());
+    }
+    if let [protocol, "jitter", value] = args {
+        let value = value.parse().map_err(|_| "jitter must be milliseconds")?;
+        match *protocol {
+            "tcp" => config.lock().unwrap().client_jitter_millis = value,
+            "udp" => config.lock().unwrap().client_jitter_millis = value,
+            _ => return Err("use configure tcp jitter <ms> or configure udp jitter <ms>".into()),
+        }
+        return Ok(());
+    }
     if let ["tcp", "bytes", value] = args {
         let value = value
             .parse()
@@ -415,16 +467,14 @@ fn prompt(server: bool, client: bool, running: bool) -> String {
     }
 }
 fn print_prompt(server: bool, client: bool, running: bool) {
-    print!("{} ", prompt(server, client, running));
-    io::stdout().flush().unwrap();
+    cli_textout::raw(format!("{} ", prompt(server, client, running)));
 }
 fn redraw_prompt(server: bool, client: bool, running: bool) {
-    print!("\r\x1b[2K");
+    cli_textout::raw("\r\x1b[2K");
     print_prompt(server, client, running);
 }
 fn clear_input_line() {
-    print!("\r\x1b[2K");
-    io::stdout().flush().unwrap();
+    cli_textout::raw("\r\x1b[2K");
 }
 fn client_http_check(log_dir: &std::path::Path, url: &str) {
     let url = normalize_http_target(url);
@@ -434,7 +484,7 @@ fn client_http_check(log_dir: &std::path::Path, url: &str) {
     {
         Ok(client) => client,
         Err(error) => {
-            eprintln!("HTTP client error: {error}");
+            cli_textout::line(format!("HTTP client error: {error}"));
             return;
         }
     };
@@ -447,10 +497,10 @@ fn client_http_check(log_dir: &std::path::Path, url: &str) {
         Ok(response) => match response.bytes() {
             Ok(body) => {
                 let elapsed = started.elapsed().as_millis();
-                println!(
+                cli_textout::line(format!(
                     "HTTP check succeeded: {url} ({elapsed} ms, {} bytes)",
                     body.len()
-                );
+                ));
                 if let Ok(mut log) = OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -466,9 +516,9 @@ fn client_http_check(log_dir: &std::path::Path, url: &str) {
                     );
                 }
             }
-            Err(error) => eprintln!("HTTP body error: {error}"),
+            Err(error) => cli_textout::line(format!("HTTP body error: {error}")),
         },
-        Err(error) => eprintln!("HTTP check failed: {error}"),
+        Err(error) => cli_textout::line(format!("HTTP check failed: {error}")),
     }
 }
 fn write_run_event(log_dir: &std::path::Path, run_id: u64, event: &str) {
@@ -635,34 +685,76 @@ fn print_help(stdout_guard: &Arc<Mutex<()>>, output: &Arc<Mutex<ChildStdin>>) {
     let _ = writeln!(output, "HIDE");
     let _ = output.flush();
     let _guard = stdout_guard.lock().unwrap();
-    cli_textout::lines([
-        "server - receiving side of traffic.",
-        "  enable - enable server traffic.",
-        "  disable - stop and disable server traffic.",
-        "  runtime <seconds> - limit server runtime; zero is unlimited.",
-        "client - sending side of traffic.",
-        "  enable - enable client traffic.",
-        "  disable - stop and disable client traffic.",
-        "  remote <ip> - set the client destination.",
-        "  runtime <seconds> - limit client runtime; zero is unlimited.",
-        "  http check <url> - load one HTTP or HTTPS page and log timing.",
-        "selftest - send UDP traffic to localhost and stop automatically.",
-        "configure - change traffic settings.",
-        "  tcp bytes <rate> - set TCP bytes per second.",
-        "  udp packetsize <bytes> - set UDP packet size.",
-        "metrics add sql <connection> - publish one-second metrics externally.",
-        "monitor - check an HTTP or HTTPS endpoint.",
-        "  IP <url> - set monitor target.",
-        "  start - start checks every 30 seconds.",
-        "  stop - stop monitor checks.",
-        "  history - show monitor events and alarms.",
-        "start - start a traffic run.",
-        "stop - stop the traffic run.",
-        "status - show current counters.",
-        "sql enable - enable local SQLite snapshots.",
-        "show run <id> - show stored run metrics.",
-        "list - list all run IDs and results.",
-        "help - show this help.",
-        "exit - stop workers and exit.",
-    ]);
+    let rows = vec![
+        vec!["server".into(), "receiving side of traffic".into()],
+        vec!["enable".into(), "enable server traffic".into()],
+        vec!["disable".into(), "disable server traffic".into()],
+        vec![
+            "runtime <seconds>".into(),
+            "limit server runtime; zero is unlimited".into(),
+        ],
+        vec!["client".into(), "sending side of traffic".into()],
+        vec!["enable".into(), "enable client traffic".into()],
+        vec!["disable".into(), "disable client traffic".into()],
+        vec!["remote <ip>".into(), "set client destination".into()],
+        vec![
+            "runtime <seconds>".into(),
+            "limit client runtime; zero is unlimited".into(),
+        ],
+        vec![
+            "http check <url>".into(),
+            "load one HTTP or HTTPS page".into(),
+        ],
+        vec![
+            "selftest".into(),
+            "send UDP traffic to localhost and stop automatically".into(),
+        ],
+        vec![
+            "configure tcp bytes <rate>".into(),
+            "set TCP bytes per second".into(),
+        ],
+        vec![
+            "configure tcp jitter <ms>".into(),
+            "set TCP send jitter".into(),
+        ],
+        vec![
+            "configure udp packetsize <bytes>".into(),
+            "set UDP packet size".into(),
+        ],
+        vec![
+            "configure udp jitter <ms>".into(),
+            "set UDP send jitter".into(),
+        ],
+        vec![
+            "metrics add sql <connection>".into(),
+            "publish one-second metrics externally".into(),
+        ],
+        vec![
+            "monitor IP <url>".into(),
+            "set HTTP or HTTPS monitor target".into(),
+        ],
+        vec![
+            "monitor start | stop".into(),
+            "start or stop 30-second checks".into(),
+        ],
+        vec![
+            "monitor history".into(),
+            "show monitor events and alarms".into(),
+        ],
+        vec!["start | stop".into(), "start or stop a traffic run".into()],
+        vec!["status".into(), "show current counters".into()],
+        vec![
+            "sql enable | disable".into(),
+            "control local SQLite snapshots".into(),
+        ],
+        vec![
+            "clean".into(),
+            "delete data while preserving the run ID counter".into(),
+        ],
+        vec!["show run <id>".into(), "show stored run metrics".into()],
+        vec!["list".into(), "list all run IDs and results".into()],
+        vec!["help".into(), "show this help".into()],
+        vec!["exit".into(), "stop workers and exit".into()],
+    ];
+    cli_textout::table(&rows, &[34, 64]);
 }

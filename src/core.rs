@@ -38,6 +38,9 @@ pub struct Config {
     pub udp_packet_size: usize,
     pub client_runtime: u64,
     pub server_runtime: u64,
+    pub jitter_millis: u64,
+    pub client_jitter_millis: u64,
+    pub server_jitter_millis: u64,
 }
 
 pub struct StartGate {
@@ -181,6 +184,9 @@ impl SqlState {
     }
     pub fn enable(&self) -> Result<(), String> {
         let connection = Connection::open(database_path()).map_err(|e| e.to_string())?;
+        connection.execute_batch("CREATE TABLE IF NOT EXISTS run_counter (id INTEGER PRIMARY KEY CHECK (id = 1), next_id INTEGER NOT NULL); INSERT OR IGNORE INTO run_counter (id, next_id) VALUES (1, 1);").map_err(|e| e.to_string())?;
+        let _ = connection.execute("UPDATE run_counter SET next_id = MAX(next_id, COALESCE((SELECT MAX(id) + 1 FROM runs), 1)) WHERE id = 1", []);
+        let _ = connection.execute("UPDATE run_counter SET next_id = MAX(next_id, COALESCE((SELECT MAX(id) + 1 FROM runs), 1)) WHERE id = 1", []);
         connection.execute_batch("CREATE TABLE IF NOT EXISTS runs (id INTEGER PRIMARY KEY, started_utc TEXT NOT NULL); CREATE TABLE IF NOT EXISTS metrics (run_id INTEGER NOT NULL, timestamp_utc TEXT NOT NULL, sent_tcp_packets INTEGER, sent_tcp_bytes INTEGER, sent_udp_packets INTEGER, sent_udp_bytes INTEGER, received_tcp_packets INTEGER, received_tcp_bytes INTEGER, received_udp_packets INTEGER, received_udp_bytes INTEGER, lost_udp_packets INTEGER DEFAULT 0, out_of_order_udp_packets INTEGER DEFAULT 0, jitter_millis INTEGER DEFAULT 0); CREATE TABLE IF NOT EXISTS alarms (timestamp_utc TEXT NOT NULL, target TEXT NOT NULL, error TEXT NOT NULL);").map_err(|e| e.to_string())?;
         for column in [
             "lost_udp_packets",
@@ -202,20 +208,14 @@ impl SqlState {
         Ok(())
     }
     pub fn next_run_id(&self, fallback: u64) -> u64 {
-        self.connection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(|c| {
-                c.query_row("SELECT COALESCE(MAX(id), 0) + 1 FROM runs", [], |row| {
-                    row.get(0)
-                })
-                .ok()
-            })
-            .unwrap_or(fallback)
+        let connection = self.connection.lock().unwrap();
+        connection.as_ref().and_then(|c| c.query_row("UPDATE run_counter SET next_id = next_id + 1 WHERE id = 1 RETURNING next_id - 1", [], |row| row.get(0)).ok()).unwrap_or(fallback)
     }
     pub fn start_run(&self, id: u64) {
         self.run_id.store(id, Ordering::Relaxed);
+        if !self.enabled.load(Ordering::Relaxed) {
+            return;
+        }
         if let Some(c) = self.connection.lock().unwrap().as_ref() {
             let _ = c.execute(
                 "INSERT INTO runs (id, started_utc, result) VALUES (?1, ?2, 'running')",
@@ -224,12 +224,26 @@ impl SqlState {
         }
     }
     pub fn complete_run(&self, id: u64, result: &str) {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return;
+        }
         if let Some(c) = self.connection.lock().unwrap().as_ref() {
             let _ = c.execute(
                 "UPDATE runs SET completed_utc = ?1, result = ?2 WHERE id = ?3",
                 params![timestamp(), result, id],
             );
         }
+    }
+    pub fn disable(&self) {
+        self.enabled.store(false, Ordering::Relaxed);
+    }
+    pub fn clean(&self) -> Result<(), String> {
+        let connection = self.connection.lock().unwrap();
+        connection
+            .as_ref()
+            .ok_or_else(|| "local SQL is disabled".to_string())?
+            .execute_batch("DELETE FROM metrics; DELETE FROM alarms; DELETE FROM runs;")
+            .map_err(|error| error.to_string())
     }
     pub fn list_runs(&self) -> Result<(), String> {
         let c = Connection::open(database_path()).map_err(|e| e.to_string())?;
@@ -255,6 +269,9 @@ impl SqlState {
         self.run_id.load(Ordering::Relaxed)
     }
     pub fn record_alarm(&self, timestamp_utc: &str, target: &str, error: &str) {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return;
+        }
         let mut connection = self.connection.lock().unwrap();
         if connection.is_none() {
             if let Ok(value) = Connection::open(database_path()) {
@@ -416,6 +433,7 @@ pub fn spawn_client(
                 log,
                 &remote,
                 config.client_runtime,
+                config.client_jitter_millis,
             ),
             PacketType::Udp => udp_client(
                 config.rate,
@@ -425,6 +443,7 @@ pub fn spawn_client(
                 log,
                 &remote,
                 config.client_runtime,
+                config.server_jitter_millis,
             ),
         }
     });
@@ -525,6 +544,7 @@ fn tcp_client(
     mut log: File,
     remote: &str,
     runtime: u64,
+    jitter_millis: u64,
 ) {
     let started = Instant::now();
     let mut stream = loop {
@@ -542,6 +562,7 @@ fn tcp_client(
         metrics,
         &mut log,
         runtime,
+        jitter_millis,
         |p| stream.write_all(p),
     );
 }
@@ -553,6 +574,7 @@ fn udp_client(
     mut log: File,
     remote: &str,
     runtime: u64,
+    jitter_millis: u64,
 ) {
     let socket = match UdpSocket::bind("0.0.0.0:0") {
         Ok(v) => v,
@@ -568,6 +590,7 @@ fn udp_client(
         metrics,
         &mut log,
         runtime,
+        jitter_millis,
         |p| socket.send(p).map(|_| ()),
     );
 }
@@ -577,6 +600,7 @@ fn send_tcp_packets<F>(
     metrics: &Arc<Metrics>,
     log: &mut File,
     runtime: u64,
+    jitter_millis: u64,
     mut send: F,
 ) where
     F: FnMut(&[u8]) -> io::Result<()>,
@@ -591,7 +615,7 @@ fn send_tcp_packets<F>(
         }
         metrics.add(true, PacketType::Tcp, packet.len());
         writeln!(log, "{} TCP {} bytes", timestamp(), packet.len()).ok();
-        thread::sleep(interval);
+        thread::sleep(jittered_delay(interval, jitter_millis));
     }
 }
 fn send_udp_packets<F>(
@@ -601,6 +625,7 @@ fn send_udp_packets<F>(
     metrics: &Arc<Metrics>,
     log: &mut File,
     runtime: u64,
+    jitter_millis: u64,
     mut send: F,
 ) where
     F: FnMut(&[u8]) -> io::Result<()>,
@@ -618,7 +643,21 @@ fn send_udp_packets<F>(
         metrics.add(true, PacketType::Udp, packet.len());
         writeln!(log, "{} UDP {} bytes", timestamp(), packet.len()).ok();
         sequence += 1;
-        thread::sleep(interval);
+        thread::sleep(jittered_delay(interval, jitter_millis));
+    }
+}
+
+fn jittered_delay(base: Duration, jitter_millis: u64) -> Duration {
+    if jitter_millis == 0 {
+        return base;
+    }
+    let range = jitter_millis.saturating_mul(2).saturating_add(1);
+    let offset =
+        (Instant::now().elapsed().subsec_nanos() as u64 % range) as i64 - jitter_millis as i64;
+    if offset.is_negative() {
+        base.saturating_sub(Duration::from_millis(offset.unsigned_abs()))
+    } else {
+        base.saturating_add(Duration::from_millis(offset as u64))
     }
 }
 #[cfg(test)]
@@ -655,6 +694,9 @@ mod tests {
             udp_packet_size: 1024,
             client_runtime: 10,
             server_runtime: 10,
+            jitter_millis: 0,
+            client_jitter_millis: 0,
+            server_jitter_millis: 0,
         }));
         let gate = Arc::new(StartGate::new());
         let stopping = Arc::new(AtomicBool::new(false));
@@ -805,6 +847,7 @@ mod tests {
                 &sender_metrics,
                 &mut log,
                 10,
+                0,
                 |packet| stream.write_all(packet),
             );
         });
