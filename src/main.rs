@@ -103,8 +103,9 @@ fn main() {
         match event::read().unwrap() {
             Event::Key(KeyEvent {
                 code: KeyCode::Char(choice),
+                modifiers,
                 ..
-            }) if clean_confirmation => {
+            }) if clean_confirmation && !modifiers.contains(KeyModifiers::CONTROL) => {
                 match choice.to_ascii_lowercase() {
                     'y' => {
                         clean_confirmation = false;
@@ -121,11 +122,6 @@ fn main() {
                     }
                     _ => cli_textout::line("Please answer Y or N."),
                 }
-                print_prompt(
-                    server_enabled,
-                    client_enabled,
-                    running.load(Ordering::Relaxed),
-                );
             }
             Event::Key(KeyEvent {
                 code: KeyCode::Char('c'),
@@ -300,7 +296,7 @@ fn main() {
                     [] => {}
                     _ => cli_textout::line("unknown command; type 'help' for commands"),
                 }
-                if cli_mode {
+                if cli_mode && !clean_confirmation {
                     redraw_prompt(
                         server_enabled,
                         client_enabled,
@@ -405,7 +401,7 @@ fn run_selftest(
     let sql_state = Arc::clone(sql);
     let logs = log_dir.to_path_buf();
     thread::spawn(move || {
-        thread::sleep(Duration::from_secs(11));
+        thread::sleep(Duration::from_secs(10));
         stop.store(true, Ordering::Relaxed);
         state.store(false, Ordering::Relaxed);
         sql_state.complete_run(run_id, "ok");

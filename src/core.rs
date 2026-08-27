@@ -4,6 +4,7 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64 as RandomState;
 use std::sync::{
     Arc, Condvar, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -186,12 +187,13 @@ impl SqlState {
         let connection = Connection::open(database_path()).map_err(|e| e.to_string())?;
         connection.execute_batch("CREATE TABLE IF NOT EXISTS run_counter (id INTEGER PRIMARY KEY CHECK (id = 1), next_id INTEGER NOT NULL); INSERT OR IGNORE INTO run_counter (id, next_id) VALUES (1, 1);").map_err(|e| e.to_string())?;
         let _ = connection.execute("UPDATE run_counter SET next_id = MAX(next_id, COALESCE((SELECT MAX(id) + 1 FROM runs), 1)) WHERE id = 1", []);
-        let _ = connection.execute("UPDATE run_counter SET next_id = MAX(next_id, COALESCE((SELECT MAX(id) + 1 FROM runs), 1)) WHERE id = 1", []);
         connection.execute_batch("CREATE TABLE IF NOT EXISTS runs (id INTEGER PRIMARY KEY, started_utc TEXT NOT NULL); CREATE TABLE IF NOT EXISTS metrics (run_id INTEGER NOT NULL, timestamp_utc TEXT NOT NULL, sent_tcp_packets INTEGER, sent_tcp_bytes INTEGER, sent_udp_packets INTEGER, sent_udp_bytes INTEGER, received_tcp_packets INTEGER, received_tcp_bytes INTEGER, received_udp_packets INTEGER, received_udp_bytes INTEGER, lost_udp_packets INTEGER DEFAULT 0, out_of_order_udp_packets INTEGER DEFAULT 0, jitter_millis INTEGER DEFAULT 0); CREATE TABLE IF NOT EXISTS alarms (timestamp_utc TEXT NOT NULL, target TEXT NOT NULL, error TEXT NOT NULL);").map_err(|e| e.to_string())?;
+        let _ = connection.execute("UPDATE run_counter SET next_id = MAX(next_id, COALESCE((SELECT MAX(id) + 1 FROM runs), 1)) WHERE id = 1", []);
         for column in [
             "lost_udp_packets",
             "out_of_order_udp_packets",
             "jitter_millis",
+            "timestamp_ms",
         ] {
             let _ = connection.execute(
                 &format!("ALTER TABLE metrics ADD COLUMN {column} INTEGER DEFAULT 0"),
@@ -202,6 +204,10 @@ impl SqlState {
         let _ = connection.execute(
             "ALTER TABLE runs ADD COLUMN result TEXT NOT NULL DEFAULT 'running'",
             [],
+        );
+        let _ = connection.execute(
+            "UPDATE runs SET completed_utc = COALESCE(completed_utc, ?1), result = 'aborted' WHERE result = 'running'",
+            params![timestamp()],
         );
         *self.connection.lock().unwrap() = Some(connection);
         self.enabled.store(true, Ordering::Relaxed);
@@ -229,7 +235,7 @@ impl SqlState {
         }
         if let Some(c) = self.connection.lock().unwrap().as_ref() {
             let _ = c.execute(
-                "UPDATE runs SET completed_utc = ?1, result = ?2 WHERE id = ?3",
+                "UPDATE runs SET completed_utc = ?1, result = ?2 WHERE id = ?3 AND result = 'running'",
                 params![timestamp(), result, id],
             );
         }
@@ -292,10 +298,11 @@ impl SqlState {
         }
         if let Some(c) = self.connection.lock().unwrap().as_ref() {
             let _ = c.execute(
-                "INSERT INTO metrics (run_id, timestamp_utc, sent_tcp_packets, sent_tcp_bytes, sent_udp_packets, sent_udp_bytes, received_tcp_packets, received_tcp_bytes, received_udp_packets, received_udp_bytes, lost_udp_packets, out_of_order_udp_packets, jitter_millis) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                "INSERT INTO metrics (run_id, timestamp_utc, timestamp_ms, sent_tcp_packets, sent_tcp_bytes, sent_udp_packets, sent_udp_bytes, received_tcp_packets, received_tcp_bytes, received_udp_packets, received_udp_bytes, lost_udp_packets, out_of_order_udp_packets, jitter_millis) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     self.run_id.load(Ordering::Relaxed),
                     timestamp(),
+                    Utc::now().timestamp_millis(),
                     values[0],
                     values[1],
                     values[2],
@@ -651,9 +658,14 @@ fn jittered_delay(base: Duration, jitter_millis: u64) -> Duration {
     if jitter_millis == 0 {
         return base;
     }
+    static RANDOM_STATE: RandomState = RandomState::new(0x9e3779b97f4a7c15);
     let range = jitter_millis.saturating_mul(2).saturating_add(1);
-    let offset =
-        (Instant::now().elapsed().subsec_nanos() as u64 % range) as i64 - jitter_millis as i64;
+    let state = RANDOM_STATE
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            Some(value.wrapping_mul(6364136223846793005).wrapping_add(1))
+        })
+        .unwrap_or(0);
+    let offset = (state % range) as i64 - jitter_millis as i64;
     if offset.is_negative() {
         base.saturating_sub(Duration::from_millis(offset.unsigned_abs()))
     } else {
@@ -663,6 +675,7 @@ fn jittered_delay(base: Duration, jitter_millis: u64) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    static TIMED_TEST_LOCK: Mutex<()> = Mutex::new(());
     #[test]
     fn config_defaults_are_local() {
         assert_eq!(DEFAULT_REMOTE, "127.0.0.1");
@@ -679,6 +692,44 @@ mod tests {
     }
 
     #[test]
+    fn completion_does_not_overwrite_finished_result() {
+        let sql = SqlState::new();
+        sql.enable().unwrap();
+        let id = sql.next_run_id(1);
+        sql.start_run(id);
+        sql.complete_run(id, "ok");
+        sql.complete_run(id, "aborted");
+        let result: String = Connection::open(database_path())
+            .unwrap()
+            .query_row(
+                "SELECT result FROM runs WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(result, "ok");
+    }
+
+    #[test]
+    fn metrics_table_stores_millisecond_timestamp() {
+        let sql = SqlState::new();
+        sql.enable().unwrap();
+        let values = [0; 8];
+        let run_id = sql.next_run_id(1);
+        sql.start_run(run_id);
+        sql.write_snapshot(&values, 0, 0, 0);
+        let timestamp_ms: i64 = Connection::open(database_path())
+            .unwrap()
+            .query_row(
+                "SELECT timestamp_ms FROM metrics WHERE run_id = ?1 ORDER BY rowid DESC LIMIT 1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(timestamp_ms > 0);
+    }
+
+    #[test]
     fn timestamps_are_explicit_utc() {
         let value = timestamp();
         assert!(value.ends_with('Z'));
@@ -687,6 +738,8 @@ mod tests {
 
     #[test]
     fn ten_second_udp_client_server_logs_match() {
+        let _test_lock = TIMED_TEST_LOCK.lock().unwrap();
+        let started = Instant::now();
         let config = Arc::new(Mutex::new(Config {
             rate: 10,
             packet_type: PacketType::Udp,
@@ -741,7 +794,7 @@ mod tests {
         );
         thread::sleep(Duration::from_millis(100));
         gate.start();
-        thread::sleep(Duration::from_secs(11));
+        thread::sleep(Duration::from_secs(10));
         stopping.store(true, Ordering::Relaxed);
         thread::sleep(Duration::from_millis(250));
         let sent = metrics.current();
@@ -823,10 +876,13 @@ mod tests {
             result,
             "run {run_id} did not produce matching nonzero logs and SQLite data"
         );
+        assert!(started.elapsed() >= Duration::from_secs(10));
     }
 
     #[test]
     fn ten_second_tcp_loopback_logs_match() {
+        let _test_lock = TIMED_TEST_LOCK.lock().unwrap();
+        let started = Instant::now();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let stopping = Arc::new(AtomicBool::new(false));
@@ -876,5 +932,6 @@ mod tests {
         assert!(sent_bytes > 0, "client sent zero TCP bytes");
         assert_eq!(sent_bytes, client_bytes);
         assert_eq!(client_bytes, server_bytes);
+        assert!(started.elapsed() >= Duration::from_secs(10));
     }
 }
