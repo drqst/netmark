@@ -14,4 +14,17 @@ Better status page to show what is going on in more detail.
 How to use:
 Just run the binary netmark and you'll get a prompt, type help and go from there.
 
+SMTP:
+Set the server with `configure smtp <host[:port]>`, then turn it on with
+`admin smtp enabled` or off with `admin smtp disabled`. Enabling first verifies
+the server answers with an SMTP greeting; `admin smtp status` re-runs that check
+at any time.
+
+As a library:
+netmark is also a Rust library. `netmark::sdk::TestRunner` runs a test profile
+from code and returns a `RunReport` you can assert on. A profile may name Rust
+callbacks in its `hooks.before` and `hooks.after` lists; register them on the
+runner with `.hook("name", ...)`. An `after` hook that returns an error fails the
+run. See `examples/sdk_hooks.rs` and `profiles/udp-hooks.yaml`.
+
 Better documentation to come.

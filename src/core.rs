@@ -1,5 +1,5 @@
 use chrono::{SecondsFormat, Utc};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
@@ -14,7 +14,13 @@ use std::time::{Duration, Instant};
 
 pub const DEFAULT_REMOTE: &str = "127.0.0.1";
 const PORT: u16 = 9000;
-const PACKET_SIZE: usize = 1024;
+pub(crate) const PACKET_SIZE: usize = 1024;
+/// UDP packet header: 8-byte sequence number + 8-byte send timestamp (ms).
+const UDP_HEADER_LEN: usize = 16;
+/// TCP is a byte stream, so a timestamp is embedded every `TCP_TIMESTAMP_CHUNK` bytes.
+const TCP_TIMESTAMP_CHUNK: usize = 100;
+/// TCP frame header: 8-byte send timestamp (ms) + 2-byte chunk length.
+const TCP_HEADER_LEN: usize = 10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PacketType {
@@ -29,9 +35,15 @@ impl PacketType {
             _ => None,
         }
     }
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+        }
+    }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Config {
     pub rate: u64,
     pub packet_type: PacketType,
@@ -42,6 +54,30 @@ pub struct Config {
     pub jitter_millis: u64,
     pub client_jitter_millis: u64,
     pub server_jitter_millis: u64,
+    pub max_tcp_jitter_millis: u64,
+    pub max_udp_jitter_millis: u64,
+    /// Minimum acceptable throughput in bytes/sec for a run to be considered a pass; 0 disables the check.
+    pub limit_bytes_per_second: u64,
+    pub admin_emails: Vec<String>,
+}
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            rate: 100,
+            packet_type: PacketType::Tcp,
+            tcp_bytes_per_second: 1024,
+            udp_packet_size: 1024,
+            client_runtime: 0,
+            server_runtime: 0,
+            jitter_millis: 0,
+            client_jitter_millis: 0,
+            server_jitter_millis: 0,
+            max_tcp_jitter_millis: 1000,
+            max_udp_jitter_millis: 1000,
+            limit_bytes_per_second: 0,
+            admin_emails: Vec::new(),
+        }
+    }
 }
 
 pub struct StartGate {
@@ -79,7 +115,18 @@ pub struct Metrics {
     lost_udp_packets: AtomicU64,
     out_of_order_udp_packets: AtomicU64,
     jitter_millis: AtomicU64,
-    last_udp_arrival: Mutex<Option<(Instant, Duration)>>,
+    tcp_jitter_millis: AtomicU64,
+    udp_jitter_millis: AtomicU64,
+    run_sent_tcp_packets: AtomicU64,
+    run_sent_tcp_bytes: AtomicU64,
+    run_sent_udp_packets: AtomicU64,
+    run_sent_udp_bytes: AtomicU64,
+    run_received_tcp_packets: AtomicU64,
+    run_received_tcp_bytes: AtomicU64,
+    run_received_udp_packets: AtomicU64,
+    run_received_udp_bytes: AtomicU64,
+    last_udp_timestamps: Mutex<Option<(i64, i64)>>,
+    last_tcp_timestamps: Mutex<Option<(i64, i64)>>,
 }
 impl Metrics {
     pub fn new() -> Self {
@@ -95,18 +142,99 @@ impl Metrics {
             lost_udp_packets: AtomicU64::new(0),
             out_of_order_udp_packets: AtomicU64::new(0),
             jitter_millis: AtomicU64::new(0),
-            last_udp_arrival: Mutex::new(None),
+            tcp_jitter_millis: AtomicU64::new(0),
+            udp_jitter_millis: AtomicU64::new(0),
+            run_sent_tcp_packets: AtomicU64::new(0),
+            run_sent_tcp_bytes: AtomicU64::new(0),
+            run_sent_udp_packets: AtomicU64::new(0),
+            run_sent_udp_bytes: AtomicU64::new(0),
+            run_received_tcp_packets: AtomicU64::new(0),
+            run_received_tcp_bytes: AtomicU64::new(0),
+            run_received_udp_packets: AtomicU64::new(0),
+            run_received_udp_bytes: AtomicU64::new(0),
+            last_udp_timestamps: Mutex::new(None),
+            last_tcp_timestamps: Mutex::new(None),
         }
     }
     fn add(&self, sent: bool, protocol: PacketType, bytes: usize) {
-        let (packets, total) = match (sent, protocol) {
-            (true, PacketType::Tcp) => (&self.sent_tcp_packets, &self.sent_tcp_bytes),
-            (true, PacketType::Udp) => (&self.sent_udp_packets, &self.sent_udp_bytes),
-            (false, PacketType::Tcp) => (&self.received_tcp_packets, &self.received_tcp_bytes),
-            (false, PacketType::Udp) => (&self.received_udp_packets, &self.received_udp_bytes),
+        let (packets, total, run_packets, run_total) = match (sent, protocol) {
+            (true, PacketType::Tcp) => (
+                &self.sent_tcp_packets,
+                &self.sent_tcp_bytes,
+                &self.run_sent_tcp_packets,
+                &self.run_sent_tcp_bytes,
+            ),
+            (true, PacketType::Udp) => (
+                &self.sent_udp_packets,
+                &self.sent_udp_bytes,
+                &self.run_sent_udp_packets,
+                &self.run_sent_udp_bytes,
+            ),
+            (false, PacketType::Tcp) => (
+                &self.received_tcp_packets,
+                &self.received_tcp_bytes,
+                &self.run_received_tcp_packets,
+                &self.run_received_tcp_bytes,
+            ),
+            (false, PacketType::Udp) => (
+                &self.received_udp_packets,
+                &self.received_udp_bytes,
+                &self.run_received_udp_packets,
+                &self.run_received_udp_bytes,
+            ),
         };
         packets.fetch_add(1, Ordering::Relaxed);
         total.fetch_add(bytes as u64, Ordering::Relaxed);
+        run_packets.fetch_add(1, Ordering::Relaxed);
+        run_total.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+    /// Total bytes sent (TCP, UDP) since the last `reset_run()`, unaffected by the
+    /// periodic `snapshot()` used for live reporting.
+    pub fn run_sent_bytes(&self) -> (u64, u64) {
+        (
+            self.run_sent_tcp_bytes.load(Ordering::Relaxed),
+            self.run_sent_udp_bytes.load(Ordering::Relaxed),
+        )
+    }
+    /// Total bytes received (TCP, UDP) since the last `reset_run()`, mirroring
+    /// `run_sent_bytes` so the server side's throughput can be checked too.
+    pub fn run_received_bytes(&self) -> (u64, u64) {
+        (
+            self.run_received_tcp_bytes.load(Ordering::Relaxed),
+            self.run_received_udp_bytes.load(Ordering::Relaxed),
+        )
+    }
+    /// Run-scoped counters in the same `[sent_tcp_packets, sent_tcp_bytes, ...]`
+    /// layout as `snapshot()`, for the single final report written to the
+    /// external metrics database at the end of a run.
+    pub fn run_totals(&self) -> [u64; 8] {
+        [
+            self.run_sent_tcp_packets.load(Ordering::Relaxed),
+            self.run_sent_tcp_bytes.load(Ordering::Relaxed),
+            self.run_sent_udp_packets.load(Ordering::Relaxed),
+            self.run_sent_udp_bytes.load(Ordering::Relaxed),
+            self.run_received_tcp_packets.load(Ordering::Relaxed),
+            self.run_received_tcp_bytes.load(Ordering::Relaxed),
+            self.run_received_udp_packets.load(Ordering::Relaxed),
+            self.run_received_udp_bytes.load(Ordering::Relaxed),
+        ]
+    }
+    /// Clears the per-run counters (sent/received bytes, jitter, UDP loss) so the
+    /// next run's final ok/fail evaluation and metrics report reflect only that run.
+    pub fn reset_run(&self) {
+        self.run_sent_tcp_packets.store(0, Ordering::Relaxed);
+        self.run_sent_tcp_bytes.store(0, Ordering::Relaxed);
+        self.run_sent_udp_packets.store(0, Ordering::Relaxed);
+        self.run_sent_udp_bytes.store(0, Ordering::Relaxed);
+        self.run_received_tcp_packets.store(0, Ordering::Relaxed);
+        self.run_received_tcp_bytes.store(0, Ordering::Relaxed);
+        self.run_received_udp_packets.store(0, Ordering::Relaxed);
+        self.run_received_udp_bytes.store(0, Ordering::Relaxed);
+        self.jitter_millis.store(0, Ordering::Relaxed);
+        self.tcp_jitter_millis.store(0, Ordering::Relaxed);
+        self.udp_jitter_millis.store(0, Ordering::Relaxed);
+        self.lost_udp_packets.store(0, Ordering::Relaxed);
+        self.out_of_order_udp_packets.store(0, Ordering::Relaxed);
     }
     pub fn snapshot(&self) -> [u64; 8] {
         [
@@ -118,18 +246,6 @@ impl Metrics {
             self.received_tcp_bytes.swap(0, Ordering::Relaxed),
             self.received_udp_packets.swap(0, Ordering::Relaxed),
             self.received_udp_bytes.swap(0, Ordering::Relaxed),
-        ]
-    }
-    pub fn current(&self) -> [u64; 8] {
-        [
-            self.sent_tcp_packets.load(Ordering::Relaxed),
-            self.sent_tcp_bytes.load(Ordering::Relaxed),
-            self.sent_udp_packets.load(Ordering::Relaxed),
-            self.sent_udp_bytes.load(Ordering::Relaxed),
-            self.received_tcp_packets.load(Ordering::Relaxed),
-            self.received_tcp_bytes.load(Ordering::Relaxed),
-            self.received_udp_packets.load(Ordering::Relaxed),
-            self.received_udp_bytes.load(Ordering::Relaxed),
         ]
     }
     pub fn udp_status(&self) -> (u64, u64) {
@@ -151,22 +267,60 @@ impl Metrics {
         }
         *expected = Some((*expected).map_or(sequence, |previous| previous.max(sequence)));
     }
-    fn udp_arrival(&self) {
-        let now = Instant::now();
-        let mut last = self.last_udp_arrival.lock().unwrap();
-        if let Some((previous, interval)) = *last {
-            let current = now.duration_since(previous);
-            self.jitter_millis.fetch_max(
-                current.abs_diff(interval).as_millis() as u64,
-                Ordering::Relaxed,
-            );
-            *last = Some((now, current));
-        } else {
-            *last = Some((now, Duration::ZERO));
+    #[cfg(test)]
+    pub(crate) fn test_udp_sequence(&self, expected: &mut Option<u64>, sequence: u64) {
+        self.udp_sequence(expected, sequence);
+    }
+    fn record_jitter(&self, protocol: PacketType, jitter: Duration) {
+        let value = jitter.as_millis() as u64;
+        self.jitter_millis.fetch_max(value, Ordering::Relaxed);
+        match protocol {
+            PacketType::Tcp => self.tcp_jitter_millis.fetch_max(value, Ordering::Relaxed),
+            PacketType::Udp => self.udp_jitter_millis.fetch_max(value, Ordering::Relaxed),
+        };
+    }
+    #[cfg(test)]
+    pub(crate) fn test_jitter(&self, protocol: PacketType, millis: u64) {
+        self.record_jitter(protocol, Duration::from_millis(millis));
+    }
+    /// Computes jitter (RFC 3550 style delay variation) from a packet's send timestamp,
+    /// so the receiving side can detect jitter without relying on local send intervals.
+    fn timestamp_jitter(
+        &self,
+        protocol: PacketType,
+        last: &Mutex<Option<(i64, i64)>>,
+        send_timestamp_ms: i64,
+    ) {
+        let arrival_ms = Utc::now().timestamp_millis();
+        let mut last = last.lock().unwrap();
+        if let Some((last_send_ms, last_arrival_ms)) = *last {
+            let delay_variation =
+                (arrival_ms - last_arrival_ms) - (send_timestamp_ms - last_send_ms);
+            self.record_jitter(protocol, Duration::from_millis(delay_variation.unsigned_abs()));
         }
+        *last = Some((send_timestamp_ms, arrival_ms));
+    }
+    fn udp_timestamp_jitter(&self, send_timestamp_ms: i64) {
+        self.timestamp_jitter(PacketType::Udp, &self.last_udp_timestamps, send_timestamp_ms);
+    }
+    fn tcp_timestamp_jitter(&self, send_timestamp_ms: i64) {
+        self.timestamp_jitter(PacketType::Tcp, &self.last_tcp_timestamps, send_timestamp_ms);
     }
     pub fn jitter_millis(&self) -> u64 {
         self.jitter_millis.load(Ordering::Relaxed)
+    }
+    #[cfg(test)]
+    pub(crate) fn protocol_jitter_millis(&self) -> (u64, u64) {
+        (
+            self.tcp_jitter_millis.load(Ordering::Relaxed),
+            self.udp_jitter_millis.load(Ordering::Relaxed),
+        )
+    }
+    pub fn tcp_jitter_millis(&self) -> u64 {
+        self.tcp_jitter_millis.load(Ordering::Relaxed)
+    }
+    pub fn udp_jitter_millis(&self) -> u64 {
+        self.udp_jitter_millis.load(Ordering::Relaxed)
     }
 }
 
@@ -186,25 +340,12 @@ impl SqlState {
     pub fn enable(&self) -> Result<(), String> {
         let connection = Connection::open(database_path()).map_err(|e| e.to_string())?;
         connection.execute_batch("CREATE TABLE IF NOT EXISTS run_counter (id INTEGER PRIMARY KEY CHECK (id = 1), next_id INTEGER NOT NULL); INSERT OR IGNORE INTO run_counter (id, next_id) VALUES (1, 1);").map_err(|e| e.to_string())?;
+        connection.execute_batch("CREATE TABLE IF NOT EXISTS runs (id INTEGER PRIMARY KEY, started_utc TEXT NOT NULL); CREATE TABLE IF NOT EXISTS alarms (timestamp_utc TEXT NOT NULL, target TEXT NOT NULL, error TEXT NOT NULL);").map_err(|e| e.to_string())?;
         let _ = connection.execute("UPDATE run_counter SET next_id = MAX(next_id, COALESCE((SELECT MAX(id) + 1 FROM runs), 1)) WHERE id = 1", []);
-        connection.execute_batch("CREATE TABLE IF NOT EXISTS runs (id INTEGER PRIMARY KEY, started_utc TEXT NOT NULL); CREATE TABLE IF NOT EXISTS metrics (run_id INTEGER NOT NULL, timestamp_utc TEXT NOT NULL, sent_tcp_packets INTEGER, sent_tcp_bytes INTEGER, sent_udp_packets INTEGER, sent_udp_bytes INTEGER, received_tcp_packets INTEGER, received_tcp_bytes INTEGER, received_udp_packets INTEGER, received_udp_bytes INTEGER, lost_udp_packets INTEGER DEFAULT 0, out_of_order_udp_packets INTEGER DEFAULT 0, jitter_millis INTEGER DEFAULT 0); CREATE TABLE IF NOT EXISTS alarms (timestamp_utc TEXT NOT NULL, target TEXT NOT NULL, error TEXT NOT NULL);").map_err(|e| e.to_string())?;
-        let _ = connection.execute("UPDATE run_counter SET next_id = MAX(next_id, COALESCE((SELECT MAX(id) + 1 FROM runs), 1)) WHERE id = 1", []);
-        for column in [
-            "lost_udp_packets",
-            "out_of_order_udp_packets",
-            "jitter_millis",
-            "timestamp_ms",
-        ] {
-            let _ = connection.execute(
-                &format!("ALTER TABLE metrics ADD COLUMN {column} INTEGER DEFAULT 0"),
-                [],
-            );
-        }
         let _ = connection.execute("ALTER TABLE runs ADD COLUMN completed_utc TEXT", []);
-        let _ = connection.execute(
-            "ALTER TABLE runs ADD COLUMN result TEXT NOT NULL DEFAULT 'running'",
-            [],
-        );
+        let _ = connection.execute("ALTER TABLE runs ADD COLUMN result TEXT NOT NULL DEFAULT 'running'", []);
+        let _ = connection.execute("ALTER TABLE runs ADD COLUMN sent_bytes INTEGER DEFAULT 0", []);
+        let _ = connection.execute("ALTER TABLE runs ADD COLUMN failure_reason TEXT", []);
         let _ = connection.execute(
             "UPDATE runs SET completed_utc = COALESCE(completed_utc, ?1), result = 'aborted' WHERE result = 'running'",
             params![timestamp()],
@@ -229,40 +370,44 @@ impl SqlState {
             );
         }
     }
-    pub fn complete_run(&self, id: u64, result: &str) {
+    /// Records the end state of a run: bytes sent, whether it stayed within its
+    /// configured limits, and why not, if it didn't. No millisecond-level metrics
+    /// are ever stored here; those only go to the configured external SQL database.
+    pub fn complete_run(&self, id: u64, result: &str, sent_bytes: u64, failure_reason: Option<&str>) {
         if !self.enabled.load(Ordering::Relaxed) {
             return;
         }
         if let Some(c) = self.connection.lock().unwrap().as_ref() {
             let _ = c.execute(
-                "UPDATE runs SET completed_utc = ?1, result = ?2 WHERE id = ?3 AND result = 'running'",
-                params![timestamp(), result, id],
+                "UPDATE runs SET completed_utc = ?1, result = ?2, sent_bytes = ?3, failure_reason = ?4 WHERE id = ?5 AND result = 'running'",
+                params![timestamp(), result, sent_bytes, failure_reason, id],
             );
         }
-    }
-    pub fn disable(&self) {
-        self.enabled.store(false, Ordering::Relaxed);
     }
     pub fn clean(&self) -> Result<(), String> {
         let connection = self.connection.lock().unwrap();
         connection
             .as_ref()
             .ok_or_else(|| "local SQL is disabled".to_string())?
-            .execute_batch("DELETE FROM metrics; DELETE FROM alarms; DELETE FROM runs;")
+            .execute_batch("DELETE FROM alarms; DELETE FROM runs;")
             .map_err(|error| error.to_string())
     }
     pub fn list_runs(&self) -> Result<(), String> {
         let c = Connection::open(database_path()).map_err(|e| e.to_string())?;
         let mut q = c
-            .prepare("SELECT started_utc, id, result FROM runs ORDER BY id")
+            .prepare("SELECT started_utc, id, result, sent_bytes, failure_reason FROM runs ORDER BY id")
             .map_err(|e| e.to_string())?;
         let rows = q
             .query_map([], |row| {
                 Ok(format!(
-                    "{} {} {}",
+                    "{} {} {} sent_bytes={}{}",
                     row.get::<_, String>(0)?,
                     row.get::<_, u64>(1)?,
-                    row.get::<_, String>(2)?
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<u64>>(3)?.unwrap_or(0),
+                    row.get::<_, Option<String>>(4)?
+                        .map(|reason| format!(" ({reason})"))
+                        .unwrap_or_default()
                 ))
             })
             .map_err(|e| e.to_string())?;
@@ -271,8 +416,30 @@ impl SqlState {
         }
         Ok(())
     }
-    pub fn current_run_id(&self) -> u64 {
-        self.run_id.load(Ordering::Relaxed)
+    /// Reads a single run's final summary from local SQLite only; per-second
+    /// metrics never live here, so this is just the started/completed/result row.
+    pub fn show_run(&self, id: u64) -> Result<Option<String>, String> {
+        let connection = Connection::open(database_path()).map_err(|e| e.to_string())?;
+        connection
+            .query_row(
+                "SELECT started_utc, completed_utc, result, sent_bytes, failure_reason FROM runs WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok(format!(
+                        "started {} completed {} result {} sent_bytes={}{}",
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?
+                            .unwrap_or_else(|| "n/a".to_string()),
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<u64>>(3)?.unwrap_or(0),
+                        row.get::<_, Option<String>>(4)?
+                            .map(|reason| format!(" ({reason})"))
+                            .unwrap_or_default()
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| e.to_string())
     }
     pub fn record_alarm(&self, timestamp_utc: &str, target: &str, error: &str) {
         if !self.enabled.load(Ordering::Relaxed) {
@@ -291,64 +458,6 @@ impl SqlState {
                 params![timestamp_utc, target, error],
             );
         }
-    }
-    pub fn write_snapshot(&self, values: &[u64; 8], lost: u64, out_of_order: u64, jitter: u64) {
-        if !self.enabled.load(Ordering::Relaxed) {
-            return;
-        }
-        if let Some(c) = self.connection.lock().unwrap().as_ref() {
-            let _ = c.execute(
-                "INSERT INTO metrics (run_id, timestamp_utc, timestamp_ms, sent_tcp_packets, sent_tcp_bytes, sent_udp_packets, sent_udp_bytes, received_tcp_packets, received_tcp_bytes, received_udp_packets, received_udp_bytes, lost_udp_packets, out_of_order_udp_packets, jitter_millis) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-                params![
-                    self.run_id.load(Ordering::Relaxed),
-                    timestamp(),
-                    Utc::now().timestamp_millis(),
-                    values[0],
-                    values[1],
-                    values[2],
-                    values[3],
-                    values[4],
-                    values[5],
-                    values[6],
-                    values[7], lost, out_of_order, jitter
-                ],
-            );
-        }
-    }
-    pub fn show_run(&self, id: u64) -> Result<(), String> {
-        let c = Connection::open(database_path()).map_err(|e| e.to_string())?;
-        for column in [
-            "lost_udp_packets",
-            "out_of_order_udp_packets",
-            "jitter_millis",
-        ] {
-            let _ = c.execute(
-                &format!("ALTER TABLE metrics ADD COLUMN {column} INTEGER DEFAULT 0"),
-                [],
-            );
-        }
-        let mut q = c.prepare("SELECT timestamp_utc, sent_tcp_bytes, sent_udp_bytes, received_tcp_bytes, received_udp_bytes, lost_udp_packets, out_of_order_udp_packets, jitter_millis FROM metrics WHERE run_id=?1 ORDER BY timestamp_utc").map_err(|e| e.to_string())?;
-        let rows = q
-            .query_map(params![id], |r| {
-                Ok(format!(
-                    "{} sent TCP={} UDP={}, received TCP={} UDP={}, lost UDP={}, out-of-order UDP={}, jitter={} ms{}",
-                    r.get::<_, String>(0)?,
-                    r.get::<_, u64>(1)?,
-                    r.get::<_, u64>(2)?,
-                    r.get::<_, u64>(3)?,
-                    r.get::<_, u64>(4)?,
-                    r.get::<_, u64>(5)?,
-                    r.get::<_, u64>(6)?,
-                    r.get::<_, u64>(7)?,
-                    if r.get::<_, u64>(7)? > 10 { " WARNING" } else { "" }
-                ))
-            })
-            .map_err(|e| e.to_string())?;
-        crate::cli_textout::line(format!("Run {id}:"));
-        for row in rows {
-            crate::cli_textout::line(row.map_err(|e| e.to_string())?);
-        }
-        Ok(())
     }
 }
 
@@ -382,7 +491,7 @@ pub fn spawn_server(
     let http_stopping = Arc::clone(&stopping);
     thread::spawn(move || run_http_server(&http_stopping));
     thread::spawn(move || {
-        let config = *config.lock().unwrap();
+        let config = config.lock().unwrap().clone();
         let log = File::options()
             .create(true)
             .append(true)
@@ -426,7 +535,7 @@ pub fn spawn_client(
 ) {
     thread::spawn(move || {
         gate.wait();
-        let config = *config.lock().unwrap();
+        let config = config.lock().unwrap().clone();
         let log = File::options()
             .create(true)
             .append(true)
@@ -484,11 +593,13 @@ fn tcp_server(
             Ok((mut stream, _)) => {
                 stream.set_nonblocking(true).ok();
                 let mut buffer = [0; PACKET_SIZE];
+                let mut frame_reader = TcpFrameReader::new();
                 while !stopping.load(Ordering::Relaxed) && !expired(started, runtime) {
                     match stream.read(&mut buffer) {
                         Ok(0) => break,
                         Ok(n) => {
                             metrics.add(false, PacketType::Tcp, n);
+                            frame_reader.feed(&buffer[..n], metrics);
                             writeln!(log, "{} TCP {n} bytes", timestamp()).ok();
                         }
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -528,12 +639,14 @@ fn udp_server(
         match socket.recv_from(&mut buffer) {
             Ok((n, _)) => {
                 metrics.add(false, PacketType::Udp, n);
-                metrics.udp_arrival();
-                if n >= 8 {
+                if n >= UDP_HEADER_LEN {
                     metrics.udp_sequence(
                         &mut expected_sequence,
                         u64::from_be_bytes(buffer[..8].try_into().unwrap()),
                     );
+                    metrics.udp_timestamp_jitter(i64::from_be_bytes(
+                        buffer[8..16].try_into().unwrap(),
+                    ));
                 }
                 writeln!(log, "{} UDP {n} bytes", timestamp()).ok();
             }
@@ -601,7 +714,7 @@ fn udp_client(
         |p| socket.send(p).map(|_| ()),
     );
 }
-fn send_tcp_packets<F>(
+pub(crate) fn send_tcp_packets<F>(
     bytes_per_second: u64,
     stopping: &AtomicBool,
     metrics: &Arc<Metrics>,
@@ -613,14 +726,21 @@ fn send_tcp_packets<F>(
     F: FnMut(&[u8]) -> io::Result<()>,
 {
     let packet_size = bytes_per_second.min(PACKET_SIZE as u64).max(1) as usize;
-    let packet = vec![0u8; packet_size];
     let interval = Duration::from_secs_f64(packet_size as f64 / bytes_per_second.max(1) as f64);
     let started = Instant::now();
+    let mut previous_send = started;
     while !stopping.load(Ordering::Relaxed) && !expired(started, runtime) {
+        let packet = build_tcp_frame(packet_size);
         if send(&packet).is_err() {
             return;
         }
         metrics.add(true, PacketType::Tcp, packet.len());
+        let now = Instant::now();
+        metrics.record_jitter(
+            PacketType::Tcp,
+            now.duration_since(previous_send).abs_diff(interval),
+        );
+        previous_send = now;
         writeln!(log, "{} TCP {} bytes", timestamp(), packet.len()).ok();
         thread::sleep(jittered_delay(interval, jitter_millis));
     }
@@ -637,20 +757,92 @@ fn send_udp_packets<F>(
 ) where
     F: FnMut(&[u8]) -> io::Result<()>,
 {
-    let packet_size = packet_size.max(8);
+    let packet_size = packet_size.max(UDP_HEADER_LEN);
     let interval = Duration::from_secs_f64(1.0 / rate.max(1) as f64);
     let mut sequence = 0u64;
     let started = Instant::now();
+    let mut previous_send = started;
     while !stopping.load(Ordering::Relaxed) && !expired(started, runtime) {
         let mut packet = vec![0u8; packet_size];
         packet[..8].copy_from_slice(&sequence.to_be_bytes());
+        packet[8..16].copy_from_slice(&Utc::now().timestamp_millis().to_be_bytes());
         if send(&packet).is_err() {
             return;
         }
         metrics.add(true, PacketType::Udp, packet.len());
+        let now = Instant::now();
+        metrics.record_jitter(
+            PacketType::Udp,
+            now.duration_since(previous_send).abs_diff(interval),
+        );
+        previous_send = now;
         writeln!(log, "{} UDP {} bytes", timestamp(), packet.len()).ok();
         sequence += 1;
         thread::sleep(jittered_delay(interval, jitter_millis));
+    }
+}
+
+/// Builds a TCP payload of `payload_len` bytes with a send timestamp embedded
+/// every `TCP_TIMESTAMP_CHUNK` bytes, so the receiver can measure jitter on a stream.
+fn build_tcp_frame(payload_len: usize) -> Vec<u8> {
+    let mut buffer = Vec::with_capacity(payload_len + payload_len.div_ceil(TCP_TIMESTAMP_CHUNK) * TCP_HEADER_LEN);
+    let mut remaining = payload_len;
+    while remaining > 0 {
+        let chunk = remaining.min(TCP_TIMESTAMP_CHUNK);
+        buffer.extend_from_slice(&Utc::now().timestamp_millis().to_be_bytes());
+        buffer.extend_from_slice(&(chunk as u16).to_be_bytes());
+        buffer.extend(std::iter::repeat_n(0u8, chunk));
+        remaining -= chunk;
+    }
+    buffer
+}
+
+enum TcpFrameState {
+    Header(Vec<u8>),
+    Payload { remaining: usize },
+}
+
+/// Parses the timestamp-framed TCP byte stream produced by `build_tcp_frame`,
+/// tolerating frames split arbitrarily across reads.
+struct TcpFrameReader {
+    state: TcpFrameState,
+}
+impl TcpFrameReader {
+    fn new() -> Self {
+        Self {
+            state: TcpFrameState::Header(Vec::with_capacity(TCP_HEADER_LEN)),
+        }
+    }
+    fn feed(&mut self, data: &[u8], metrics: &Metrics) {
+        let mut offset = 0;
+        while offset < data.len() {
+            match &mut self.state {
+                TcpFrameState::Header(buffer) => {
+                    let need = TCP_HEADER_LEN - buffer.len();
+                    let take = need.min(data.len() - offset);
+                    buffer.extend_from_slice(&data[offset..offset + take]);
+                    offset += take;
+                    if buffer.len() == TCP_HEADER_LEN {
+                        let timestamp_ms = i64::from_be_bytes(buffer[..8].try_into().unwrap());
+                        let length = u16::from_be_bytes(buffer[8..10].try_into().unwrap()) as usize;
+                        metrics.tcp_timestamp_jitter(timestamp_ms);
+                        self.state = if length == 0 {
+                            TcpFrameState::Header(Vec::with_capacity(TCP_HEADER_LEN))
+                        } else {
+                            TcpFrameState::Payload { remaining: length }
+                        };
+                    }
+                }
+                TcpFrameState::Payload { remaining } => {
+                    let take = (*remaining).min(data.len() - offset);
+                    offset += take;
+                    *remaining -= take;
+                    if *remaining == 0 {
+                        self.state = TcpFrameState::Header(Vec::with_capacity(TCP_HEADER_LEN));
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -670,268 +862,5 @@ fn jittered_delay(base: Duration, jitter_millis: u64) -> Duration {
         base.saturating_sub(Duration::from_millis(offset.unsigned_abs()))
     } else {
         base.saturating_add(Duration::from_millis(offset as u64))
-    }
-}
-#[cfg(test)]
-mod tests {
-    use super::*;
-    static TIMED_TEST_LOCK: Mutex<()> = Mutex::new(());
-    #[test]
-    fn config_defaults_are_local() {
-        assert_eq!(DEFAULT_REMOTE, "127.0.0.1");
-    }
-
-    #[test]
-    fn persisted_run_ids_are_incremental() {
-        let sql = SqlState::new();
-        sql.enable().unwrap();
-        let first = sql.next_run_id(1);
-        sql.start_run(first);
-        let second = sql.next_run_id(first + 1);
-        assert_eq!(second, first + 1);
-    }
-
-    #[test]
-    fn completion_does_not_overwrite_finished_result() {
-        let sql = SqlState::new();
-        sql.enable().unwrap();
-        let id = sql.next_run_id(1);
-        sql.start_run(id);
-        sql.complete_run(id, "ok");
-        sql.complete_run(id, "aborted");
-        let result: String = Connection::open(database_path())
-            .unwrap()
-            .query_row(
-                "SELECT result FROM runs WHERE id = ?1",
-                params![id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(result, "ok");
-    }
-
-    #[test]
-    fn metrics_table_stores_millisecond_timestamp() {
-        let sql = SqlState::new();
-        sql.enable().unwrap();
-        let values = [0; 8];
-        let run_id = sql.next_run_id(1);
-        sql.start_run(run_id);
-        sql.write_snapshot(&values, 0, 0, 0);
-        let timestamp_ms: i64 = Connection::open(database_path())
-            .unwrap()
-            .query_row(
-                "SELECT timestamp_ms FROM metrics WHERE run_id = ?1 ORDER BY rowid DESC LIMIT 1",
-                params![run_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(timestamp_ms > 0);
-    }
-
-    #[test]
-    fn timestamps_are_explicit_utc() {
-        let value = timestamp();
-        assert!(value.ends_with('Z'));
-        assert!(chrono::DateTime::parse_from_rfc3339(&value).is_ok());
-    }
-
-    #[test]
-    fn ten_second_udp_client_server_logs_match() {
-        let _test_lock = TIMED_TEST_LOCK.lock().unwrap();
-        let started = Instant::now();
-        let config = Arc::new(Mutex::new(Config {
-            rate: 10,
-            packet_type: PacketType::Udp,
-            tcp_bytes_per_second: 1024,
-            udp_packet_size: 1024,
-            client_runtime: 10,
-            server_runtime: 10,
-            jitter_millis: 0,
-            client_jitter_millis: 0,
-            server_jitter_millis: 0,
-        }));
-        let gate = Arc::new(StartGate::new());
-        let stopping = Arc::new(AtomicBool::new(false));
-        let metrics = Arc::new(Metrics::new());
-        let test_dir = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("log");
-        std::fs::create_dir_all(&test_dir).unwrap();
-        let database_path = database_path();
-        let sql = SqlState::new();
-        sql.enable().unwrap();
-        let run_id = sql.next_run_id(1);
-        File::create(test_dir.join("client.log")).unwrap();
-        File::create(test_dir.join("server.log")).unwrap();
-        File::create(test_dir.join("netmark.log")).unwrap();
-        File::create(test_dir.join("cli.log")).unwrap();
-        for file_name in ["cli.log", "client.log", "server.log", "netmark.log"] {
-            let mut file = File::options()
-                .append(true)
-                .open(test_dir.join(file_name))
-                .unwrap();
-            writeln!(file, "{} Starting run {}", timestamp(), run_id).unwrap();
-        }
-        spawn_server(
-            Arc::clone(&config),
-            Arc::clone(&gate),
-            Arc::clone(&stopping),
-            Arc::clone(&metrics),
-            test_dir.clone(),
-        );
-        spawn_client(
-            Arc::clone(&config),
-            Arc::clone(&gate),
-            Arc::clone(&stopping),
-            Arc::clone(&metrics),
-            DEFAULT_REMOTE.to_string(),
-            test_dir.clone(),
-        );
-        thread::sleep(Duration::from_millis(100));
-        gate.start();
-        thread::sleep(Duration::from_secs(10));
-        stopping.store(true, Ordering::Relaxed);
-        thread::sleep(Duration::from_millis(250));
-        let sent = metrics.current();
-        sql.start_run(run_id);
-        sql.write_snapshot(&sent, 0, 0, 0);
-        let client_log_path = test_dir.join("client.log");
-        let server_log_path = test_dir.join("server.log");
-        let client_log = std::fs::read_to_string(client_log_path).unwrap();
-        let server_log = std::fs::read_to_string(server_log_path).unwrap();
-        let client_bytes = client_log
-            .lines()
-            .filter_map(|line| line.split_whitespace().nth(2)?.parse::<u64>().ok())
-            .sum::<u64>();
-        let server_bytes = server_log
-            .lines()
-            .filter_map(|line| line.split_whitespace().nth(2)?.parse::<u64>().ok())
-            .sum::<u64>();
-        let database_bytes: u64 = Connection::open(database_path)
-            .unwrap()
-            .query_row(
-                "SELECT COALESCE(SUM(sent_udp_bytes), 0) FROM metrics WHERE run_id = ?1",
-                params![run_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let result = sent[3] > 0
-            && client_bytes > 0
-            && server_bytes > 0
-            && sent[3] == client_bytes
-            && client_bytes == server_bytes
-            && database_bytes == sent[3];
-        writeln!(
-            File::options()
-                .append(true)
-                .open(test_dir.join("netmark.log"))
-                .unwrap(),
-            "{} Run-Id {} result {}",
-            timestamp(),
-            run_id,
-            if result { "PASS" } else { "FAIL" }
-        )
-        .unwrap();
-        for file_name in ["cli.log", "client.log", "server.log", "netmark.log"] {
-            let mut file = File::options()
-                .append(true)
-                .open(test_dir.join(file_name))
-                .unwrap();
-            writeln!(file, "{} Completed run {}", timestamp(), run_id).unwrap();
-        }
-        assert!(
-            std::fs::read_to_string(test_dir.join("netmark.log"))
-                .unwrap()
-                .contains("result PASS")
-        );
-        let lifecycle = std::fs::read_to_string(test_dir.join("netmark.log")).unwrap();
-        assert_eq!(
-            lifecycle.matches(&format!("Starting run {run_id}")).count(),
-            1
-        );
-        assert_eq!(
-            lifecycle
-                .matches(&format!("Completed run {run_id}"))
-                .count(),
-            1
-        );
-        assert!(!lifecycle.contains("run 0"));
-        for file_name in ["cli.log", "client.log", "server.log", "netmark.log"] {
-            let contents = std::fs::read_to_string(test_dir.join(file_name)).unwrap();
-            assert!(
-                contents.contains(&format!("Starting run {run_id}")),
-                "{file_name} is missing start marker"
-            );
-            assert!(
-                contents.contains(&format!("Completed run {run_id}")),
-                "{file_name} is missing completion marker"
-            );
-        }
-        assert!(
-            result,
-            "run {run_id} did not produce matching nonzero logs and SQLite data"
-        );
-        assert!(started.elapsed() >= Duration::from_secs(10));
-    }
-
-    #[test]
-    fn ten_second_tcp_loopback_logs_match() {
-        let _test_lock = TIMED_TEST_LOCK.lock().unwrap();
-        let started = Instant::now();
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let stopping = Arc::new(AtomicBool::new(false));
-        let metrics = Arc::new(Metrics::new());
-        let test_dir =
-            std::env::temp_dir().join(format!("netmark-tcp-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&test_dir);
-        std::fs::create_dir_all(&test_dir).unwrap();
-        let client_log_path = test_dir.join("client.log");
-        let sender_stopping = Arc::clone(&stopping);
-        let sender_metrics = Arc::clone(&metrics);
-        let sender = thread::spawn(move || {
-            let mut stream = TcpStream::connect(address).unwrap();
-            let mut log = File::create(client_log_path).unwrap();
-            send_tcp_packets(
-                1024,
-                &sender_stopping,
-                &sender_metrics,
-                &mut log,
-                10,
-                0,
-                |packet| stream.write_all(packet),
-            );
-        });
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut server_log = File::create(test_dir.join("server.log")).unwrap();
-        let mut buffer = [0; PACKET_SIZE];
-        while let Ok(bytes) = stream.read(&mut buffer) {
-            if bytes == 0 {
-                break;
-            }
-            writeln!(server_log, "{} TCP {bytes} bytes", timestamp()).unwrap();
-        }
-        sender.join().unwrap();
-        server_log.flush().unwrap();
-        let client_bytes = std::fs::read_to_string(test_dir.join("client.log"))
-            .unwrap()
-            .lines()
-            .filter_map(|line| line.split_whitespace().nth(2)?.parse::<u64>().ok())
-            .sum::<u64>();
-        let server_bytes = std::fs::read_to_string(test_dir.join("server.log"))
-            .unwrap()
-            .lines()
-            .filter_map(|line| line.split_whitespace().nth(2)?.parse::<u64>().ok())
-            .sum::<u64>();
-        let sent_bytes = metrics.current()[1];
-        assert!(sent_bytes > 0, "client sent zero TCP bytes");
-        assert_eq!(sent_bytes, client_bytes);
-        assert_eq!(client_bytes, server_bytes);
-        assert!(started.elapsed() >= Duration::from_secs(10));
     }
 }

@@ -1,0 +1,21 @@
+server:
+  enabled: true
+client:
+  enabled: true
+  remote: 127.0.0.1
+traffic:
+  rate: 100
+  packet_type: tcp
+  tcp_bytes_per_second: 10240
+  udp_packet_size: 1024
+  client_runtime: 5
+  server_runtime: 5
+  jitter_millis: 0
+  client_jitter_millis: 0
+  server_jitter_millis: 0
+  max_tcp_jitter_millis: 1000
+  max_udp_jitter_millis: 1000
+  limit: 0
+metrics:
+  sql: null
+duration_seconds: 5

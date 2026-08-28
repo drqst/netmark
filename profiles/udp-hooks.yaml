@@ -1,0 +1,30 @@
+# Test profile that calls into Rust code. The hook names are resolved against
+# callbacks registered on netmark::sdk::TestRunner (see examples/sdk_hooks.rs);
+# running this profile with the plain `netmark <profile>` binary fails, because
+# no hooks are registered there.
+server:
+  enabled: true
+client:
+  enabled: true
+  remote: 127.0.0.1
+traffic:
+  rate: 10
+  packet_type: udp
+  tcp_bytes_per_second: 1024
+  udp_packet_size: 1024
+  client_runtime: 3
+  server_runtime: 3
+  jitter_millis: 0
+  client_jitter_millis: 0
+  server_jitter_millis: 0
+  max_tcp_jitter_millis: 1000
+  max_udp_jitter_millis: 1000
+  limit: 0
+metrics:
+  sql: null
+duration_seconds: 3
+hooks:
+  before:
+    - announce
+  after:
+    - require_traffic
