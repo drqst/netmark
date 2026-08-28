@@ -19,6 +19,58 @@ use std::time::{Duration, Instant};
 /// Wall-clock length of `selftest`.
 pub const SELFTEST_SECONDS: u64 = 3;
 
+/// The command stack behind the arrow keys. Position 0 is the line being typed;
+/// stepping back walks into older commands and stepping forward returns to
+/// position 0, restoring whatever was half-typed there.
+#[derive(Default)]
+pub struct History {
+    entries: Vec<String>,
+    position: usize,
+    draft: String,
+}
+
+impl History {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records a submitted command and returns to position 0. Blank lines and
+    /// immediate repeats are not stacked.
+    pub fn push(&mut self, line: &str) {
+        let line = line.trim();
+        if !line.is_empty() && self.entries.last().map(String::as_str) != Some(line) {
+            self.entries.push(line.to_string());
+        }
+        self.position = 0;
+        self.draft.clear();
+    }
+
+    pub fn step_back(&mut self, input: &mut String) {
+        if self.position == self.entries.len() {
+            return;
+        }
+        if self.position == 0 {
+            self.draft = input.clone();
+        }
+        self.position += 1;
+        *input = self.entries[self.entries.len() - self.position].clone();
+    }
+
+    pub fn step_forward(&mut self, input: &mut String) {
+        match self.position {
+            0 => {}
+            1 => {
+                self.position = 0;
+                *input = std::mem::take(&mut self.draft);
+            }
+            _ => {
+                self.position -= 1;
+                *input = self.entries[self.entries.len() - self.position].clone();
+            }
+        }
+    }
+}
+
 /// The set of clients this instance drives, each with its own id starting at 0.
 pub struct Clients {
     clients: Mutex<Vec<configuration::ClientConfig>>,
@@ -120,6 +172,21 @@ pub fn client_command(clients: &Clients, id: u64, args: &[&str], log_dir: &std::
             }
             Err(_) => cli_textout::line("jitter must be milliseconds"),
         },
+        ["webrtc", value] => match *value {
+            "on" | "enable" | "true" => {
+                clients.update(id, |client| client.webrtc = Some(true));
+                cli_textout::line(format!("client {id} sends WebRTC data channels"));
+            }
+            "off" | "disable" | "false" => {
+                clients.update(id, |client| client.webrtc = Some(false));
+                cli_textout::line(format!("client {id} sends plain traffic"));
+            }
+            "follow" => {
+                clients.update(id, |client| client.webrtc = None);
+                cli_textout::line(format!("client {id} follows the webrtc command"));
+            }
+            _ => cli_textout::line("client <id> webrtc: on | off | follow"),
+        },
         ["http", "check", url] => client_http_check(log_dir, url),
         ["status"] => {
             cli_textout::line(clients.get(id).map(|c| c.summary()).unwrap_or_default())
@@ -128,13 +195,46 @@ pub fn client_command(clients: &Clients, id: u64, args: &[&str], log_dir: &std::
     }
 }
 
-pub const CLIENT_USAGE: &str = "client: list | add | delete <id> | <id> enable | <id> disable | <id> remote <ip> | <id> runtime <seconds> | <id> jitter <ms> | <id> http check <url> | <id> status";
+pub const CLIENT_USAGE: &str = "client: list | add | delete <id> | <id> enable | <id> disable | <id> remote <ip> | <id> runtime <seconds> | <id> jitter <ms> | <id> webrtc <on|off|follow> | <id> http check <url> | <id> status";
 
 /// Subcommand: client list
 pub fn list_clients(clients: &Clients) {
     for client in clients.list() {
         cli_textout::line(client.summary());
     }
+}
+
+pub const WEBRTC_USAGE: &str =
+    "webrtc: enable | disable | channels <n> | label <name> | ordered <true|false> | status";
+
+/// Subcommand dispatcher for `webrtc <...>`; returns the resulting settings line.
+pub fn webrtc_command(
+    settings: &Arc<Mutex<crate::webrtc::Settings>>,
+    args: &[&str],
+) -> Result<String, String> {
+    let mut settings = settings.lock().unwrap();
+    match args {
+        ["enable"] => settings.enabled = true,
+        ["disable"] => settings.enabled = false,
+        ["channels", value] => {
+            let value: u16 = value.parse().map_err(|_| "channels must be 1 or more")?;
+            if value == 0 {
+                return Err("channels must be 1 or more".into());
+            }
+            settings.channels = value;
+        }
+        ["label", value] => settings.label = (*value).to_string(),
+        ["ordered", value] => {
+            settings.ordered = match *value {
+                "true" | "on" | "yes" => true,
+                "false" | "off" | "no" => false,
+                _ => return Err("ordered must be true or false".into()),
+            }
+        }
+        ["status"] | [] => {}
+        _ => return Err(WEBRTC_USAGE.into()),
+    }
+    Ok(settings.summary())
 }
 
 /// Subcommand: client runtime <seconds> | server runtime <seconds>
@@ -203,16 +303,20 @@ pub fn save_configuration(
     external: &Arc<Mutex<Option<Arc<ExternalSqlMetrics>>>>,
     smtp: &Arc<Mutex<configuration::SmtpConfig>>,
     restapi: &Arc<Mutex<configuration::RestApiConfig>>,
+    webrtc: &Arc<Mutex<crate::webrtc::Settings>>,
 ) -> Result<(), String> {
     let mut document = configuration::load(path).unwrap_or_default();
     document.traffic = crate::traffic_config_from(config);
     document.clients = clients.list();
     document.admin.emails = config.admin_emails.clone();
-    if let Some(sink) = external.lock().unwrap().as_ref() {
-        document.metrics.sql = Some(sink.connection_string().to_string());
-    }
+    document.metrics.sql = external
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|sink| sink.connection_string().to_string());
     document.smtp = smtp.lock().unwrap().clone();
     document.restapi = restapi.lock().unwrap().clone();
+    document.webrtc = crate::webrtc_config_from(&webrtc.lock().unwrap());
     let contents = serde_yaml::to_string(&document).map_err(|error| error.to_string())?;
     std::fs::write(path, contents).map_err(|error| error.to_string())
 }
@@ -226,6 +330,7 @@ pub fn reset_configuration(
     external: &Arc<Mutex<Option<Arc<ExternalSqlMetrics>>>>,
     smtp: &Arc<Mutex<configuration::SmtpConfig>>,
     restapi: &Arc<Mutex<configuration::RestApiConfig>>,
+    webrtc: &Arc<Mutex<crate::webrtc::Settings>>,
 ) {
     let file_config = configuration::load(path).unwrap_or_default();
     *config.lock().unwrap() = crate::config_from_file(&file_config);
@@ -238,6 +343,7 @@ pub fn reset_configuration(
         .map(Arc::new);
     *smtp.lock().unwrap() = file_config.smtp;
     *restapi.lock().unwrap() = file_config.restapi;
+    *webrtc.lock().unwrap() = crate::webrtc_settings(&file_config.webrtc);
 }
 
 /// Subcommand: admin smtp enabled | admin smtp disabled — turns SMTP use on or
@@ -401,19 +507,17 @@ pub fn run_selftest(
                 outcome.add_failure(error);
             }
         }
-        sql_state.complete_run(
+        sql_state.complete_run(run_id, &outcome.summary());
+        crate::record_final_metrics(
+            state_external.lock().unwrap().as_ref(),
             run_id,
-            outcome.result,
-            outcome.sent_bytes,
-            outcome.failure_reason.as_deref(),
+            &state_metrics,
+            &outcome,
         );
-        crate::record_final_metrics(state_external.lock().unwrap().as_ref(), run_id, &state_metrics);
         crate::write_run_event(&logs, run_id, "Completed");
+        crate::write_log_line(&logs, &outcome.report_line(run_id));
         cli_textout::raw("\r\n");
-        cli_textout::line(format!(
-            "selftest completed run {run_id} ({})",
-            outcome.result
-        ));
+        cli_textout::line(format!("selftest completed {}", outcome.report_line(run_id)));
     });
 }
 
@@ -425,7 +529,17 @@ pub fn run_benchmark(remote: &str, seconds: u64, sql: &SqlState, log_dir: &std::
     let mut stream = match TcpStream::connect(format!("{remote}:9000")) {
         Ok(stream) => stream,
         Err(error) => {
-            sql.complete_run(run_id, "error", 0, Some(&error.to_string()));
+            sql.complete_run(
+                run_id,
+                &core::RunSummary {
+                    result: "error",
+                    sent_bytes: 0,
+                    received_bytes: 0,
+                    sent_bytes_per_second: 0,
+                    received_bytes_per_second: 0,
+                    failure_reason: Some(&error.to_string()),
+                },
+            );
             crate::write_run_event(log_dir, run_id, "Completed");
             cli_textout::line(format!("benchmark run {run_id} failed: {error}"));
             return;
@@ -459,14 +573,21 @@ pub fn run_benchmark(remote: &str, seconds: u64, sql: &SqlState, log_dir: &std::
     }
     sql.complete_run(
         run_id,
-        if bytes > 0 { "ok" } else { "error" },
-        bytes,
-        if bytes > 0 { None } else { Some("no bytes sent") },
+        &core::RunSummary {
+            result: if bytes > 0 { "ok" } else { "error" },
+            sent_bytes: bytes,
+            received_bytes: 0,
+            sent_bytes_per_second: bytes_per_second,
+            received_bytes_per_second: 0,
+            failure_reason: if bytes > 0 { None } else { Some("no bytes sent") },
+        },
     );
     crate::write_run_event(log_dir, run_id, "Completed");
-    cli_textout::line(format!(
-        "benchmark run {run_id}: {bytes} bytes in {elapsed_ms} ms ({bytes_per_second} bytes/sec)"
-    ));
+    let line = format!(
+        "benchmark run {run_id}: {bytes} bytes in {elapsed_ms} ms up={bytes_per_second} bytes/sec down=0 bytes/sec"
+    );
+    crate::write_log_line(log_dir, &line);
+    cli_textout::line(line);
 }
 
 /// Subcommand dispatcher for `configure <...>`: tcp bytes, tcp/udp jitter,
@@ -506,8 +627,15 @@ pub fn configure(config: &Arc<Mutex<Config>>, args: &[&str]) -> Result<(), Strin
         config.lock().unwrap().udp_packet_size = value;
         return Ok(());
     }
+    if let ["udp_rate", value] = args {
+        let value = value
+            .parse()
+            .map_err(|_| "UDP rate must be packets per second")?;
+        config.lock().unwrap().udp_rate = value;
+        return Ok(());
+    }
     if let ["type", value] = args {
-        let packet_type = PacketType::parse(value).ok_or("type must be tcp or udp")?;
+        let packet_type = PacketType::parse(value).ok_or("type must be tcp, udp or ip")?;
         config.lock().unwrap().packet_type = packet_type;
         return Ok(());
     }
@@ -518,8 +646,10 @@ pub fn configure(config: &Arc<Mutex<Config>>, args: &[&str]) -> Result<(), Strin
         config.lock().unwrap().limit_bytes_per_second = value;
         return Ok(());
     }
-    Err("use: configure tcp bytes <rate>, udp packetsize <bytes>, type <tcp|udp>, or bandwidth limit <bytes/sec>".into())
+    Err(CONFIGURE_USAGE.into())
 }
+
+pub const CONFIGURE_USAGE: &str = "configure: metrics <connection> | save | reset | smtp <host[:port]> | type <tcp|udp|ip> | tcp bytes <bytes/sec> | tcp jitter <ms> | tcp maxjitter <ms> | udp_rate <packets/sec> | udp packetsize <bytes> | udp jitter <ms> | udp max jitter <ms> | bandwidth limit <bytes/sec>";
 
 /// Subcommand: client http check <url>
 pub fn client_http_check(log_dir: &std::path::Path, url: &str) {
@@ -568,21 +698,114 @@ pub fn client_http_check(log_dir: &std::path::Path, url: &str) {
     }
 }
 
-/// Helper for Command: status — run-scoped totals so counts correlate with the
-/// final report instead of the periodically-reset live display counters.
-pub fn traffic_status(metrics: &Metrics, running: bool) -> String {
+/// Everything `status` needs to know about the rest of the process.
+pub struct StatusContext<'a> {
+    pub running: bool,
+    pub elapsed: Option<Duration>,
+    pub run_id: u64,
+    pub server_enabled: bool,
+    pub clients: &'a Clients,
+    pub webrtc: &'a crate::webrtc::Settings,
+    pub packet_type: PacketType,
+    /// running, monitor id, calls, successes, failures
+    pub monitor: (bool, u64, u64, u64, u64),
+    pub metrics_sql: String,
+    pub restapi: String,
+    pub smtp: bool,
+}
+
+/// Command: status — run-scoped totals, so the counts correlate with the final
+/// report rather than with the periodically-reset live display counters.
+pub fn status_rows(metrics: &Metrics, context: &StatusContext<'_>) -> Vec<Vec<String>> {
     let values = metrics.run_totals();
     let (lost, order) = metrics.udp_status();
-    format!(
-        "{} TCP sent {} bytes, UDP sent {} bytes, TCP received {} bytes, UDP received {} bytes, UDP lost {}, out of order {}",
-        if running { "running" } else { "stopped" },
-        values[1],
-        values[3],
-        values[5],
-        values[7],
-        lost,
-        order
-    )
+    let (webrtc_sent, webrtc_received, webrtc_invalid) = metrics.webrtc_counts();
+    let elapsed = context.elapsed.unwrap_or_default();
+    let sent = metrics.run_sent_total();
+    let received = metrics.run_received_total();
+    let (monitor_on, monitor_id, calls, successes, failures) = context.monitor;
+    let mut rows = vec![
+        vec![
+            "Traffic".into(),
+            format!(
+                "{} ({})",
+                if context.running { "running" } else { "stopped" },
+                context.packet_type.as_str()
+            ),
+        ],
+        vec![
+            "Run".into(),
+            if context.run_id == 0 {
+                "none yet".to_string()
+            } else {
+                format!("{} ({} s elapsed)", context.run_id, elapsed.as_secs())
+            },
+        ],
+        vec![
+            "Bandwidth up".into(),
+            format!("{} bytes/sec", core::bandwidth(sent, elapsed)),
+        ],
+        vec![
+            "Bandwidth down".into(),
+            format!("{} bytes/sec", core::bandwidth(received, elapsed)),
+        ],
+        vec![
+            "Sent".into(),
+            format!(
+                "{} bytes  (TCP {}, UDP {}, IP {})",
+                sent, values[1], values[3], values[9]
+            ),
+        ],
+        vec![
+            "Received".into(),
+            format!(
+                "{} bytes  (TCP {}, UDP {}, IP {})",
+                received, values[5], values[7], values[11]
+            ),
+        ],
+        vec![
+            "UDP loss".into(),
+            format!("{lost} lost, {order} out of order"),
+        ],
+        vec![
+            "Jitter".into(),
+            format!(
+                "TCP {} ms, UDP {} ms",
+                metrics.tcp_jitter_millis(),
+                metrics.udp_jitter_millis()
+            ),
+        ],
+        vec!["Server".into(), enabled_word(context.server_enabled).into()],
+    ];
+    for client in context.clients.list() {
+        rows.push(vec![format!("Client {}", client.id), client.summary()]);
+    }
+    rows.push(vec!["WebRTC".into(), context.webrtc.summary()]);
+    if context.webrtc.enabled || webrtc_sent > 0 || webrtc_received > 0 {
+        rows.push(vec![
+            "WebRTC messages".into(),
+            format!("{webrtc_sent} sent, {webrtc_received} received, {webrtc_invalid} invalid"),
+        ]);
+    }
+    rows.push(vec![
+        "Monitor".into(),
+        format!(
+            "{} id {monitor_id}, {calls} calls, {successes} ok, {failures} failed",
+            if monitor_on { "on" } else { "off" }
+        ),
+    ]);
+    rows.push(vec!["Metrics SQL".into(), context.metrics_sql.clone()]);
+    rows.push(vec!["REST API".into(), context.restapi.clone()]);
+    rows.push(vec!["SMTP".into(), enabled_word(context.smtp).into()]);
+    rows
+}
+
+fn enabled_word(enabled: bool) -> &'static str {
+    if enabled { "enabled" } else { "disabled" }
+}
+
+pub fn print_status(metrics: &Metrics, context: &StatusContext<'_>) {
+    cli_textout::table(&status_rows(metrics, context), &[16, 80]);
 }
 
 /// Subcommand: monitor history
@@ -594,7 +817,7 @@ pub fn show_monitor_history(log_dir: &std::path::Path) {
                     || line.contains("Monitor started")
                     || line.contains("Monitor stopped")
                 {
-                    cli_textout::line(&line);
+                    cli_textout::line(line);
                 }
             }
         }
@@ -610,7 +833,11 @@ pub fn print_help(
     let _ = writeln!(output, "HIDE");
     let _ = output.flush();
     let _guard = stdout_guard.lock().unwrap();
-    let rows = vec![
+    cli_textout::table(&help_rows(), &[36, 64]);
+}
+
+pub fn help_rows() -> Vec<Vec<String>> {
+    vec![
         vec!["server".into(), "receiving side of traffic".into()],
         vec!["server enable".into(), "enable server traffic".into()],
         vec!["server disable".into(), "disable server traffic".into()],
@@ -644,8 +871,16 @@ pub fn print_help(
             "set that client's send jitter".into(),
         ],
         vec![
+            "client <id> webrtc on | off | follow".into(),
+            "connect the WebRTC layer to that client alone; follow (the default) uses `webrtc enable`".into(),
+        ],
+        vec![
             "client <id> http check <url>".into(),
             "load one HTTP or HTTPS page".into(),
+        ],
+        vec![
+            "client <id> status".into(),
+            "show one client's settings".into(),
         ],
         vec![
             "selftest".into(),
@@ -656,12 +891,24 @@ pub fn print_help(
             "flood the remote server with TCP and report bandwidth".into(),
         ],
         vec![
-            "configure tcp bytes <rate>".into(),
+            "configure type <tcp|udp|ip>".into(),
+            "pick the transport; ip is raw IPv4 and needs CAP_NET_RAW".into(),
+        ],
+        vec![
+            "configure tcp bytes <bytes/sec>".into(),
             "set TCP bytes per second".into(),
         ],
         vec![
             "configure tcp jitter <ms>".into(),
             "set TCP send jitter".into(),
+        ],
+        vec![
+            "configure tcp maxjitter <ms>".into(),
+            "fail a run above this measured TCP jitter".into(),
+        ],
+        vec![
+            "configure udp_rate <packets/sec>".into(),
+            "set UDP packets per second; also paces raw IP".into(),
         ],
         vec![
             "configure udp packetsize <bytes>".into(),
@@ -672,8 +919,33 @@ pub fn print_help(
             "set UDP send jitter".into(),
         ],
         vec![
+            "configure udp max jitter <ms>".into(),
+            "fail a run above this measured UDP jitter".into(),
+        ],
+        vec![
             "configure bandwidth limit <bytes/sec>".into(),
             "minimum acceptable throughput; 0 disables the check".into(),
+        ],
+        vec![
+            "webrtc enable | disable".into(),
+            "wrap traffic in WebRTC data-channel frames for every client that follows".into(),
+        ],
+        vec![
+            "webrtc channels <n>".into(),
+            "number of data channels to spread messages over".into(),
+        ],
+        vec!["webrtc label <name>".into(), "data-channel label".into()],
+        vec![
+            "webrtc ordered <true|false>".into(),
+            "ordered or unordered delivery".into(),
+        ],
+        vec![
+            "webrtc status".into(),
+            "show the current WebRTC settings".into(),
+        ],
+        vec![
+            "  connecting WebRTC".into(),
+            "`webrtc enable` turns it on for every client whose `webrtc` is `follow`; `client <id> webrtc on|off` overrides one client, so you can run WebRTC and plain traffic side by side".into(),
         ],
         vec![
             "metrics enable".into(),
@@ -684,8 +956,12 @@ pub fn print_help(
             "disable external SQL metrics".into(),
         ],
         vec![
+            "metrics status".into(),
+            "show the external SQL connection state".into(),
+        ],
+        vec![
             "configure metrics <connection>".into(),
-            "override the configured external SQL target".into(),
+            "set the external SQL target; off until you set one".into(),
         ],
         vec![
             "configure save".into(),
@@ -738,15 +1014,56 @@ pub fn print_help(
         ],
         vec!["start".into(), "start a traffic run".into()],
         vec!["stop".into(), "stop the traffic run".into()],
-        vec!["status".into(), "show current counters".into()],
+        vec![
+            "status".into(),
+            "show current counters and bandwidth up and down".into(),
+        ],
         vec![
             "clean".into(),
             "delete data while preserving the run ID counter".into(),
         ],
-        vec!["show run <id>".into(), "show stored run metrics".into()],
-        vec!["list".into(), "list all run IDs and results".into()],
+        vec![
+            "show run <id>".into(),
+            "show one run, its bandwidth and both debriefs".into(),
+        ],
+        vec![
+            "list".into(),
+            "list all runs with role, result and bandwidth".into(),
+        ],
         vec!["help".into(), "show this help".into()],
-        vec!["exit".into(), "stop workers and exit".into()],
-    ];
-    cli_textout::table(&rows, &[34, 64]);
+        vec!["quit | exit".into(), "stop workers and exit".into()],
+    ]
+}
+
+/// Every command word the interactive loop accepts, so `help` can be checked
+/// against the dispatcher instead of drifting from it.
+pub const COMMANDS: &[&str] = &[
+    "server",
+    "client",
+    "selftest",
+    "benchmark",
+    "configure",
+    "webrtc",
+    "metrics",
+    "monitor",
+    "admin",
+    "restapi",
+    "start",
+    "stop",
+    "status",
+    "clean",
+    "show run",
+    "list",
+    "help",
+    "quit",
+    "exit",
+];
+
+/// The first word of every row in the help table, used to prove `help` covers
+/// every command in [`COMMANDS`].
+pub fn help_topics() -> Vec<String> {
+    help_rows()
+        .into_iter()
+        .map(|row| row[0].clone())
+        .collect()
 }

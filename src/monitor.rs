@@ -1,7 +1,7 @@
 use crate::core::SqlState;
 use reqwest::blocking::Client;
 use std::fs::OpenOptions;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -34,7 +34,7 @@ impl MonitorState {
     pub fn set_target(&self, target: String) {
         *self.target.lock().unwrap() = Some(target);
     }
-    pub fn start(&self, log_dir: &PathBuf) -> Option<u64> {
+    pub fn start(&self, log_dir: &Path) -> Option<u64> {
         if self.running.swap(true, Ordering::Relaxed) {
             None
         } else {
@@ -48,7 +48,7 @@ impl MonitorState {
             Some(id)
         }
     }
-    pub fn stop(&self, log_dir: &PathBuf) {
+    pub fn stop(&self, log_dir: &Path) {
         if self.running.swap(false, Ordering::Relaxed) {
             append(
                 log_dir,
@@ -80,8 +80,9 @@ impl MonitorState {
                 Err(_) => return,
             };
             while !std::thread::panicking() {
-                if self.running.load(Ordering::Relaxed) {
-                    if let Some(target) = self.target.lock().unwrap().clone() {
+                if self.running.load(Ordering::Relaxed)
+                    && let Some(target) = self.target.lock().unwrap().clone()
+                {
                         let call_id = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
                         let timestamp = crate::core::timestamp();
                         let result = client
@@ -120,7 +121,6 @@ impl MonitorState {
                             );
                             sql.record_alarm(&timestamp, &target, &detail);
                         }
-                    }
                 }
                 thread::sleep(Duration::from_secs(30));
             }
@@ -128,7 +128,13 @@ impl MonitorState {
     }
 }
 
-fn append(log_dir: &PathBuf, name: &str, line: &str) {
+impl Default for MonitorState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn append(log_dir: &Path, name: &str, line: &str) {
     if let Ok(mut file) = OpenOptions::new()
         .create(true)
         .append(true)

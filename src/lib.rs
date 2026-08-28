@@ -8,9 +8,11 @@ pub mod configuration;
 pub mod core;
 pub mod metrics;
 pub mod monitor;
+pub mod rawip;
 pub mod restapi;
 pub mod sdk;
 pub mod smtp;
+pub mod webrtc;
 
 #[cfg(test)]
 mod tests;
@@ -29,7 +31,26 @@ use std::time::{Duration, Instant};
 pub fn config_from_file(file_config: &configuration::FileConfig) -> Config {
     let mut config = config_from_traffic(&file_config.traffic);
     config.admin_emails = file_config.admin.emails.clone();
+    config.webrtc = webrtc_settings(&file_config.webrtc);
     config
+}
+
+pub fn webrtc_settings(config: &configuration::WebRtcConfig) -> webrtc::Settings {
+    webrtc::Settings {
+        enabled: config.enabled,
+        channels: config.channels.max(1),
+        label: config.label.clone(),
+        ordered: config.ordered,
+    }
+}
+
+pub fn webrtc_config_from(settings: &webrtc::Settings) -> configuration::WebRtcConfig {
+    configuration::WebRtcConfig {
+        enabled: settings.enabled,
+        channels: settings.channels,
+        label: settings.label.clone(),
+        ordered: settings.ordered,
+    }
 }
 
 pub fn config_from_traffic(traffic: &configuration::TrafficConfig) -> Config {
@@ -46,15 +67,17 @@ pub fn config_from_traffic(traffic: &configuration::TrafficConfig) -> Config {
         max_tcp_jitter_millis: traffic.max_tcp_jitter_millis,
         max_udp_jitter_millis: traffic.max_udp_jitter_millis,
         limit_bytes_per_second: traffic.limit,
+        webrtc: webrtc::Settings::default(),
         admin_emails: Vec::new(),
     }
 }
 
-/// Per-client view of the traffic settings, applying that client's runtime and
-/// jitter overrides on top of the profile-wide values.
+/// Per-client view of the traffic settings, applying that client's runtime,
+/// jitter and WebRTC overrides on top of the profile-wide values.
 pub fn client_config(
     traffic: &configuration::TrafficConfig,
     client: &configuration::ClientConfig,
+    webrtc: &webrtc::Settings,
 ) -> Config {
     let mut config = config_from_traffic(traffic);
     if let Some(runtime) = client.runtime {
@@ -63,6 +86,8 @@ pub fn client_config(
     if let Some(jitter) = client.jitter_millis {
         config.client_jitter_millis = jitter;
     }
+    config.webrtc = webrtc.clone();
+    config.webrtc.enabled = client.webrtc.unwrap_or(webrtc.enabled);
     config
 }
 
@@ -83,11 +108,15 @@ pub fn traffic_config_from(config: &Config) -> configuration::TrafficConfig {
     }
 }
 
-/// The end state of a run as stored in local SQLite: bytes sent, plus whether it
-/// stayed within the configured jitter and throughput limits (millisecond-level
-/// metrics never touch local SQLite; they only go to the configured external SQL).
+/// The end state of a run as stored in local SQLite: bytes moved in each
+/// direction and the bandwidth that implies, plus whether the run stayed within
+/// the configured jitter and throughput limits (millisecond-level metrics never
+/// touch local SQLite; they only go to the configured external SQL).
 pub struct RunOutcome {
     pub sent_bytes: u64,
+    pub received_bytes: u64,
+    pub sent_bytes_per_second: u64,
+    pub received_bytes_per_second: u64,
     pub result: &'static str,
     pub failure_reason: Option<String>,
 }
@@ -101,13 +130,37 @@ impl RunOutcome {
             None => reason,
         });
     }
+    pub fn summary(&self) -> core::RunSummary<'_> {
+        core::RunSummary {
+            result: self.result,
+            sent_bytes: self.sent_bytes,
+            received_bytes: self.received_bytes,
+            sent_bytes_per_second: self.sent_bytes_per_second,
+            received_bytes_per_second: self.received_bytes_per_second,
+            failure_reason: self.failure_reason.as_deref(),
+        }
+    }
+    /// The one line every surface prints for a finished run.
+    pub fn report_line(&self, run_id: u64) -> String {
+        format!(
+            "run {run_id} result={} sent_bytes={} received_bytes={} up={} bytes/sec down={} bytes/sec{}",
+            self.result,
+            self.sent_bytes,
+            self.received_bytes,
+            self.sent_bytes_per_second,
+            self.received_bytes_per_second,
+            self.failure_reason
+                .as_deref()
+                .map(|reason| format!(" reason=\"{reason}\""))
+                .unwrap_or_default()
+        )
+    }
 }
 
 pub fn evaluate_run(metrics: &Metrics, config: &Config, elapsed: Option<Duration>) -> RunOutcome {
-    let (sent_tcp, sent_udp) = metrics.run_sent_bytes();
-    let sent_bytes = sent_tcp + sent_udp;
-    let (received_tcp, received_udp) = metrics.run_received_bytes();
-    let received_bytes = received_tcp + received_udp;
+    let sent_bytes = metrics.run_sent_total();
+    let received_bytes = metrics.run_received_total();
+    let elapsed = elapsed.unwrap_or_default();
     let mut reasons = Vec::new();
     if sent_bytes == 0 {
         reasons.push("no bytes were sent".to_string());
@@ -126,31 +179,29 @@ pub fn evaluate_run(metrics: &Metrics, config: &Config, elapsed: Option<Duration
             config.max_udp_jitter_millis
         ));
     }
+    let sent_bytes_per_second = core::bandwidth(sent_bytes, elapsed);
+    let received_bytes_per_second = core::bandwidth(received_bytes, elapsed);
     if config.limit_bytes_per_second > 0 {
-        let elapsed_secs = elapsed.unwrap_or_default().as_secs_f64().max(1.0);
         // Only check a side's throughput if that role actually transferred bytes
         // this run, so an idle client or server doesn't produce a false failure.
-        if sent_bytes > 0 {
-            let bytes_per_second = (sent_bytes as f64 / elapsed_secs) as u64;
-            if bytes_per_second < config.limit_bytes_per_second {
-                reasons.push(format!(
-                    "client throughput {bytes_per_second} bytes/sec below limit {}",
-                    config.limit_bytes_per_second
-                ));
-            }
+        if sent_bytes > 0 && sent_bytes_per_second < config.limit_bytes_per_second {
+            reasons.push(format!(
+                "client throughput {sent_bytes_per_second} bytes/sec below limit {}",
+                config.limit_bytes_per_second
+            ));
         }
-        if received_bytes > 0 {
-            let bytes_per_second = (received_bytes as f64 / elapsed_secs) as u64;
-            if bytes_per_second < config.limit_bytes_per_second {
-                reasons.push(format!(
-                    "server throughput {bytes_per_second} bytes/sec below limit {}",
-                    config.limit_bytes_per_second
-                ));
-            }
+        if received_bytes > 0 && received_bytes_per_second < config.limit_bytes_per_second {
+            reasons.push(format!(
+                "server throughput {received_bytes_per_second} bytes/sec below limit {}",
+                config.limit_bytes_per_second
+            ));
         }
     }
     RunOutcome {
         sent_bytes,
+        received_bytes,
+        sent_bytes_per_second,
+        received_bytes_per_second,
         result: if reasons.is_empty() { "ok" } else { "fail" },
         failure_reason: if reasons.is_empty() {
             None
@@ -167,6 +218,7 @@ pub fn record_final_metrics(
     sink: Option<&Arc<ExternalSqlMetrics>>,
     run_id: u64,
     metrics: &Metrics,
+    outcome: &RunOutcome,
 ) {
     if let Some(sink) = sink {
         let (lost, out_of_order) = metrics.udp_status();
@@ -177,8 +229,36 @@ pub fn record_final_metrics(
             lost,
             out_of_order,
             metrics.jitter_millis(),
+            outcome.sent_bytes_per_second,
+            outcome.received_bytes_per_second,
         );
     }
+}
+
+/// Appends one line to netmark.log.
+pub fn write_log_line(log_dir: &std::path::Path, line: &str) {
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_dir.join("netmark.log"))
+    {
+        let _ = writeln!(file, "{} {line}", core::timestamp());
+    }
+}
+
+/// Blocks until an RFC 3339 instant, so machines handed the same profile begin
+/// sending together. An instant already past starts immediately.
+pub fn wait_until(start_at: Option<&str>) -> Result<(), String> {
+    let Some(start_at) = start_at else {
+        return Ok(());
+    };
+    let target = chrono::DateTime::parse_from_rfc3339(start_at)
+        .map_err(|error| format!("start_at must be an RFC 3339 timestamp: {error}"))?;
+    let wait = target.timestamp_millis() - chrono::Utc::now().timestamp_millis();
+    if wait > 0 {
+        thread::sleep(Duration::from_millis(wait as u64));
+    }
+    Ok(())
 }
 
 pub fn write_run_event(log_dir: &std::path::Path, run_id: u64, event: &str) {
@@ -191,10 +271,10 @@ pub fn write_run_event(log_dir: &std::path::Path, run_id: u64, event: &str) {
         let already_logged = std::fs::read_to_string(&path)
             .map(|contents| contents.lines().any(|line| line.ends_with(&marker)))
             .unwrap_or(false);
-        if !already_logged {
-            if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-                let _ = writeln!(file, "{} {}", core::timestamp(), marker);
-            }
+        if !already_logged
+            && let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path)
+        {
+            let _ = writeln!(file, "{} {}", core::timestamp(), marker);
         }
     }
 }
@@ -243,7 +323,10 @@ pub(crate) fn execute_profile(
         .as_deref()
         .and_then(|connection| ExternalSqlMetrics::connect(connection).ok())
         .map(Arc::new);
-    let config = Arc::new(Mutex::new(config_from_traffic(&profile.traffic)));
+    let webrtc = webrtc_settings(&profile.webrtc);
+    let mut base_config = config_from_traffic(&profile.traffic);
+    base_config.webrtc = webrtc.clone();
+    let config = Arc::new(Mutex::new(base_config));
     let packet_type = config.lock().unwrap().packet_type;
     let stopping = Arc::new(AtomicBool::new(false));
     let metrics = Arc::new(Metrics::new());
@@ -269,7 +352,7 @@ pub(crate) fn execute_profile(
     }
     for client in &clients {
         core::spawn_client(
-            Arc::new(Mutex::new(client_config(&profile.traffic, client))),
+            Arc::new(Mutex::new(client_config(&profile.traffic, client, &webrtc))),
             Arc::clone(&gate),
             Arc::clone(&stopping),
             Arc::clone(&metrics),
@@ -279,6 +362,7 @@ pub(crate) fn execute_profile(
         );
     }
     sql.start_run(run_id);
+    wait_until(profile.start_at.as_deref())?;
     let started = Instant::now();
     gate.start();
     thread::sleep(Duration::from_secs(profile.duration_seconds.max(1)));
@@ -312,13 +396,9 @@ pub(crate) fn execute_profile(
         }
         None => None,
     };
-    sql.complete_run(
-        run_id,
-        outcome.result,
-        outcome.sent_bytes,
-        outcome.failure_reason.as_deref(),
-    );
-    record_final_metrics(external.as_ref(), run_id, &metrics);
+    sql.complete_run(run_id, &outcome.summary());
+    write_log_line(log_dir, &outcome.report_line(run_id));
+    record_final_metrics(external.as_ref(), run_id, &metrics, &outcome);
     Ok(ProfileRun {
         run_id,
         metrics,

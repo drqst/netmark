@@ -109,7 +109,7 @@ paths:
                     type: array
                     items:
                       type: string
-                      example: "2026-08-28T12:34:16.109Z run 215 role=client+server ok sent_bytes=51200"
+                      example: "2026-08-28T12:34:16.109Z run 215 role=client+server ok sent_bytes=51200 received_bytes=51200 up=17066 bytes/sec down=17066 bytes/sec"
         "500":
           $ref: "#/components/responses/Error"
     post:
@@ -224,6 +224,12 @@ components:
           format: int64
           nullable: true
           description: Overrides traffic.client_jitter_millis for this client
+        webrtc:
+          type: boolean
+          nullable: true
+          description: |
+            Connects the WebRTC layer to this client alone. Null follows the
+            profile's `webrtc.enabled`.
 
     Traffic:
       type: object
@@ -234,7 +240,10 @@ components:
           description: UDP packets per second; ignored for TCP
         packet_type:
           type: string
-          enum: [tcp, udp]
+          enum: [tcp, udp, ip]
+          description: |
+            `ip` carries the payload directly in IPv4 packets using protocol
+            number 253 and needs CAP_NET_RAW.
         tcp_bytes_per_second:
           type: integer
           format: int64
@@ -285,6 +294,24 @@ components:
           items:
             type: string
 
+    WebRtc:
+      type: object
+      description: |
+        The WebRTC data-channel layer that rides on top of the selected transport.
+        It reproduces DCEP-style channel setup, per-channel message sequencing and
+        the ordered/unordered distinction; it is not a full ICE/DTLS/SCTP stack.
+      properties:
+        enabled:
+          type: boolean
+        channels:
+          type: integer
+          minimum: 1
+          description: Messages are spread round-robin over this many channels
+        label:
+          type: string
+        ordered:
+          type: boolean
+
     TestProfile:
       type: object
       properties:
@@ -299,17 +326,29 @@ components:
             $ref: "#/components/schemas/Client"
         traffic:
           $ref: "#/components/schemas/Traffic"
+        webrtc:
+          $ref: "#/components/schemas/WebRtc"
         metrics:
           type: object
           properties:
             sql:
               type: string
               nullable: true
-              description: External SQL connection string for the final metrics row
+              description: |
+                External SQL connection string for the final metrics row. Null by
+                default, which means nothing is written off this host.
         duration_seconds:
           type: integer
           format: int64
           minimum: 1
+        start_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: |
+            RFC 3339 UTC instant to begin sending at. The run is set up first and
+            then blocks until this moment, so every machine given the same value
+            starts together. Null starts immediately.
         hooks:
           $ref: "#/components/schemas/Hooks"
 
@@ -339,7 +378,7 @@ components:
           description: Which side produced this record
         protocol:
           type: string
-          enum: [tcp, udp]
+          enum: [tcp, udp, ip]
         sent_packets:
           type: integer
           format: int64
@@ -388,10 +427,16 @@ components:
         sent_udp_bytes:
           type: integer
           format: int64
+        sent_ip_bytes:
+          type: integer
+          format: int64
         received_tcp_bytes:
           type: integer
           format: int64
         received_udp_bytes:
+          type: integer
+          format: int64
+        received_ip_bytes:
           type: integer
           format: int64
         sent_bytes:
@@ -400,9 +445,18 @@ components:
         received_bytes:
           type: integer
           format: int64
+        sent_bytes_per_second:
+          type: integer
+          format: int64
+          description: Upload bandwidth over the run
+        received_bytes_per_second:
+          type: integer
+          format: int64
+          description: Download bandwidth over the run
         throughput_bytes_per_second:
           type: integer
           format: int64
+          description: Alias of sent_bytes_per_second
         lost_udp_packets:
           type: integer
           format: int64
@@ -413,6 +467,15 @@ components:
           type: integer
           format: int64
         udp_jitter_millis:
+          type: integer
+          format: int64
+        webrtc_sent_messages:
+          type: integer
+          format: int64
+        webrtc_received_messages:
+          type: integer
+          format: int64
+        webrtc_invalid_frames:
           type: integer
           format: int64
         debrief:
@@ -429,8 +492,8 @@ components:
           format: int64
         summary:
           type: string
-          description: Includes the role of the host that recorded the run
-          example: "started 2026-08-28T12:34:13.101Z completed 2026-08-28T12:34:16.116Z role client+server result ok sent_bytes=51200"
+          description: Includes the role of the host that recorded the run and the bandwidth in each direction
+          example: "started 2026-08-28T12:34:13.101Z completed 2026-08-28T12:34:16.116Z role client+server result ok sent_bytes=51200 received_bytes=51200 up=17066 bytes/sec down=17066 bytes/sec"
         debriefs:
           type: array
           description: One entry per role that recorded a debrief for this run

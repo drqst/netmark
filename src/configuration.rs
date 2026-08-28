@@ -15,6 +15,28 @@ pub struct FileConfig {
     pub smtp: SmtpConfig,
     #[serde(default)]
     pub restapi: RestApiConfig,
+    #[serde(default)]
+    pub webrtc: WebRtcConfig,
+}
+
+/// The WebRTC data-channel layer that rides on top of the selected transport.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct WebRtcConfig {
+    pub enabled: bool,
+    pub channels: u16,
+    pub label: String,
+    pub ordered: bool,
+}
+impl Default for WebRtcConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            channels: 1,
+            label: "netmark".to_string(),
+            ordered: true,
+        }
+    }
 }
 
 /// Mirrors `core::Config` so the same settings apply whether they come from the
@@ -24,6 +46,7 @@ pub struct FileConfig {
 pub struct TrafficConfig {
     /// UDP packets per second; ignored for TCP, which is paced by `tcp_bytes_per_second`.
     pub udp_rate: u64,
+    /// `tcp`, `udp` or `ip`.
     pub packet_type: String,
     pub tcp_bytes_per_second: u64,
     pub udp_packet_size: usize,
@@ -57,6 +80,8 @@ impl Default for TrafficConfig {
     }
 }
 
+/// External metrics database. Nothing is written anywhere off this host until a
+/// connection string is set, so this is empty by default.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct MetricsConfig {
     pub sql: Option<String>,
@@ -116,8 +141,12 @@ pub struct TestProfile {
     pub server: RoleConfig,
     pub clients: Vec<ClientConfig>,
     pub traffic: TrafficConfig,
+    pub webrtc: WebRtcConfig,
     pub metrics: MetricsConfig,
     pub duration_seconds: u64,
+    /// RFC 3339 UTC instant to begin sending at. Every machine given the same
+    /// value starts together, to the accuracy of their clocks.
+    pub start_at: Option<String>,
     pub hooks: HooksConfig,
 }
 impl Default for TestProfile {
@@ -126,8 +155,10 @@ impl Default for TestProfile {
             server: RoleConfig::default(),
             clients: vec![ClientConfig::new(0)],
             traffic: TrafficConfig::default(),
+            webrtc: WebRtcConfig::default(),
             metrics: MetricsConfig::default(),
             duration_seconds: 3,
+            start_at: None,
             hooks: HooksConfig::default(),
         }
     }
@@ -157,7 +188,7 @@ pub struct RoleConfig {
 }
 
 /// One sending client. A netmark instance can drive several at once, each with
-/// its own id, destination, and optional runtime and jitter overrides.
+/// its own id, destination, and optional runtime, jitter and WebRTC overrides.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ClientConfig {
@@ -168,6 +199,8 @@ pub struct ClientConfig {
     pub runtime: Option<u64>,
     /// Overrides `traffic.client_jitter_millis` when set.
     pub jitter_millis: Option<u64>,
+    /// Overrides `webrtc.enabled` for this client alone; `None` follows it.
+    pub webrtc: Option<bool>,
 }
 impl Default for ClientConfig {
     fn default() -> Self {
@@ -182,11 +215,12 @@ impl ClientConfig {
             remote: "127.0.0.1".to_string(),
             runtime: None,
             jitter_millis: None,
+            webrtc: None,
         }
     }
     pub fn summary(&self) -> String {
         format!(
-            "client {} {} remote={}{}{}",
+            "client {} {} remote={}{}{} webrtc={}",
             self.id,
             if self.enabled { "enabled" } else { "disabled" },
             self.remote,
@@ -195,7 +229,12 @@ impl ClientConfig {
                 .unwrap_or_default(),
             self.jitter_millis
                 .map(|value| format!(" jitter_millis={value}"))
-                .unwrap_or_default()
+                .unwrap_or_default(),
+            match self.webrtc {
+                Some(true) => "on",
+                Some(false) => "off",
+                None => "follow",
+            }
         )
     }
 }

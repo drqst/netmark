@@ -23,6 +23,18 @@ fn random_u64() -> u64 {
     RandomState::new().build_hasher().finish()
 }
 
+/// A finished run with no traffic, for tests that only care about the result.
+fn summary(result: &str) -> crate::core::RunSummary<'_> {
+    crate::core::RunSummary {
+        result,
+        sent_bytes: 0,
+        received_bytes: 0,
+        sent_bytes_per_second: 0,
+        received_bytes_per_second: 0,
+        failure_reason: None,
+    }
+}
+
 #[test]
 fn config_defaults_are_local() {
     assert_eq!(DEFAULT_REMOTE, "127.0.0.1");
@@ -79,8 +91,8 @@ fn completion_does_not_overwrite_finished_result() {
     sql.enable().unwrap();
     let id = sql.next_run_id(1);
     sql.start_run(id);
-    sql.complete_run(id, "ok", 0, None);
-    sql.complete_run(id, "aborted", 0, None);
+    sql.complete_run(id, &summary("ok"));
+    sql.complete_run(id, &summary("aborted"));
     let result: String = Connection::open(database_path())
         .unwrap()
         .query_row(
@@ -127,17 +139,28 @@ fn metrics_database_random_data_round_trip() {
     let _ = std::fs::remove_file(&path);
     let sink = ExternalSqlMetrics::connect(&format!("sqlite://{}", path.display())).unwrap();
     let run_id = random_u64() % 1_000_000 + 1;
-    let values: [u64; 8] = std::array::from_fn(|_| random_u64() % 1_000_000 + 1);
+    let values: [u64; 12] = std::array::from_fn(|_| random_u64() % 1_000_000 + 1);
     let lost = random_u64() % 1000 + 1;
     let out_of_order = random_u64() % 1000 + 1;
     let jitter = random_u64() % 1000 + 1;
-    sink.write(&timestamp(), run_id, &values, lost, out_of_order, jitter)
-        .unwrap();
+    let up = random_u64() % 1000 + 1;
+    let down = random_u64() % 1000 + 1;
+    sink.write(
+        &timestamp(),
+        run_id,
+        &values,
+        lost,
+        out_of_order,
+        jitter,
+        up,
+        down,
+    )
+    .unwrap();
     drop(sink);
-    let row: (u64, u64, u64, u64, u64, u64, u64, u64) = Connection::open(&path)
+    let row: (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) = Connection::open(&path)
         .unwrap()
         .query_row(
-            "SELECT run_id, sent_tcp_bytes, sent_udp_bytes, received_tcp_bytes, received_udp_bytes, lost_udp_packets, out_of_order_udp_packets, jitter_millis FROM netmark_metrics WHERE run_id = ?1",
+            "SELECT run_id, sent_tcp_bytes, sent_udp_bytes, received_tcp_bytes, received_udp_bytes, lost_udp_packets, out_of_order_udp_packets, jitter_millis, sent_ip_bytes, received_ip_bytes, sent_bytes_per_second, received_bytes_per_second FROM netmark_metrics WHERE run_id = ?1",
             params![run_id],
             |row| {
                 Ok((
@@ -149,6 +172,10 @@ fn metrics_database_random_data_round_trip() {
                     row.get(5)?,
                     row.get(6)?,
                     row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
                 ))
             },
         )
@@ -163,7 +190,11 @@ fn metrics_database_random_data_round_trip() {
             values[7],
             lost,
             out_of_order,
-            jitter
+            jitter,
+            values[9],
+            values[11],
+            up,
+            down
         )
     );
     let _ = std::fs::remove_file(path);
@@ -180,16 +211,21 @@ fn sqlite_metrics_can_be_read_back() {
     sink.write(
         "2026-08-28T00:00:00.000Z",
         7,
-        &[1, 1024, 2, 2048, 3, 3072, 4, 4096],
+        &[1, 1024, 2, 2048, 3, 3072, 4, 4096, 8, 8192, 9, 9216],
         5,
         6,
         7,
+        512,
+        256,
     )
     .unwrap();
     drop(sink);
     let connection = Connection::open(&path).unwrap();
-    let row: (u64, u64, u64, u64, u64, u64, u64, u64) = connection.query_row("SELECT run_id, sent_tcp_bytes, sent_udp_bytes, received_tcp_bytes, received_udp_bytes, lost_udp_packets, out_of_order_udp_packets, jitter_millis FROM netmark_metrics", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?))).unwrap();
-    assert_eq!(row, (7, 1024, 2048, 3072, 4096, 5, 6, 7));
+    let row: (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) = connection.query_row("SELECT run_id, sent_tcp_bytes, sent_udp_bytes, received_tcp_bytes, received_udp_bytes, lost_udp_packets, out_of_order_udp_packets, jitter_millis, sent_ip_bytes, received_ip_bytes, sent_bytes_per_second, received_bytes_per_second FROM netmark_metrics", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?, row.get(10)?, row.get(11)?))).unwrap();
+    assert_eq!(
+        row,
+        (7, 1024, 2048, 3072, 4096, 5, 6, 7, 8192, 9216, 512, 256)
+    );
     let _ = std::fs::remove_file(path);
 }
 
@@ -210,6 +246,7 @@ fn three_second_udp_client_server_logs_match() {
         max_tcp_jitter_millis: 1000,
         max_udp_jitter_millis: 1000,
         limit_bytes_per_second: 0,
+        webrtc: crate::webrtc::Settings::default(),
         admin_emails: Vec::new(),
     }));
     let gate = Arc::new(StartGate::new());
@@ -268,7 +305,7 @@ fn three_second_udp_client_server_logs_match() {
     let external = ExternalSqlMetrics::connect(&format!("sqlite://{}", metrics_db_path.display()))
         .unwrap();
     external
-        .write(&timestamp(), run_id, &sent, 0, 0, 0)
+        .write(&timestamp(), run_id, &sent, 0, 0, 0, 0, 0)
         .unwrap();
     let client_log_path = test_dir.join("client.log");
     let server_log_path = test_dir.join("server.log");
@@ -374,6 +411,7 @@ fn three_second_tcp_loopback_logs_match() {
             3,
             0,
             0,
+            &crate::webrtc::Settings::default(),
             |packet| stream.write_all(packet),
         );
     });
@@ -525,7 +563,7 @@ fn udp_intentional_reordering_is_flagged_as_failure() {
     );
 }
 
-/// Sends real TCP traffic at a known rate, then checks `evaluate_run`'s bandwidth
+/// Sends real TCP traffic at a known bytes-per-second, then checks `evaluate_run`'s bandwidth
 /// verdict against configured limits both below and above the achieved throughput.
 #[test]
 fn bandwidth_is_checked_against_configured_limit() {
@@ -556,6 +594,7 @@ fn bandwidth_is_checked_against_configured_limit() {
             runtime_secs,
             0,
             0,
+            &crate::webrtc::Settings::default(),
             |packet| stream.write_all(packet),
         );
     });
@@ -814,17 +853,39 @@ fn clients_are_identified_by_id_starting_at_zero() {
     assert_eq!(clients.add(), 1);
 }
 
-/// A per-client runtime override must win over the profile-wide traffic setting.
+/// A per-client runtime override must win over the profile-wide traffic setting,
+/// and a client can opt out of the WebRTC layer on its own.
 #[test]
 fn client_overrides_beat_the_profile_wide_traffic_settings() {
-    let mut traffic = crate::configuration::TrafficConfig::default();
-    traffic.client_runtime = 30;
-    traffic.client_jitter_millis = 5;
+    let traffic = crate::configuration::TrafficConfig {
+        client_runtime: 30,
+        client_jitter_millis: 5,
+        ..Default::default()
+    };
+    let webrtc = crate::webrtc::Settings {
+        enabled: true,
+        ..crate::webrtc::Settings::default()
+    };
     let mut client = crate::configuration::ClientConfig::new(3);
     client.runtime = Some(2);
-    let config = crate::client_config(&traffic, &client);
+    let config = crate::client_config(&traffic, &client, &webrtc);
     assert_eq!(config.client_runtime, 2);
     assert_eq!(config.client_jitter_millis, 5);
+    // `follow` takes the layer from the webrtc command.
+    assert!(config.webrtc.enabled);
+
+    client.webrtc = Some(false);
+    assert!(!crate::client_config(&traffic, &client, &webrtc).webrtc.enabled);
+    client.webrtc = Some(true);
+    assert!(
+        crate::client_config(
+            &traffic,
+            &client,
+            &crate::webrtc::Settings::default()
+        )
+        .webrtc
+        .enabled
+    );
 }
 
 /// Every row a host writes must say which side wrote it, so a database copied off
@@ -838,7 +899,17 @@ fn local_sqlite_records_the_role_that_wrote_each_row() {
     assert_eq!(sql.role(), "client+server");
     let id = sql.next_run_id(1);
     sql.start_run(id);
-    sql.complete_run(id, "ok", 1, None);
+    sql.complete_run(
+        id,
+        &crate::core::RunSummary {
+            result: "ok",
+            sent_bytes: 1,
+            received_bytes: 2,
+            sent_bytes_per_second: 3,
+            received_bytes_per_second: 4,
+            failure_reason: None,
+        },
+    );
 
     let row: String = Connection::open(database_path())
         .unwrap()
@@ -1019,4 +1090,538 @@ fn rest_api_rejects_a_profile_with_unregistered_hooks() {
         "{body}"
     );
     api.disable();
+}
+
+/// A data-channel header must survive a round trip and reject anything that is
+/// not one.
+#[test]
+fn webrtc_frames_round_trip_and_reject_foreign_bytes() {
+    let frame = crate::webrtc::Frame {
+        message_type: crate::webrtc::MessageType::Data,
+        channel: 7,
+        ordered: false,
+        sequence: 4_000_000_000,
+        payload_len: 900,
+    };
+    let encoded = frame.encode();
+    assert_eq!(encoded.len(), crate::webrtc::HEADER_LEN);
+    assert_eq!(crate::webrtc::Frame::decode(&encoded), Some(frame));
+
+    assert!(crate::webrtc::Frame::decode(&[0u8; crate::webrtc::HEADER_LEN]).is_none());
+    assert!(crate::webrtc::Frame::decode(&encoded[..8]).is_none());
+
+    let mut receiver = crate::webrtc::Receiver::default();
+    assert!(receiver.accept(&encoded).is_some());
+    assert!(receiver.accept(&[9u8; 32]).is_none());
+    assert_eq!(receiver.messages, 1);
+    assert_eq!(receiver.invalid, 1);
+}
+
+/// Messages must be spread over the configured channels, and the first message on
+/// each channel must open it.
+#[test]
+fn webrtc_sender_opens_each_channel_and_rotates() {
+    let mut sender = crate::webrtc::Sender::new(crate::webrtc::Settings {
+        enabled: true,
+        channels: 3,
+        label: "test".to_string(),
+        ordered: true,
+    });
+    let first: Vec<_> = (0..3).map(|_| sender.next(10)).collect();
+    assert_eq!(
+        first.iter().map(|frame| frame.channel).collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+    assert!(
+        first
+            .iter()
+            .all(|frame| frame.message_type == crate::webrtc::MessageType::Open)
+    );
+
+    let second: Vec<_> = (0..3).map(|_| sender.next(10)).collect();
+    assert!(
+        second
+            .iter()
+            .all(|frame| frame.message_type == crate::webrtc::MessageType::Data)
+    );
+    assert_eq!(
+        second.iter().map(|frame| frame.sequence).collect::<Vec<_>>(),
+        vec![1, 1, 1]
+    );
+}
+
+/// With the WebRTC layer on, every message the client sends must be decoded by the
+/// server, over both TCP and UDP, with no invalid frames.
+#[test]
+fn webrtc_messages_survive_both_transports() {
+    let _test_lock = TIMED_TEST_LOCK.lock().unwrap();
+    for protocol in ["udp", "tcp"] {
+        let log_dir = std::env::temp_dir().join(format!(
+            "netmark-webrtc-{protocol}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&log_dir);
+        let mut profile = crate::configuration::TestProfile::default();
+        profile.server.enabled = true;
+        profile.clients[0].enabled = true;
+        profile.traffic.packet_type = protocol.to_string();
+        profile.traffic.udp_rate = 20;
+        profile.traffic.tcp_bytes_per_second = 10240;
+        profile.traffic.client_runtime = 3;
+        profile.traffic.server_runtime = 3;
+        profile.duration_seconds = 3;
+        profile.webrtc.enabled = true;
+        profile.webrtc.channels = 2;
+
+        let report = crate::sdk::TestRunner::new(profile)
+            .log_dir(&log_dir)
+            .run()
+            .unwrap();
+
+        assert!(
+            report.webrtc_sent_messages > 0,
+            "{protocol}: no data-channel messages were sent"
+        );
+        assert_eq!(
+            report.webrtc_sent_messages, report.webrtc_received_messages,
+            "{protocol}: data-channel messages were lost"
+        );
+        assert_eq!(report.webrtc_invalid_frames, 0, "{protocol}");
+        assert!(report.passed, "{protocol}: {:?}", report.failure_reason);
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+}
+
+/// Raw IP needs CAP_NET_RAW. Where it is available the transport must carry
+/// traffic end to end; where it is not, the failure must say so rather than
+/// reporting a misleading zero.
+#[test]
+fn raw_ip_transport_works_or_explains_why_not() {
+    let _test_lock = TIMED_TEST_LOCK.lock().unwrap();
+    match crate::rawip::RawIpSocket::open() {
+        Err(error) => {
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            assert!(error.to_string().contains("CAP_NET_RAW"), "{error}");
+        }
+        Ok(_) => {
+            let log_dir =
+                std::env::temp_dir().join(format!("netmark-rawip-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&log_dir);
+            let mut profile = crate::configuration::TestProfile::default();
+            profile.server.enabled = true;
+            profile.clients[0].enabled = true;
+            profile.traffic.packet_type = "ip".to_string();
+            profile.traffic.udp_rate = 20;
+            profile.traffic.client_runtime = 3;
+            profile.traffic.server_runtime = 3;
+            profile.duration_seconds = 3;
+
+            let report = crate::sdk::TestRunner::new(profile)
+                .log_dir(&log_dir)
+                .run()
+                .unwrap();
+            assert!(report.sent_ip_bytes > 0, "no raw IP bytes were sent");
+            assert_eq!(report.sent_ip_bytes, report.received_ip_bytes);
+            let _ = std::fs::remove_dir_all(&log_dir);
+        }
+    }
+    assert!(crate::rawip::resolve("10.0.0.1:9000").is_ok());
+    assert!(crate::rawip::resolve("example.com").is_err());
+}
+
+/// Bandwidth up and down must reach every surface: the report, netmark.log and
+/// both of the local SQLite views.
+#[test]
+fn bandwidth_up_and_down_is_reported_everywhere() {
+    let _test_lock = TIMED_TEST_LOCK.lock().unwrap();
+    let log_dir =
+        std::env::temp_dir().join(format!("netmark-bandwidth-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&log_dir);
+    let mut profile = crate::configuration::TestProfile::default();
+    profile.server.enabled = true;
+    profile.clients[0].enabled = true;
+    profile.traffic.packet_type = "udp".to_string();
+    profile.traffic.udp_rate = 20;
+    profile.traffic.client_runtime = 3;
+    profile.traffic.server_runtime = 3;
+    profile.duration_seconds = 3;
+
+    let report = crate::sdk::TestRunner::new(profile)
+        .log_dir(&log_dir)
+        .run()
+        .unwrap();
+
+    assert!(report.sent_bytes_per_second > 0);
+    assert!(report.received_bytes_per_second > 0);
+    assert_eq!(
+        report.sent_bytes_per_second,
+        report.throughput_bytes_per_second()
+    );
+    assert!(report.summary().contains("up="), "{}", report.summary());
+    assert!(report.summary().contains("down="), "{}", report.summary());
+
+    let log = std::fs::read_to_string(log_dir.join("netmark.log")).unwrap();
+    assert!(
+        log.lines()
+            .any(|line| line.contains("up=") && line.contains("down=")),
+        "netmark.log has no bandwidth line"
+    );
+
+    let sql = SqlState::new();
+    let stored = sql.show_run(report.run_id).unwrap().unwrap();
+    assert!(stored.contains("up="), "{stored}");
+    assert!(stored.contains("down="), "{stored}");
+    assert!(
+        sql.run_list()
+            .unwrap()
+            .iter()
+            .any(|line| line.contains(&format!("run {} ", report.run_id))
+                && line.contains("down="))
+    );
+    let _ = std::fs::remove_dir_all(&log_dir);
+}
+
+/// `help` must document every command the interactive loop accepts.
+#[test]
+fn help_documents_every_command() {
+    let topics = crate::cli::help_topics();
+    for command in crate::cli::COMMANDS {
+        assert!(
+            topics.iter().any(|topic| topic
+                .split('|')
+                .any(|alternative| alternative.trim().starts_with(command))),
+            "help is missing the {command} command"
+        );
+    }
+}
+
+/// Arrow-key history: position 0 is the line being typed, going back reaches
+/// older commands and coming forward returns the unfinished line.
+#[test]
+fn command_history_walks_back_and_forward_from_position_zero() {
+    let mut history = crate::cli::History::new();
+    let mut input = String::new();
+
+    // Nothing to walk into yet.
+    history.step_back(&mut input);
+    assert_eq!(input, "");
+
+    history.push("server enable");
+    history.push("client 0 enable");
+    history.push("start");
+
+    input = "sto".to_string();
+    history.step_back(&mut input);
+    assert_eq!(input, "start");
+    history.step_back(&mut input);
+    assert_eq!(input, "client 0 enable");
+    history.step_back(&mut input);
+    assert_eq!(input, "server enable");
+    // Already at the oldest entry.
+    history.step_back(&mut input);
+    assert_eq!(input, "server enable");
+
+    history.step_forward(&mut input);
+    assert_eq!(input, "client 0 enable");
+    history.step_forward(&mut input);
+    assert_eq!(input, "start");
+    // Position 0 restores the half-typed line.
+    history.step_forward(&mut input);
+    assert_eq!(input, "sto");
+    history.step_forward(&mut input);
+    assert_eq!(input, "sto");
+
+    // Blank lines and repeats are not stacked.
+    history.push("   ");
+    history.push("start");
+    history.push("start");
+    let mut latest = String::new();
+    history.step_back(&mut latest);
+    assert_eq!(latest, "start");
+    history.step_back(&mut latest);
+    assert_eq!(latest, "client 0 enable");
+}
+
+/// Nothing is written off the host until an external database is configured.
+#[test]
+fn external_databases_are_off_by_default() {
+    assert!(crate::configuration::TestProfile::default().metrics.sql.is_none());
+    assert!(crate::configuration::FileConfig::default().metrics.sql.is_none());
+    let shipped = crate::configuration::load(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("netmark.config"),
+    )
+    .unwrap();
+    assert!(
+        shipped.metrics.sql.is_none(),
+        "the shipped netmark.config must not point at a database"
+    );
+    assert!(!shipped.restapi.enabled);
+    assert!(!shipped.smtp.enabled);
+    assert!(!shipped.webrtc.enabled);
+}
+
+/// A run whose measured jitter goes past `max_*_jitter_millis` must fail, and say
+/// which protocol and by how much.
+#[test]
+fn too_much_jitter_fails_the_run() {
+    let metrics = Metrics::new();
+    let config = Config {
+        max_tcp_jitter_millis: 100,
+        max_udp_jitter_millis: 100,
+        ..Config::default()
+    };
+
+    metrics.test_jitter(PacketType::Tcp, 100);
+    metrics.test_jitter(PacketType::Udp, 100);
+    metrics.add_test_bytes(true, PacketType::Udp, 1024);
+    let clean = crate::evaluate_run(&metrics, &config, Some(Duration::from_secs(1)));
+    assert_eq!(clean.result, "ok", "{:?}", clean.failure_reason);
+
+    metrics.test_jitter(PacketType::Tcp, 750);
+    let tcp = crate::evaluate_run(&metrics, &config, Some(Duration::from_secs(1)));
+    assert_eq!(tcp.result, "fail");
+    let reason = tcp.failure_reason.unwrap();
+    assert!(reason.contains("TCP jitter 750ms exceeded limit 100ms"), "{reason}");
+
+    metrics.test_jitter(PacketType::Udp, 900);
+    let both = crate::evaluate_run(&metrics, &config, Some(Duration::from_secs(1)));
+    let reason = both.failure_reason.unwrap();
+    assert!(reason.contains("TCP jitter"), "{reason}");
+    assert!(reason.contains("UDP jitter 900ms exceeded limit 100ms"), "{reason}");
+}
+
+/// Real UDP packets sent with wildly inconsistent send timestamps must push the
+/// measured jitter past the limit and fail the run end to end.
+#[test]
+fn end_to_end_jitter_beyond_the_limit_fails_the_run() {
+    let _test_lock = TIMED_TEST_LOCK.lock().unwrap();
+    let stopping = Arc::new(AtomicBool::new(false));
+    let metrics = Arc::new(Metrics::new());
+    let gate = Arc::new(StartGate::new());
+    let config = Arc::new(Mutex::new(Config {
+        packet_type: PacketType::Udp,
+        server_runtime: 5,
+        max_udp_jitter_millis: 200,
+        ..Config::default()
+    }));
+    let test_dir =
+        std::env::temp_dir().join(format!("netmark-jitter-limit-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&test_dir);
+    std::fs::create_dir_all(&test_dir).unwrap();
+    spawn_server(
+        Arc::clone(&config),
+        Arc::clone(&gate),
+        Arc::clone(&stopping),
+        Arc::clone(&metrics),
+        test_dir.clone(),
+    );
+    thread::sleep(Duration::from_millis(100));
+    gate.start();
+
+    let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
+    socket.connect("127.0.0.1:9000").unwrap();
+    // Packets arrive 20 ms apart but claim to have been sent seconds apart, which
+    // is exactly the delay variation jitter is meant to catch.
+    for (sequence, sent_at_ms) in [(0u64, 0i64), (1, 30), (2, 8_000), (3, 8_030)] {
+        let mut packet = [0u8; 64];
+        packet[..8].copy_from_slice(&sequence.to_be_bytes());
+        packet[8..16].copy_from_slice(&sent_at_ms.to_be_bytes());
+        socket.send(&packet).unwrap();
+        thread::sleep(Duration::from_millis(20));
+    }
+    thread::sleep(Duration::from_millis(200));
+    stopping.store(true, Ordering::Relaxed);
+    thread::sleep(Duration::from_millis(100));
+
+    let measured = metrics.udp_jitter_millis();
+    assert!(measured > 200, "expected jitter above the limit, got {measured}");
+    let outcome = crate::evaluate_run(
+        &metrics,
+        &config.lock().unwrap(),
+        Some(Duration::from_secs(1)),
+    );
+    assert_eq!(outcome.result, "fail");
+    assert!(
+        outcome.failure_reason.unwrap().contains("UDP jitter"),
+        "the run failed for the wrong reason"
+    );
+    let _ = std::fs::remove_dir_all(&test_dir);
+}
+
+/// Out-of-order UDP must be counted per client, reported by the debrief, and fail
+/// the run rather than being quietly tolerated.
+#[test]
+fn out_of_order_udp_packets_fail_the_debrief() {
+    let metrics = Metrics::new();
+    let mut expected = None;
+    for sequence in [0, 1, 3, 2, 4] {
+        metrics.test_udp_sequence(&mut expected, sequence);
+    }
+    // 3 arrived before 2, so 2 is late; no packet is actually missing.
+    let (lost, out_of_order) = metrics.udp_status();
+    assert_eq!(out_of_order, 1, "the late packet was not flagged");
+    assert_eq!(lost, 1, "the gap ahead of the late packet was not counted");
+
+    // Each client has its own sequence space, so two clients starting at 0 is not
+    // reordering.
+    let separate = Metrics::new();
+    let mut client_zero = None;
+    let mut client_one = None;
+    for sequence in 0..5 {
+        separate.test_udp_sequence(&mut client_zero, sequence);
+        separate.test_udp_sequence(&mut client_one, sequence);
+    }
+    assert_eq!(separate.udp_status(), (0, 0));
+
+    let debrief = Debrief {
+        run_id: 1,
+        role: "client",
+        protocol: "udp".to_string(),
+        sent_packets: 5,
+        sent_bytes: 5120,
+        received_packets: 5,
+        received_bytes: 5120,
+        lost_packets: 0,
+        out_of_order_packets: out_of_order,
+    };
+    assert!(!debrief.matched());
+    let reason = debrief.mismatch_reason().unwrap();
+    assert!(reason.contains("1 packets out of order"), "{reason}");
+}
+
+/// Real UDP packets delivered out of order must be caught by a live server and
+/// carried into the run's debrief.
+#[test]
+fn end_to_end_out_of_order_udp_fails_the_run() {
+    let _test_lock = TIMED_TEST_LOCK.lock().unwrap();
+    let stopping = Arc::new(AtomicBool::new(false));
+    let metrics = Arc::new(Metrics::new());
+    let gate = Arc::new(StartGate::new());
+    let config = Arc::new(Mutex::new(Config {
+        packet_type: PacketType::Udp,
+        server_runtime: 5,
+        ..Config::default()
+    }));
+    let test_dir =
+        std::env::temp_dir().join(format!("netmark-udp-order-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&test_dir);
+    std::fs::create_dir_all(&test_dir).unwrap();
+    spawn_server(
+        Arc::clone(&config),
+        Arc::clone(&gate),
+        Arc::clone(&stopping),
+        Arc::clone(&metrics),
+        test_dir.clone(),
+    );
+    thread::sleep(Duration::from_millis(100));
+    gate.start();
+
+    let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
+    socket.connect("127.0.0.1:9000").unwrap();
+    let sent_at = chrono::Utc::now().timestamp_millis();
+    for (index, sequence) in [0u64, 1, 2, 4, 3, 5].into_iter().enumerate() {
+        let mut packet = [0u8; 64];
+        packet[..8].copy_from_slice(&sequence.to_be_bytes());
+        packet[8..16].copy_from_slice(&(sent_at + index as i64 * 20).to_be_bytes());
+        socket.send(&packet).unwrap();
+        thread::sleep(Duration::from_millis(20));
+    }
+    thread::sleep(Duration::from_millis(200));
+    stopping.store(true, Ordering::Relaxed);
+    thread::sleep(Duration::from_millis(100));
+
+    let (_, out_of_order) = metrics.udp_status();
+    assert!(out_of_order > 0, "the reordered packet was not detected");
+
+    let (received_packets, received_bytes) = metrics.run_counts(false, PacketType::Udp);
+    let debrief = Debrief {
+        run_id: 1,
+        role: "server",
+        protocol: "udp".to_string(),
+        sent_packets: received_packets,
+        sent_bytes: received_bytes,
+        received_packets,
+        received_bytes,
+        lost_packets: 0,
+        out_of_order_packets: out_of_order,
+    };
+    assert!(!debrief.matched(), "{}", debrief.summary());
+    assert!(debrief.summary().contains("out_of_order="));
+    let _ = std::fs::remove_dir_all(&test_dir);
+}
+
+/// `status` must come out as an aligned table with one labelled row per fact.
+#[test]
+fn status_is_reported_as_a_table() {
+    let metrics = Metrics::new();
+    metrics.add_test_bytes(true, PacketType::Udp, 2048);
+    metrics.add_test_bytes(false, PacketType::Udp, 1024);
+    let clients = Clients::new(Vec::new());
+    clients.update(0, |client| client.enabled = true);
+    let webrtc = crate::webrtc::Settings::default();
+
+    let rows = crate::cli::status_rows(
+        &metrics,
+        &crate::cli::StatusContext {
+            running: true,
+            elapsed: Some(Duration::from_secs(2)),
+            run_id: 42,
+            server_enabled: true,
+            clients: &clients,
+            webrtc: &webrtc,
+            packet_type: PacketType::Udp,
+            monitor: (true, 1, 5, 4, 1),
+            metrics_sql: "not connected".to_string(),
+            restapi: "disabled".to_string(),
+            smtp: false,
+        },
+    );
+
+    assert!(
+        rows.iter().all(|row| row.len() == 2),
+        "every status row must be a label and a value"
+    );
+    let value = |label: &str| {
+        rows.iter()
+            .find(|row| row[0] == label)
+            .unwrap_or_else(|| panic!("status has no {label} row"))[1]
+            .clone()
+    };
+    assert_eq!(value("Traffic"), "running (udp)");
+    assert_eq!(value("Run"), "42 (2 s elapsed)");
+    assert_eq!(value("Bandwidth up"), "1024 bytes/sec");
+    assert_eq!(value("Bandwidth down"), "512 bytes/sec");
+    assert!(value("Sent").starts_with("2048 bytes"));
+    assert!(value("Received").starts_with("1024 bytes"));
+    assert_eq!(value("UDP loss"), "0 lost, 0 out of order");
+    assert_eq!(value("Server"), "enabled");
+    assert!(value("Client 0").contains("enabled"));
+    assert!(value("WebRTC").starts_with("webrtc disabled"));
+    assert_eq!(value("Monitor"), "on id 1, 5 calls, 4 ok, 1 failed");
+    assert_eq!(value("Metrics SQL"), "not connected");
+    assert_eq!(value("REST API"), "disabled");
+    assert_eq!(value("SMTP"), "disabled");
+}
+
+/// `start_at` is how many machines begin together: it blocks until the instant
+/// given, ignores one already past, and rejects anything that is not a timestamp.
+#[test]
+fn start_at_blocks_until_the_agreed_instant() {
+    assert!(crate::wait_until(None).is_ok());
+
+    let past = (chrono::Utc::now() - chrono::Duration::seconds(60)).to_rfc3339();
+    let started = Instant::now();
+    crate::wait_until(Some(&past)).unwrap();
+    assert!(started.elapsed() < Duration::from_millis(200));
+
+    let future = (chrono::Utc::now() + chrono::Duration::milliseconds(400)).to_rfc3339();
+    let started = Instant::now();
+    crate::wait_until(Some(&future)).unwrap();
+    assert!(
+        started.elapsed() >= Duration::from_millis(350),
+        "start_at returned early"
+    );
+
+    let error = crate::wait_until(Some("tuesday")).unwrap_err();
+    assert!(error.contains("RFC 3339"), "{error}");
 }

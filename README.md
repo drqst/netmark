@@ -1,60 +1,69 @@
 # netmark
-CLI load testing tool
 
-The same binary for client and server, to create traffic between two computers just start same binary on both servers and  use CLI commands "server enable" on one and "enable client" on the other. You can also run both server and client on the same computer just to test things out.
+CLI load testing tool. One binary is both the sending and the receiving side:
+start it on two hosts, make one a server and the other a client, and it pushes
+traffic between them, measures what arrives, reconciles the two sides against
+each other and records the result.
 
-It also has a monitor function that will check that a configurable address on the internet is accessible and log alarms when it's not reachhing that point.
+**Full documentation: [doc/netmark.md](doc/netmark.md).**
+**REST API contract: [doc/openapi.yaml](doc/openapi.yaml).**
 
-Plans:
-Send email when monitor fails.
-Add traffic patterns and more protocols to the client.
-Write data into a database for graphing.
-Better status page to show what is going on in more detail.
+## Quick start
 
-How to use:
-Just run the binary netmark and you'll get a prompt, type help and go from there.
+```sh
+cargo build --release
+./target/release/netmark                             # interactive; type `help`
+./target/release/netmark profiles/udp-10kbps.yaml    # one run, exit 0 or 1
+```
 
-SMTP:
-Set the server with `configure smtp <host[:port]>`, then turn it on with
-`admin smtp enabled` or off with `admin smtp disabled`. Enabling first verifies
-the server answers with an SMTP greeting; `admin smtp status` re-runs that check
-at any time.
+## What it does
 
-Clients:
-One instance can drive several clients at once. Each has its own id, starting at
-0, its own destination and optional runtime and jitter overrides, and every
-command that configures or controls a client takes that id:
-`client list`, `client add`, `client delete <id>`, `client <id> enable`,
-`client <id> disable`, `client <id> remote <ip>`, `client <id> runtime <seconds>`,
-`client <id> jitter <ms>`, `client <id> http check <url>`, `client <id> status`.
-UDP sequence numbers are namespaced per client id, so several clients sending to
-one server are not mistaken for reordering.
+- **Transports:** TCP, UDP, and raw IPv4 (protocol 253, needs `CAP_NET_RAW`).
+- **WebRTC layer:** optional data-channel framing on top of any transport.
+- **Multiple clients:** each with its own id starting at 0, its own destination,
+  and optional runtime and jitter overrides.
+- **Debrief:** at the end of every run the client and server reconcile packets
+  and bytes; anything that does not match exactly fails the run.
+- **Bandwidth up and down** on every run, in stdout, the logs, the local SQLite
+  database and the external one.
+- **Monitoring:** periodic HTTP checks with alarms, plus an SMTP connection check.
+- **REST API and Rust SDK** over the same code path as the CLI.
 
-Debrief:
-Every run ends with a debrief between client and server over TCP port 9001. The
-client reports what it put on the wire, the server reports what it took off, and
-each side writes the reconciliation to its own netmark.log and local SQLite
-`debriefs` table. Packets and bytes must correlate exactly, with no loss and no
-reordering, or the run fails. `show run <id>` prints the stored debriefs.
+## Defaults
 
-Roles in the local database:
-Every table in the local SQLite database carries a `role` column saying which
-side wrote the row: `client`, `server`, `client+server` or `none`. It is also
-printed by `list` and `show run <id>`, so a database copied off any host says
-plainly what that host was doing.
+Nothing leaves the host unless you ask for it. The external metrics database, the
+REST API, SMTP and the WebRTC layer are all off until enabled, and the REST API
+binds to loopback when you do enable it.
 
-REST API:
-`restapi enable [<address>]` serves the SDK over HTTP; `restapi disable` stops it
-and `restapi status` shows where it is listening. It defaults to
-`127.0.0.1:8081`, because the API is unauthenticated and can start traffic runs.
-The contract is in [doc/openapi.yaml](doc/openapi.yaml) and the running service
-serves that same document from `/api/v1/openapi.yaml`.
+## Running across many machines
 
-As a library:
-netmark is also a Rust library. `netmark::sdk::TestRunner` runs a test profile
-from code and returns a `RunReport` you can assert on. A profile may name Rust
-callbacks in its `hooks.before` and `hooks.after` lists; register them on the
-runner with `.hook("name", ...)`. An `after` hook that returns an error fails the
-run. See `examples/sdk_hooks.rs` and `profiles/udp-hooks.yaml`.
+The usual shape is one server machine and many client machines — one receiver and
+ten senders, say. Run **one netmark per machine**; to load a sender harder, add
+more clients to its profile rather than more processes. Two servers cannot share
+a machine, because they would both want ports 9000 and 9001.
 
-Better documentation to come.
+Every profile takes a `start_at`, an RFC 3339 UTC instant. netmark sets the run up
+and then blocks until that moment before sending, so handing all eleven machines
+the same value starts them together — keep their clocks in step with `chrony` or
+`ntpd` and pick a moment far enough ahead to cover startup.
+
+```sh
+AT=$(date -u -d '+30 seconds' +%Y-%m-%dT%H:%M:%SZ)
+for host in receiver sender-{1..10}; do
+  ssh "$host" "sed -i 's|^start_at:.*|start_at: \"$AT\"|' /opt/netmark/profile.yaml \
+               && /opt/netmark/netmark /opt/netmark/profile.yaml" &
+done
+wait
+```
+
+Get the profile onto each machine either **preloaded** — shipped with the binary
+and run as `netmark profile.yaml`, with nothing listening and nothing to secure —
+or **pushed** by a controller that POSTs it to each machine's REST API and
+collects the reports. [doc/netmark.md](doc/netmark.md#running-across-many-machines)
+has both, with a worked controller example and how to collect results afterwards.
+
+## Plans
+
+- Send email when the monitor fails.
+- More traffic patterns and protocols.
+- A better status page.

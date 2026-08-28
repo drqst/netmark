@@ -19,7 +19,7 @@ impl ExternalSqlMetrics {
         {
             let mut client =
                 Client::connect(connection_string, NoTls).map_err(|error| error.to_string())?;
-            client.batch_execute("CREATE TABLE IF NOT EXISTS netmark_metrics (timestamp_utc TEXT NOT NULL, run_id BIGINT NOT NULL, sent_tcp_bytes BIGINT NOT NULL, sent_udp_bytes BIGINT NOT NULL, received_tcp_bytes BIGINT NOT NULL, received_udp_bytes BIGINT NOT NULL, lost_udp_packets BIGINT NOT NULL, out_of_order_udp_packets BIGINT NOT NULL, jitter_millis BIGINT NOT NULL)").map_err(|error| error.to_string())?;
+            client.batch_execute("CREATE TABLE IF NOT EXISTS netmark_metrics (timestamp_utc TEXT NOT NULL, run_id BIGINT NOT NULL, sent_tcp_bytes BIGINT NOT NULL, sent_udp_bytes BIGINT NOT NULL, received_tcp_bytes BIGINT NOT NULL, received_udp_bytes BIGINT NOT NULL, lost_udp_packets BIGINT NOT NULL, out_of_order_udp_packets BIGINT NOT NULL, jitter_millis BIGINT NOT NULL, sent_ip_bytes BIGINT NOT NULL DEFAULT 0, received_ip_bytes BIGINT NOT NULL DEFAULT 0, sent_bytes_per_second BIGINT NOT NULL DEFAULT 0, received_bytes_per_second BIGINT NOT NULL DEFAULT 0)").map_err(|error| error.to_string())?;
             Ok(Self {
                 target: connection_string.to_string(),
                 backend: Mutex::new(Backend::Postgres(client)),
@@ -29,7 +29,7 @@ impl ExternalSqlMetrics {
                 .strip_prefix("sqlite://")
                 .unwrap_or(connection_string);
             let connection = Connection::open(path).map_err(|error| error.to_string())?;
-            connection.execute_batch("CREATE TABLE IF NOT EXISTS netmark_metrics (timestamp_utc TEXT NOT NULL, run_id INTEGER NOT NULL, sent_tcp_bytes INTEGER NOT NULL, sent_udp_bytes INTEGER NOT NULL, received_tcp_bytes INTEGER NOT NULL, received_udp_bytes INTEGER NOT NULL, lost_udp_packets INTEGER NOT NULL, out_of_order_udp_packets INTEGER NOT NULL, jitter_millis INTEGER NOT NULL)").map_err(|error| error.to_string())?;
+            connection.execute_batch("CREATE TABLE IF NOT EXISTS netmark_metrics (timestamp_utc TEXT NOT NULL, run_id INTEGER NOT NULL, sent_tcp_bytes INTEGER NOT NULL, sent_udp_bytes INTEGER NOT NULL, received_tcp_bytes INTEGER NOT NULL, received_udp_bytes INTEGER NOT NULL, lost_udp_packets INTEGER NOT NULL, out_of_order_udp_packets INTEGER NOT NULL, jitter_millis INTEGER NOT NULL, sent_ip_bytes INTEGER NOT NULL DEFAULT 0, received_ip_bytes INTEGER NOT NULL DEFAULT 0, sent_bytes_per_second INTEGER NOT NULL DEFAULT 0, received_bytes_per_second INTEGER NOT NULL DEFAULT 0)").map_err(|error| error.to_string())?;
             Ok(Self {
                 target: connection_string.to_string(),
                 backend: Mutex::new(Backend::Sqlite(connection)),
@@ -42,19 +42,22 @@ impl ExternalSqlMetrics {
     pub fn connection_string(&self) -> &str {
         &self.target
     }
+    #[allow(clippy::too_many_arguments)]
     pub fn write(
         &self,
         timestamp: &str,
         run_id: u64,
-        values: &[u64; 8],
+        values: &[u64; 12],
         lost: u64,
         out_of_order: u64,
         jitter: u64,
+        sent_bytes_per_second: u64,
+        received_bytes_per_second: u64,
     ) -> Result<(), String> {
         match &mut *self.backend.lock().unwrap() {
             Backend::Sqlite(connection) => connection
                 .execute(
-                    "INSERT INTO netmark_metrics VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    "INSERT INTO netmark_metrics VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                     params![
                         timestamp,
                         run_id,
@@ -64,14 +67,18 @@ impl ExternalSqlMetrics {
                         values[7],
                         lost,
                         out_of_order,
-                        jitter
+                        jitter,
+                        values[9],
+                        values[11],
+                        sent_bytes_per_second,
+                        received_bytes_per_second
                     ],
                 )
                 .map(|_| ())
                 .map_err(|error| error.to_string()),
             Backend::Postgres(client) => client
                 .execute(
-                    "INSERT INTO netmark_metrics VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                    "INSERT INTO netmark_metrics VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
                     &[
                         &timestamp,
                         &(run_id as i64),
@@ -82,6 +89,10 @@ impl ExternalSqlMetrics {
                         &(lost as i64),
                         &(out_of_order as i64),
                         &(jitter as i64),
+                        &(values[9] as i64),
+                        &(values[11] as i64),
+                        &(sent_bytes_per_second as i64),
+                        &(received_bytes_per_second as i64),
                     ],
                 )
                 .map(|_| ())

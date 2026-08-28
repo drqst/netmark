@@ -46,12 +46,15 @@ const TCP_HEADER_LEN: usize = 10;
 pub enum PacketType {
     Tcp,
     Udp,
+    /// Payload carried directly in IPv4 packets, with no transport header.
+    Ip,
 }
 impl PacketType {
     pub fn parse(value: &str) -> Option<Self> {
         match value.to_ascii_lowercase().as_str() {
             "tcp" => Some(Self::Tcp),
             "udp" => Some(Self::Udp),
+            "ip" | "rawip" => Some(Self::Ip),
             _ => None,
         }
     }
@@ -59,6 +62,7 @@ impl PacketType {
         match self {
             Self::Tcp => "tcp",
             Self::Udp => "udp",
+            Self::Ip => "ip",
         }
     }
 }
@@ -79,6 +83,7 @@ pub struct Config {
     pub max_udp_jitter_millis: u64,
     /// Minimum acceptable throughput in bytes/sec for a run to be considered a pass; 0 disables the check.
     pub limit_bytes_per_second: u64,
+    pub webrtc: crate::webrtc::Settings,
     pub admin_emails: Vec<String>,
 }
 impl Default for Config {
@@ -96,6 +101,7 @@ impl Default for Config {
             max_tcp_jitter_millis: 1000,
             max_udp_jitter_millis: 1000,
             limit_bytes_per_second: 0,
+            webrtc: crate::webrtc::Settings::default(),
             admin_emails: Vec::new(),
         }
     }
@@ -124,6 +130,12 @@ impl StartGate {
     }
 }
 
+impl Default for StartGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct Metrics {
     sent_tcp_packets: AtomicU64,
     sent_tcp_bytes: AtomicU64,
@@ -146,6 +158,17 @@ pub struct Metrics {
     run_received_tcp_bytes: AtomicU64,
     run_received_udp_packets: AtomicU64,
     run_received_udp_bytes: AtomicU64,
+    sent_ip_packets: AtomicU64,
+    sent_ip_bytes: AtomicU64,
+    received_ip_packets: AtomicU64,
+    received_ip_bytes: AtomicU64,
+    run_sent_ip_packets: AtomicU64,
+    run_sent_ip_bytes: AtomicU64,
+    run_received_ip_packets: AtomicU64,
+    run_received_ip_bytes: AtomicU64,
+    webrtc_sent_messages: AtomicU64,
+    webrtc_received_messages: AtomicU64,
+    webrtc_invalid_frames: AtomicU64,
     last_udp_timestamps: Mutex<Option<(i64, i64)>>,
     last_tcp_timestamps: Mutex<Option<(i64, i64)>>,
 }
@@ -173,6 +196,17 @@ impl Metrics {
             run_received_tcp_bytes: AtomicU64::new(0),
             run_received_udp_packets: AtomicU64::new(0),
             run_received_udp_bytes: AtomicU64::new(0),
+            sent_ip_packets: AtomicU64::new(0),
+            sent_ip_bytes: AtomicU64::new(0),
+            received_ip_packets: AtomicU64::new(0),
+            received_ip_bytes: AtomicU64::new(0),
+            run_sent_ip_packets: AtomicU64::new(0),
+            run_sent_ip_bytes: AtomicU64::new(0),
+            run_received_ip_packets: AtomicU64::new(0),
+            run_received_ip_bytes: AtomicU64::new(0),
+            webrtc_sent_messages: AtomicU64::new(0),
+            webrtc_received_messages: AtomicU64::new(0),
+            webrtc_invalid_frames: AtomicU64::new(0),
             last_udp_timestamps: Mutex::new(None),
             last_tcp_timestamps: Mutex::new(None),
         }
@@ -209,6 +243,18 @@ impl Metrics {
                 &self.run_received_udp_packets,
                 &self.run_received_udp_bytes,
             ),
+            (true, PacketType::Ip) => (
+                &self.sent_ip_packets,
+                &self.sent_ip_bytes,
+                &self.run_sent_ip_packets,
+                &self.run_sent_ip_bytes,
+            ),
+            (false, PacketType::Ip) => (
+                &self.received_ip_packets,
+                &self.received_ip_bytes,
+                &self.run_received_ip_packets,
+                &self.run_received_ip_bytes,
+            ),
         };
         total_packets.fetch_add(packets, Ordering::Relaxed);
         total.fetch_add(bytes, Ordering::Relaxed);
@@ -231,10 +277,21 @@ impl Metrics {
             self.run_received_udp_bytes.load(Ordering::Relaxed),
         )
     }
+    /// Bytes sent across every transport this run, which is what the reported
+    /// upload bandwidth is computed from.
+    pub fn run_sent_total(&self) -> u64 {
+        let (tcp, udp) = self.run_sent_bytes();
+        tcp + udp + self.run_sent_ip_bytes.load(Ordering::Relaxed)
+    }
+    /// Bytes received across every transport this run, for download bandwidth.
+    pub fn run_received_total(&self) -> u64 {
+        let (tcp, udp) = self.run_received_bytes();
+        tcp + udp + self.run_received_ip_bytes.load(Ordering::Relaxed)
+    }
     /// Run-scoped counters in the same `[sent_tcp_packets, sent_tcp_bytes, ...]`
-    /// layout as `snapshot()`, for the single final report written to the
-    /// external metrics database at the end of a run.
-    pub fn run_totals(&self) -> [u64; 8] {
+    /// layout as `snapshot()`, with the raw IP counters appended, for the single
+    /// final report written to the external metrics database at the end of a run.
+    pub fn run_totals(&self) -> [u64; 12] {
         [
             self.run_sent_tcp_packets.load(Ordering::Relaxed),
             self.run_sent_tcp_bytes.load(Ordering::Relaxed),
@@ -244,6 +301,10 @@ impl Metrics {
             self.run_received_tcp_bytes.load(Ordering::Relaxed),
             self.run_received_udp_packets.load(Ordering::Relaxed),
             self.run_received_udp_bytes.load(Ordering::Relaxed),
+            self.run_sent_ip_packets.load(Ordering::Relaxed),
+            self.run_sent_ip_bytes.load(Ordering::Relaxed),
+            self.run_received_ip_packets.load(Ordering::Relaxed),
+            self.run_received_ip_bytes.load(Ordering::Relaxed),
         ]
     }
     /// Run-scoped (packets, bytes) for one direction and protocol, as used by the
@@ -255,6 +316,27 @@ impl Metrics {
             (true, PacketType::Udp) => (totals[2], totals[3]),
             (false, PacketType::Tcp) => (totals[4], totals[5]),
             (false, PacketType::Udp) => (totals[6], totals[7]),
+            (true, PacketType::Ip) => (totals[8], totals[9]),
+            (false, PacketType::Ip) => (totals[10], totals[11]),
+        }
+    }
+    /// WebRTC data-channel messages sent, received, and frames that failed to parse.
+    pub fn webrtc_counts(&self) -> (u64, u64, u64) {
+        (
+            self.webrtc_sent_messages.load(Ordering::Relaxed),
+            self.webrtc_received_messages.load(Ordering::Relaxed),
+            self.webrtc_invalid_frames.load(Ordering::Relaxed),
+        )
+    }
+    pub(crate) fn record_webrtc_sent(&self) {
+        self.webrtc_sent_messages.fetch_add(1, Ordering::Relaxed);
+    }
+    pub(crate) fn record_webrtc_received(&self, valid: bool) {
+        if valid {
+            self.webrtc_received_messages
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.webrtc_invalid_frames.fetch_add(1, Ordering::Relaxed);
         }
     }
     /// Clears the per-run counters (sent/received bytes, jitter, UDP loss) so the
@@ -268,22 +350,35 @@ impl Metrics {
         self.run_received_tcp_bytes.store(0, Ordering::Relaxed);
         self.run_received_udp_packets.store(0, Ordering::Relaxed);
         self.run_received_udp_bytes.store(0, Ordering::Relaxed);
+        self.run_sent_ip_packets.store(0, Ordering::Relaxed);
+        self.run_sent_ip_bytes.store(0, Ordering::Relaxed);
+        self.run_received_ip_packets.store(0, Ordering::Relaxed);
+        self.run_received_ip_bytes.store(0, Ordering::Relaxed);
+        self.webrtc_sent_messages.store(0, Ordering::Relaxed);
+        self.webrtc_received_messages.store(0, Ordering::Relaxed);
+        self.webrtc_invalid_frames.store(0, Ordering::Relaxed);
         self.jitter_millis.store(0, Ordering::Relaxed);
         self.tcp_jitter_millis.store(0, Ordering::Relaxed);
         self.udp_jitter_millis.store(0, Ordering::Relaxed);
         self.lost_udp_packets.store(0, Ordering::Relaxed);
         self.out_of_order_udp_packets.store(0, Ordering::Relaxed);
     }
+    /// Live counters since the last call, used for the once-per-second bandwidth
+    /// display; raw IP is folded into the UDP slots because both are datagrams.
     pub fn snapshot(&self) -> [u64; 8] {
         [
             self.sent_tcp_packets.swap(0, Ordering::Relaxed),
             self.sent_tcp_bytes.swap(0, Ordering::Relaxed),
-            self.sent_udp_packets.swap(0, Ordering::Relaxed),
-            self.sent_udp_bytes.swap(0, Ordering::Relaxed),
+            self.sent_udp_packets.swap(0, Ordering::Relaxed)
+                + self.sent_ip_packets.swap(0, Ordering::Relaxed),
+            self.sent_udp_bytes.swap(0, Ordering::Relaxed)
+                + self.sent_ip_bytes.swap(0, Ordering::Relaxed),
             self.received_tcp_packets.swap(0, Ordering::Relaxed),
             self.received_tcp_bytes.swap(0, Ordering::Relaxed),
-            self.received_udp_packets.swap(0, Ordering::Relaxed),
-            self.received_udp_bytes.swap(0, Ordering::Relaxed),
+            self.received_udp_packets.swap(0, Ordering::Relaxed)
+                + self.received_ip_packets.swap(0, Ordering::Relaxed),
+            self.received_udp_bytes.swap(0, Ordering::Relaxed)
+                + self.received_ip_bytes.swap(0, Ordering::Relaxed),
         ]
     }
     pub fn udp_status(&self) -> (u64, u64) {
@@ -309,12 +404,19 @@ impl Metrics {
     pub(crate) fn test_udp_sequence(&self, expected: &mut Option<u64>, sequence: u64) {
         self.udp_sequence(expected, sequence);
     }
+    #[cfg(test)]
+    pub(crate) fn add_test_bytes(&self, sent: bool, protocol: PacketType, bytes: u64) {
+        self.add_counts(sent, protocol, 1, bytes);
+    }
     fn record_jitter(&self, protocol: PacketType, jitter: Duration) {
         let value = jitter.as_millis() as u64;
         self.jitter_millis.fetch_max(value, Ordering::Relaxed);
         match protocol {
             PacketType::Tcp => self.tcp_jitter_millis.fetch_max(value, Ordering::Relaxed),
-            PacketType::Udp => self.udp_jitter_millis.fetch_max(value, Ordering::Relaxed),
+            // Raw IP is a datagram transport, so it shares the UDP jitter budget.
+            PacketType::Udp | PacketType::Ip => {
+                self.udp_jitter_millis.fetch_max(value, Ordering::Relaxed)
+            }
         };
     }
     #[cfg(test)]
@@ -362,11 +464,34 @@ impl Metrics {
     }
 }
 
+impl Default for Metrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct SqlState {
     enabled: AtomicBool,
     connection: Mutex<Option<Connection>>,
     run_id: AtomicU64,
     role: Mutex<String>,
+}
+
+/// What is stored about a finished run, including the bandwidth it achieved in
+/// each direction.
+pub struct RunSummary<'a> {
+    pub result: &'a str,
+    pub sent_bytes: u64,
+    pub received_bytes: u64,
+    pub sent_bytes_per_second: u64,
+    pub received_bytes_per_second: u64,
+    pub failure_reason: Option<&'a str>,
+}
+
+/// Bytes per second over `elapsed`, floored at one second so a very short run
+/// cannot report an inflated figure.
+pub fn bandwidth(bytes: u64, elapsed: Duration) -> u64 {
+    (bytes as f64 / elapsed.as_secs_f64().max(1.0)) as u64
 }
 impl SqlState {
     pub fn new() -> Self {
@@ -394,6 +519,18 @@ impl SqlState {
         let _ = connection.execute("ALTER TABLE runs ADD COLUMN completed_utc TEXT", []);
         let _ = connection.execute("ALTER TABLE runs ADD COLUMN result TEXT NOT NULL DEFAULT 'running'", []);
         let _ = connection.execute("ALTER TABLE runs ADD COLUMN sent_bytes INTEGER DEFAULT 0", []);
+        let _ = connection.execute(
+            "ALTER TABLE runs ADD COLUMN received_bytes INTEGER DEFAULT 0",
+            [],
+        );
+        let _ = connection.execute(
+            "ALTER TABLE runs ADD COLUMN sent_bytes_per_second INTEGER DEFAULT 0",
+            [],
+        );
+        let _ = connection.execute(
+            "ALTER TABLE runs ADD COLUMN received_bytes_per_second INTEGER DEFAULT 0",
+            [],
+        );
         let _ = connection.execute("ALTER TABLE runs ADD COLUMN failure_reason TEXT", []);
         let _ = connection.execute(
             "ALTER TABLE runs ADD COLUMN role TEXT NOT NULL DEFAULT 'unknown'",
@@ -428,17 +565,27 @@ impl SqlState {
             );
         }
     }
-    /// Records the end state of a run: bytes sent, whether it stayed within its
-    /// configured limits, and why not, if it didn't. No millisecond-level metrics
-    /// are ever stored here; those only go to the configured external SQL database.
-    pub fn complete_run(&self, id: u64, result: &str, sent_bytes: u64, failure_reason: Option<&str>) {
+    /// Records the end state of a run: bytes moved in each direction, the resulting
+    /// upload and download bandwidth, whether it stayed within its configured
+    /// limits, and why not, if it didn't. No millisecond-level metrics are ever
+    /// stored here; those only go to the configured external SQL database.
+    pub fn complete_run(&self, id: u64, summary: &RunSummary<'_>) {
         if !self.enabled.load(Ordering::Relaxed) {
             return;
         }
         if let Some(c) = self.connection.lock().unwrap().as_ref() {
             let _ = c.execute(
-                "UPDATE runs SET completed_utc = ?1, result = ?2, sent_bytes = ?3, failure_reason = ?4 WHERE id = ?5 AND result = 'running'",
-                params![timestamp(), result, sent_bytes, failure_reason, id],
+                "UPDATE runs SET completed_utc = ?1, result = ?2, sent_bytes = ?3, received_bytes = ?4, sent_bytes_per_second = ?5, received_bytes_per_second = ?6, failure_reason = ?7 WHERE id = ?8 AND result = 'running'",
+                params![
+                    timestamp(),
+                    summary.result,
+                    summary.sent_bytes,
+                    summary.received_bytes,
+                    summary.sent_bytes_per_second,
+                    summary.received_bytes_per_second,
+                    summary.failure_reason,
+                    id
+                ],
             );
         }
     }
@@ -514,22 +661,26 @@ impl SqlState {
         }
         Ok(())
     }
-    /// One summary line per run, newest last, including the role that wrote it.
+    /// One summary line per run, newest last, including the role that wrote it and
+    /// the bandwidth measured in each direction.
     pub fn run_list(&self) -> Result<Vec<String>, String> {
         let c = Connection::open(database_path()).map_err(|e| e.to_string())?;
         let mut q = c
-            .prepare("SELECT started_utc, id, role, result, sent_bytes, failure_reason FROM runs ORDER BY id")
+            .prepare("SELECT started_utc, id, role, result, sent_bytes, received_bytes, sent_bytes_per_second, received_bytes_per_second, failure_reason FROM runs ORDER BY id")
             .map_err(|e| e.to_string())?;
         let rows = q
             .query_map([], |row| {
                 Ok(format!(
-                    "{} run {} role={} {} sent_bytes={}{}",
+                    "{} run {} role={} {} sent_bytes={} received_bytes={} up={} bytes/sec down={} bytes/sec{}",
                     row.get::<_, String>(0)?,
                     row.get::<_, u64>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, Option<u64>>(4)?.unwrap_or(0),
-                    row.get::<_, Option<String>>(5)?
+                    row.get::<_, Option<u64>>(5)?.unwrap_or(0),
+                    row.get::<_, Option<u64>>(6)?.unwrap_or(0),
+                    row.get::<_, Option<u64>>(7)?.unwrap_or(0),
+                    row.get::<_, Option<String>>(8)?
                         .map(|reason| format!(" ({reason})"))
                         .unwrap_or_default()
                 ))
@@ -543,18 +694,21 @@ impl SqlState {
         let connection = Connection::open(database_path()).map_err(|e| e.to_string())?;
         connection
             .query_row(
-                "SELECT started_utc, completed_utc, role, result, sent_bytes, failure_reason FROM runs WHERE id = ?1",
+                "SELECT started_utc, completed_utc, role, result, sent_bytes, received_bytes, sent_bytes_per_second, received_bytes_per_second, failure_reason FROM runs WHERE id = ?1",
                 params![id],
                 |row| {
                     Ok(format!(
-                        "started {} completed {} role {} result {} sent_bytes={}{}",
+                        "started {} completed {} role {} result {} sent_bytes={} received_bytes={} up={} bytes/sec down={} bytes/sec{}",
                         row.get::<_, String>(0)?,
                         row.get::<_, Option<String>>(1)?
                             .unwrap_or_else(|| "n/a".to_string()),
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
                         row.get::<_, Option<u64>>(4)?.unwrap_or(0),
-                        row.get::<_, Option<String>>(5)?
+                        row.get::<_, Option<u64>>(5)?.unwrap_or(0),
+                        row.get::<_, Option<u64>>(6)?.unwrap_or(0),
+                        row.get::<_, Option<u64>>(7)?.unwrap_or(0),
+                        row.get::<_, Option<String>>(8)?
                             .map(|reason| format!(" ({reason})"))
                             .unwrap_or_default()
                     ))
@@ -569,11 +723,9 @@ impl SqlState {
         }
         let role = self.role();
         let mut connection = self.connection.lock().unwrap();
-        if connection.is_none() {
-            if let Ok(value) = Connection::open(database_path()) {
+        if connection.is_none() && let Ok(value) = Connection::open(database_path()) {
                 let _ = value.execute_batch("CREATE TABLE IF NOT EXISTS alarms (timestamp_utc TEXT NOT NULL, target TEXT NOT NULL, error TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'unknown')");
                 *connection = Some(value);
-            }
         }
         if let Some(connection) = connection.as_ref() {
             let _ = connection.execute(
@@ -603,6 +755,12 @@ pub fn database_path() -> PathBuf {
         .join("log");
     let _ = std::fs::create_dir_all(&base);
     base.join("netmark.sqlite")
+}
+
+impl Default for SqlState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// End-of-run reconciliation between the sending and the receiving side: what the
@@ -764,7 +922,7 @@ fn serve_debrief(
     let packet_type = PacketType::parse(&protocol).unwrap_or(PacketType::Tcp);
     let (received_packets, received_bytes) = metrics.run_counts(false, packet_type);
     let (lost, out_of_order) = match packet_type {
-        PacketType::Udp => metrics.udp_status(),
+        PacketType::Udp | PacketType::Ip => metrics.udp_status(),
         PacketType::Tcp => (0, 0),
     };
     let debrief = Debrief {
@@ -843,8 +1001,30 @@ pub fn spawn_server(
             .open(log_dir.join("server.log"))
             .unwrap();
         match config.packet_type {
-            PacketType::Tcp => tcp_server(&gate, &stopping, &metrics, log, config.server_runtime),
-            PacketType::Udp => udp_server(&gate, &stopping, &metrics, log, config.server_runtime),
+            PacketType::Tcp => tcp_server(
+                &gate,
+                &stopping,
+                &metrics,
+                log,
+                config.server_runtime,
+                &config.webrtc,
+            ),
+            PacketType::Udp => udp_server(
+                &gate,
+                &stopping,
+                &metrics,
+                log,
+                config.server_runtime,
+                &config.webrtc,
+            ),
+            PacketType::Ip => ip_server(
+                &gate,
+                &stopping,
+                &metrics,
+                log,
+                config.server_runtime,
+                &config.webrtc,
+            ),
         }
     });
 }
@@ -897,6 +1077,7 @@ pub fn spawn_client(
                 config.client_runtime,
                 config.client_jitter_millis,
                 client_id,
+                &config.webrtc,
             ),
             PacketType::Udp => udp_client(
                 config.udp_rate,
@@ -908,6 +1089,19 @@ pub fn spawn_client(
                 config.client_runtime,
                 config.server_jitter_millis,
                 client_id,
+                &config.webrtc,
+            ),
+            PacketType::Ip => ip_client(
+                config.udp_rate,
+                config.udp_packet_size,
+                &stopping,
+                &metrics,
+                log,
+                &remote,
+                config.client_runtime,
+                config.server_jitter_millis,
+                client_id,
+                &config.webrtc,
             ),
         }
     });
@@ -928,6 +1122,7 @@ fn tcp_server(
     metrics: &Arc<Metrics>,
     mut log: File,
     runtime: u64,
+    webrtc: &crate::webrtc::Settings,
 ) {
     let listener = match TcpListener::bind(address("0.0.0.0")) {
         Ok(v) => v,
@@ -944,7 +1139,7 @@ fn tcp_server(
             Ok((mut stream, _)) => {
                 stream.set_nonblocking(true).ok();
                 let mut buffer = [0; PACKET_SIZE];
-                let mut frame_reader = TcpFrameReader::new();
+                let mut frame_reader = TcpFrameReader::new(webrtc.enabled);
                 while !stopping.load(Ordering::Relaxed) && !expired(started, runtime) {
                     match stream.read(&mut buffer) {
                         Ok(0) => break,
@@ -973,6 +1168,7 @@ fn udp_server(
     metrics: &Arc<Metrics>,
     mut log: File,
     runtime: u64,
+    webrtc: &crate::webrtc::Settings,
 ) {
     let socket = match UdpSocket::bind(address("0.0.0.0")) {
         Ok(v) => v,
@@ -986,21 +1182,19 @@ fn udp_server(
     let started = Instant::now();
     let mut buffer = [0; PACKET_SIZE];
     let mut expected_sequences: HashMap<u64, Option<u64>> = HashMap::new();
+    let mut channels = crate::webrtc::Receiver::default();
     while !stopping.load(Ordering::Relaxed) && !expired(started, runtime) {
         match socket.recv_from(&mut buffer) {
             Ok((n, _)) => {
-                metrics.add(false, PacketType::Udp, n);
-                if n >= UDP_HEADER_LEN {
-                    let client_id = u64::from_be_bytes(buffer[16..24].try_into().unwrap());
-                    metrics.udp_sequence(
-                        expected_sequences.entry(client_id).or_default(),
-                        u64::from_be_bytes(buffer[..8].try_into().unwrap()),
-                    );
-                    metrics.udp_timestamp_jitter(i64::from_be_bytes(
-                        buffer[8..16].try_into().unwrap(),
-                    ));
-                }
-                writeln!(log, "{} UDP {n} bytes", timestamp()).ok();
+                receive_datagram(
+                    &buffer[..n],
+                    PacketType::Udp,
+                    metrics,
+                    &mut expected_sequences,
+                    &mut channels,
+                    webrtc,
+                    &mut log,
+                );
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(10))
@@ -1009,6 +1203,78 @@ fn udp_server(
         }
     }
 }
+
+/// The raw IP server. Unlike TCP and UDP there is no port to bind: every IPv4
+/// packet carrying netmark's protocol number arrives here.
+fn ip_server(
+    gate: &StartGate,
+    stopping: &AtomicBool,
+    metrics: &Arc<Metrics>,
+    mut log: File,
+    runtime: u64,
+    webrtc: &crate::webrtc::Settings,
+) {
+    let socket = match crate::rawip::RawIpSocket::open() {
+        Ok(socket) => socket,
+        Err(error) => {
+            writeln!(log, "{} IP server unavailable: {error}", timestamp()).ok();
+            eprintln!("server error: {error}");
+            return;
+        }
+    };
+    gate.wait();
+    let started = Instant::now();
+    let mut buffer = [0; PACKET_SIZE];
+    let mut expected_sequences: HashMap<u64, Option<u64>> = HashMap::new();
+    let mut channels = crate::webrtc::Receiver::default();
+    while !stopping.load(Ordering::Relaxed) && !expired(started, runtime) {
+        match socket.recv(&mut buffer) {
+            Ok(n) => {
+                receive_datagram(
+                    &buffer[..n],
+                    PacketType::Ip,
+                    metrics,
+                    &mut expected_sequences,
+                    &mut channels,
+                    webrtc,
+                    &mut log,
+                );
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(1))
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+/// Shared receive accounting for the two datagram transports.
+fn receive_datagram(
+    packet: &[u8],
+    protocol: PacketType,
+    metrics: &Arc<Metrics>,
+    expected_sequences: &mut HashMap<u64, Option<u64>>,
+    channels: &mut crate::webrtc::Receiver,
+    webrtc: &crate::webrtc::Settings,
+    log: &mut File,
+) {
+    let n = packet.len();
+    metrics.add(false, protocol, n);
+    if n >= UDP_HEADER_LEN {
+        let client_id = u64::from_be_bytes(packet[16..24].try_into().unwrap());
+        metrics.udp_sequence(
+            expected_sequences.entry(client_id).or_default(),
+            u64::from_be_bytes(packet[..8].try_into().unwrap()),
+        );
+        metrics.udp_timestamp_jitter(i64::from_be_bytes(packet[8..16].try_into().unwrap()));
+        if webrtc.enabled {
+            let accepted = channels.accept(&packet[UDP_HEADER_LEN..]).is_some();
+            metrics.record_webrtc_received(accepted);
+        }
+    }
+    writeln!(log, "{} {} {n} bytes", timestamp(), protocol.as_str().to_uppercase()).ok();
+}
+#[allow(clippy::too_many_arguments)]
 fn tcp_client(
     bytes_per_second: u64,
     stopping: &AtomicBool,
@@ -1018,6 +1284,7 @@ fn tcp_client(
     runtime: u64,
     jitter_millis: u64,
     client_id: u64,
+    webrtc: &crate::webrtc::Settings,
 ) {
     let started = Instant::now();
     let mut stream = loop {
@@ -1037,9 +1304,11 @@ fn tcp_client(
         runtime,
         jitter_millis,
         client_id,
+        webrtc,
         |p| stream.write_all(p),
     );
 }
+#[allow(clippy::too_many_arguments)]
 fn udp_client(
     udp_rate: u64,
     packet_size: usize,
@@ -1050,6 +1319,7 @@ fn udp_client(
     runtime: u64,
     jitter_millis: u64,
     client_id: u64,
+    webrtc: &crate::webrtc::Settings,
 ) {
     let socket = match UdpSocket::bind("0.0.0.0:0") {
         Ok(v) => v,
@@ -1058,16 +1328,61 @@ fn udp_client(
     if socket.connect(address(remote)).is_err() {
         return;
     }
-    send_udp_packets(
+    send_datagrams(
         udp_rate,
         packet_size,
+        PacketType::Udp,
         stopping,
         metrics,
         &mut log,
         runtime,
         jitter_millis,
         client_id,
+        webrtc,
         |p| socket.send(p).map(|_| ()),
+    );
+}
+#[allow(clippy::too_many_arguments)]
+fn ip_client(
+    udp_rate: u64,
+    packet_size: usize,
+    stopping: &AtomicBool,
+    metrics: &Arc<Metrics>,
+    mut log: File,
+    remote: &str,
+    runtime: u64,
+    jitter_millis: u64,
+    client_id: u64,
+    webrtc: &crate::webrtc::Settings,
+) {
+    let destination = match crate::rawip::resolve(remote) {
+        Ok(destination) => destination,
+        Err(error) => {
+            writeln!(log, "{} IP client unavailable: {error}", timestamp()).ok();
+            eprintln!("client error: {error}");
+            return;
+        }
+    };
+    let socket = match crate::rawip::RawIpSocket::open() {
+        Ok(socket) => socket,
+        Err(error) => {
+            writeln!(log, "{} IP client unavailable: {error}", timestamp()).ok();
+            eprintln!("client error: {error}");
+            return;
+        }
+    };
+    send_datagrams(
+        udp_rate,
+        packet_size,
+        PacketType::Ip,
+        stopping,
+        metrics,
+        &mut log,
+        runtime,
+        jitter_millis,
+        client_id,
+        webrtc,
+        |p| socket.send_to(p, destination).map(|_| ()),
     );
 }
 #[allow(clippy::too_many_arguments)]
@@ -1079,6 +1394,7 @@ pub(crate) fn send_tcp_packets<F>(
     runtime: u64,
     jitter_millis: u64,
     client_id: u64,
+    webrtc: &crate::webrtc::Settings,
     mut send: F,
 ) where
     F: FnMut(&[u8]) -> io::Result<()>,
@@ -1087,12 +1403,16 @@ pub(crate) fn send_tcp_packets<F>(
     let interval = Duration::from_secs_f64(packet_size as f64 / bytes_per_second.max(1) as f64);
     let started = Instant::now();
     let mut previous_send = started;
+    let mut channels = crate::webrtc::Sender::new(webrtc.clone());
     while !stopping.load(Ordering::Relaxed) && !expired(started, runtime) {
-        let (packet, frames) = build_tcp_frame(packet_size);
+        let (packet, frames, messages) = build_tcp_frame(packet_size, webrtc, &mut channels);
         if send(&packet).is_err() {
             return;
         }
         metrics.add_counts(true, PacketType::Tcp, frames, packet.len() as u64);
+        for _ in 0..messages {
+            metrics.record_webrtc_sent();
+        }
         let now = Instant::now();
         metrics.record_jitter(
             PacketType::Tcp,
@@ -1103,78 +1423,121 @@ pub(crate) fn send_tcp_packets<F>(
         thread::sleep(jittered_delay(interval, jitter_millis));
     }
 }
+/// Sends the datagram transports (UDP and raw IP), which share a packet layout.
 #[allow(clippy::too_many_arguments)]
-fn send_udp_packets<F>(
+fn send_datagrams<F>(
     udp_rate: u64,
     packet_size: usize,
+    protocol: PacketType,
     stopping: &AtomicBool,
     metrics: &Arc<Metrics>,
     log: &mut File,
     runtime: u64,
     jitter_millis: u64,
     client_id: u64,
+    webrtc: &crate::webrtc::Settings,
     mut send: F,
 ) where
     F: FnMut(&[u8]) -> io::Result<()>,
 {
-    let packet_size = packet_size.max(UDP_HEADER_LEN);
+    let minimum = if webrtc.enabled {
+        UDP_HEADER_LEN + crate::webrtc::HEADER_LEN
+    } else {
+        UDP_HEADER_LEN
+    };
+    let packet_size = packet_size.max(minimum);
     let interval = Duration::from_secs_f64(1.0 / udp_rate.max(1) as f64);
     let mut sequence = 0u64;
     let started = Instant::now();
     let mut previous_send = started;
+    let mut channels = crate::webrtc::Sender::new(webrtc.clone());
     while !stopping.load(Ordering::Relaxed) && !expired(started, runtime) {
         let mut packet = vec![0u8; packet_size];
         packet[..8].copy_from_slice(&sequence.to_be_bytes());
         packet[8..16].copy_from_slice(&Utc::now().timestamp_millis().to_be_bytes());
         packet[16..24].copy_from_slice(&client_id.to_be_bytes());
+        if webrtc.enabled {
+            let payload_len = (packet_size - minimum) as u16;
+            let header = channels.next(payload_len).encode();
+            packet[UDP_HEADER_LEN..minimum].copy_from_slice(&header);
+        }
         if send(&packet).is_err() {
             return;
         }
-        metrics.add(true, PacketType::Udp, packet.len());
+        metrics.add(true, protocol, packet.len());
+        if webrtc.enabled {
+            metrics.record_webrtc_sent();
+        }
         let now = Instant::now();
         metrics.record_jitter(
-            PacketType::Udp,
+            protocol,
             now.duration_since(previous_send).abs_diff(interval),
         );
         previous_send = now;
-        writeln!(log, "{} UDP {} bytes client={client_id}", timestamp(), packet.len()).ok();
+        writeln!(
+            log,
+            "{} {} {} bytes client={client_id}",
+            timestamp(),
+            protocol.as_str().to_uppercase(),
+            packet.len()
+        )
+        .ok();
         sequence += 1;
         thread::sleep(jittered_delay(interval, jitter_millis));
     }
 }
 
 /// Builds a TCP payload of `payload_len` bytes with a send timestamp embedded
-/// every `TCP_TIMESTAMP_CHUNK` bytes, so the receiver can measure jitter on a stream.
-/// Returns the buffer and the number of frames it contains.
-fn build_tcp_frame(payload_len: usize) -> (Vec<u8>, u64) {
+/// every `TCP_TIMESTAMP_CHUNK` bytes, so the receiver can measure jitter on a
+/// stream. When the WebRTC layer is on, each chunk also opens with a data-channel
+/// header. Returns the buffer, the number of frames and the number of
+/// data-channel messages it contains.
+fn build_tcp_frame(
+    payload_len: usize,
+    webrtc: &crate::webrtc::Settings,
+    channels: &mut crate::webrtc::Sender,
+) -> (Vec<u8>, u64, u64) {
     let mut buffer = Vec::with_capacity(payload_len + payload_len.div_ceil(TCP_TIMESTAMP_CHUNK) * TCP_HEADER_LEN);
     let mut remaining = payload_len;
     let mut frames = 0;
+    let mut messages = 0;
     while remaining > 0 {
         let chunk = remaining.min(TCP_TIMESTAMP_CHUNK);
         buffer.extend_from_slice(&Utc::now().timestamp_millis().to_be_bytes());
         buffer.extend_from_slice(&(chunk as u16).to_be_bytes());
-        buffer.extend(std::iter::repeat_n(0u8, chunk));
+        let carries_channel = webrtc.enabled && chunk >= crate::webrtc::HEADER_LEN;
+        if carries_channel {
+            let payload = (chunk - crate::webrtc::HEADER_LEN) as u16;
+            buffer.extend_from_slice(&channels.next(payload).encode());
+            buffer.extend(std::iter::repeat_n(0u8, chunk - crate::webrtc::HEADER_LEN));
+            messages += 1;
+        } else {
+            buffer.extend(std::iter::repeat_n(0u8, chunk));
+        }
         remaining -= chunk;
         frames += 1;
     }
-    (buffer, frames)
+    (buffer, frames, messages)
 }
 
 enum TcpFrameState {
     Header(Vec<u8>),
-    Payload { remaining: usize },
+    Payload { remaining: usize, channel: Vec<u8> },
 }
 
 /// Parses the timestamp-framed TCP byte stream produced by `build_tcp_frame`,
 /// tolerating frames split arbitrarily across reads.
 struct TcpFrameReader {
     state: TcpFrameState,
+    webrtc: bool,
+    channels: crate::webrtc::Receiver,
 }
 impl TcpFrameReader {
-    fn new() -> Self {
+    fn new(webrtc: bool) -> Self {
         Self {
             state: TcpFrameState::Header(Vec::with_capacity(TCP_HEADER_LEN)),
+            webrtc,
+            channels: crate::webrtc::Receiver::default(),
         }
     }
     fn feed(&mut self, data: &[u8], metrics: &Metrics) {
@@ -1194,12 +1557,24 @@ impl TcpFrameReader {
                         self.state = if length == 0 {
                             TcpFrameState::Header(Vec::with_capacity(TCP_HEADER_LEN))
                         } else {
-                            TcpFrameState::Payload { remaining: length }
+                            TcpFrameState::Payload {
+                                remaining: length,
+                                channel: Vec::new(),
+                            }
                         };
                     }
                 }
-                TcpFrameState::Payload { remaining } => {
+                TcpFrameState::Payload { remaining, channel } => {
                     let take = (*remaining).min(data.len() - offset);
+                    // Only the head of each payload is buffered, just enough to
+                    // read the data-channel header out of the stream.
+                    if self.webrtc && channel.len() < crate::webrtc::HEADER_LEN {
+                        let wanted = (crate::webrtc::HEADER_LEN - channel.len()).min(take);
+                        channel.extend_from_slice(&data[offset..offset + wanted]);
+                        if channel.len() == crate::webrtc::HEADER_LEN {
+                            metrics.record_webrtc_received(self.channels.accept(channel).is_some());
+                        }
+                    }
                     offset += take;
                     *remaining -= take;
                     if *remaining == 0 {

@@ -19,6 +19,15 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
+type ReportLoopArgs = (
+    Arc<Metrics>,
+    Arc<AtomicBool>,
+    Arc<AtomicBool>,
+    Arc<Mutex<ChildStdin>>,
+    Arc<Mutex<Config>>,
+    std::path::PathBuf,
+);
+
 fn main() {
     if std::env::args().any(|arg| arg == "--output") {
         output_process();
@@ -67,6 +76,7 @@ fn main() {
     ));
     let smtp = Arc::new(Mutex::new(file_config.smtp.clone()));
     let restapi_config = Arc::new(Mutex::new(file_config.restapi.clone()));
+    let webrtc = Arc::new(Mutex::new(netmark::webrtc_settings(&file_config.webrtc)));
     let clients = Arc::new(Clients::new(file_config.clients.clone()));
     let restapi = Arc::new(netmark::restapi::RestApi::new(
         Arc::clone(&clients),
@@ -97,6 +107,7 @@ fn main() {
         .open(log_dir.join("cli.log"))
         .unwrap();
     let mut input = String::new();
+    let mut history = History::new();
     let mut server_enabled = false;
     let mut run_id = 0u64;
     let mut run_started: Option<Instant> = None;
@@ -171,11 +182,25 @@ fn main() {
                 io::stdout().flush().unwrap();
             }
             Event::Key(KeyEvent {
+                code: KeyCode::Up, ..
+            }) if cli_mode && !clean_confirmation => {
+                history.step_back(&mut input);
+                redraw_input(server_enabled, clients.any_enabled(), &running, &input);
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Down,
+                ..
+            }) if cli_mode && !clean_confirmation => {
+                history.step_forward(&mut input);
+                redraw_input(server_enabled, clients.any_enabled(), &running, &input);
+            }
+            Event::Key(KeyEvent {
                 code: KeyCode::Enter,
                 ..
             }) if cli_mode => {
                 let line = input.trim().to_string();
                 input.clear();
+                history.push(&line);
                 cli_textout::raw("\r\n");
                 writeln!(cli_log, "{} {}", core::timestamp(), line).unwrap();
                 cli_log.flush().unwrap();
@@ -230,6 +255,11 @@ fn main() {
                     ["restapi", ..] => {
                         cli_textout::line("restapi: enable [<address>] | disable | status")
                     }
+                    // Command: webrtc — Subcommands: enable, disable, channels, label, ordered, status
+                    ["webrtc", rest @ ..] => match webrtc_command(&webrtc, rest) {
+                        Ok(summary) => cli_textout::line(summary),
+                        Err(error) => cli_textout::line(error),
+                    },
                     // Command: admin — Subcommands: add email, delete email, smtp
                     ["admin"] => cli_textout::line(
                         "admin: add email <address> | delete email <address> | smtp enabled | smtp disabled | smtp status",
@@ -290,6 +320,7 @@ fn main() {
                             &external,
                             &smtp,
                             &restapi_config,
+                            &webrtc,
                         ) {
                             Ok(()) => cli_textout::line("configuration saved to netmark.config"),
                             Err(error) => cli_textout::line(format!("config save error: {error}")),
@@ -303,6 +334,7 @@ fn main() {
                             &external,
                             &smtp,
                             &restapi_config,
+                            &webrtc,
                         );
                         cli_textout::line("configuration reset to defaults");
                     }
@@ -324,14 +356,10 @@ fn main() {
                         }
                         Err(_) => cli_textout::line("UDP max jitter must be milliseconds"),
                     },
-                    ["configure"] => cli_textout::line(
-                        "configure: metrics <connection> | save | reset | tcp bytes <rate> | tcp jitter <ms> | udp packetsize <bytes> | udp jitter <ms> | type <tcp|udp> | bandwidth limit <bytes/sec>",
-                    ),
+                    ["configure"] => cli_textout::line(CONFIGURE_USAGE),
                     ["configure", rest @ ..] => match configure(&config, rest) {
                         Ok(()) => cli_textout::line("configuration updated"),
-                        Err(_) => cli_textout::line(
-                            "configure: metrics <connection> | save | reset | tcp bytes <rate> | tcp jitter <ms> | udp packetsize <bytes> | udp jitter <ms> | type <tcp|udp> | bandwidth limit <bytes/sec>",
-                        ),
+                        Err(error) => cli_textout::line(error),
                     },
                     // Command: metrics — Subcommands: status, enable, disable
                     ["metrics"] => cli_textout::line("metrics: enable | disable | status"),
@@ -411,6 +439,10 @@ fn main() {
                     }
                     // Command: start
                     ["start"] => {
+                        if running.load(Ordering::Relaxed) {
+                            cli_textout::line("a run is already active; stop it before starting another");
+                            continue;
+                        }
                         let enabled = clients.enabled();
                         run_id = sql.next_run_id(run_id + 1);
                         sql.set_role(core::role_name(!enabled.is_empty(), server_enabled));
@@ -419,6 +451,7 @@ fn main() {
                         metrics.reset_run();
                         run_started = Some(Instant::now());
                         let gate = Arc::new(StartGate::new());
+                        config.lock().unwrap().webrtc = webrtc.lock().unwrap().clone();
                         write_run_event(&log_dir, run_id, "Starting");
                         if server_enabled {
                             core::spawn_server(
@@ -437,8 +470,13 @@ fn main() {
                         }
                         for client in &enabled {
                             let traffic = netmark::traffic_config_from(&config.lock().unwrap());
+                            let per_client = netmark::client_config(
+                                &traffic,
+                                client,
+                                &webrtc.lock().unwrap(),
+                            );
                             core::spawn_client(
-                                Arc::new(Mutex::new(netmark::client_config(&traffic, client))),
+                                Arc::new(Mutex::new(per_client)),
                                 Arc::clone(&gate),
                                 Arc::clone(&stopping),
                                 Arc::clone(&metrics),
@@ -458,6 +496,10 @@ fn main() {
                     }
                     // Command: stop
                     ["stop"] => {
+                        if !running.load(Ordering::Relaxed) {
+                            cli_textout::line("no run is active");
+                            continue;
+                        }
                         stopping.store(true, Ordering::Relaxed);
                         running.store(false, Ordering::Relaxed);
                         cli_mode = true;
@@ -490,28 +532,38 @@ fn main() {
                                 }
                             }
                         }
-                        sql.complete_run(
+                        sql.complete_run(run_id, &outcome.summary());
+                        record_final_metrics(
+                            external.lock().unwrap().as_ref(),
                             run_id,
-                            outcome.result,
-                            outcome.sent_bytes,
-                            outcome.failure_reason.as_deref(),
+                            &metrics,
+                            &outcome,
                         );
-                        record_final_metrics(external.lock().unwrap().as_ref(), run_id, &metrics);
-                        cli_textout::line(format!("stopped ({})", outcome.result));
+                        netmark::write_log_line(&log_dir, &outcome.report_line(run_id));
+                        cli_textout::line(format!("stopped {}", outcome.report_line(run_id)));
                     }
                     // Command: status
-                    ["status"] => {
-                        let (monitor_on, monitor_id, calls, successes, failures) = monitor.status();
-                        cli_textout::line(format!(
-                            "{}; monitor {} id {} calls {} successes {} failures {}",
-                            traffic_status(&metrics, running.load(Ordering::Relaxed)),
-                            if monitor_on { "on" } else { "off" },
-                            monitor_id,
-                            calls,
-                            successes,
-                            failures
-                        ));
-                    }
+                    ["status"] => print_status(
+                        &metrics,
+                        &StatusContext {
+                            running: running.load(Ordering::Relaxed),
+                            elapsed: run_started.map(|started| started.elapsed()),
+                            run_id,
+                            server_enabled,
+                            clients: &clients,
+                            webrtc: &webrtc.lock().unwrap(),
+                            packet_type: config.lock().unwrap().packet_type,
+                            monitor: monitor.status(),
+                            metrics_sql: external
+                                .lock()
+                                .unwrap()
+                                .as_ref()
+                                .map(|sink| sink.status())
+                                .unwrap_or_else(|| "not connected".to_string()),
+                            restapi: restapi.status(),
+                            smtp: smtp.lock().unwrap().enabled,
+                        },
+                    ),
                     // Command: show run <id>
                     ["show", "run", value] => {
                         if let Ok(id) = value.parse::<u64>() {
@@ -561,11 +613,7 @@ fn main() {
             Event::Key(KeyEvent {
                 code: KeyCode::Backspace,
                 ..
-            }) if cli_mode => {
-                if input.pop().is_some() {
-                    cli_textout::raw("\x08 \x08");
-                }
-            }
+            }) if cli_mode && input.pop().is_some() => cli_textout::raw("\x08 \x08"),
             _ => {}
         }
     }
@@ -573,12 +621,22 @@ fn main() {
     running.store(false, Ordering::Relaxed);
     monitor.stop(&log_dir);
     disable_raw_mode().ok();
-    write_run_event(&log_dir, run_id, "Completed");
-    let (tcp_bytes, udp_bytes) = metrics.run_sent_bytes();
-    sql.complete_run(run_id, "aborted", tcp_bytes + udp_bytes, None);
-    record_final_metrics(external.lock().unwrap().as_ref(), run_id, &metrics);
+    if let Some(started) = run_started {
+        write_run_event(&log_dir, run_id, "Completed");
+        let mut outcome = evaluate_run(&metrics, &config.lock().unwrap(), Some(started.elapsed()));
+        outcome.result = "aborted";
+        sql.complete_run(run_id, &outcome.summary());
+        record_final_metrics(external.lock().unwrap().as_ref(), run_id, &metrics, &outcome);
+        netmark::write_log_line(&log_dir, &outcome.report_line(run_id));
+    }
     clear_input_line();
     cli_textout::raw("\r\n");
+}
+
+fn redraw_input(server: bool, client: bool, running: &AtomicBool, input: &str) {
+    redraw_prompt(server, client, running.load(Ordering::Relaxed));
+    cli_textout::raw(input);
+    io::stdout().flush().ok();
 }
 
 fn prompt(server: bool, client: bool, running: bool) -> String {
@@ -610,6 +668,7 @@ fn start_output_process() -> (ChildStdin, Arc<Mutex<()>>) {
         .spawn()
         .expect("cannot start output process");
     let mut child_stdout = child.stdout.take().unwrap();
+    let child_stdin = child.stdin.take().unwrap();
     let stdout_guard = Arc::new(Mutex::new(()));
     let reader_guard = Arc::clone(&stdout_guard);
     thread::spawn(move || {
@@ -620,12 +679,13 @@ fn start_output_process() -> (ChildStdin, Arc<Mutex<()>>) {
             cli_textout::raw(&buffer);
             buffer.clear();
         }
+        let _ = child.wait();
     });
-    (child.stdin.take().unwrap(), stdout_guard)
+    (child_stdin, stdout_guard)
 }
 fn output_process() {
     let mut visible = true;
-    for line in io::stdin().lock().lines().flatten() {
+    for line in io::stdin().lock().lines().map_while(Result::ok) {
         if line == "SHOW" {
             visible = true;
         } else if line == "HIDE" {
@@ -636,14 +696,7 @@ fn output_process() {
     }
 }
 fn report_loop(
-    (metrics, stopping, running, output, config, log_dir): (
-        Arc<Metrics>,
-        Arc<AtomicBool>,
-        Arc<AtomicBool>,
-        Arc<Mutex<ChildStdin>>,
-        Arc<Mutex<Config>>,
-        std::path::PathBuf,
-    ),
+    (metrics, stopping, running, output, config, log_dir): ReportLoopArgs,
 ) {
     loop {
         thread::sleep(Duration::from_secs(1));
@@ -654,26 +707,33 @@ fn report_loop(
         let (lost, order) = metrics.udp_status();
         let jitter = metrics.jitter_millis();
         let config_snapshot = config.lock().unwrap().clone();
-        if metrics.tcp_jitter_millis() > config_snapshot.max_tcp_jitter_millis
-            || metrics.udp_jitter_millis() > config_snapshot.max_udp_jitter_millis
-        {
-            if let Ok(mut log) = OpenOptions::new()
+        if (metrics.tcp_jitter_millis() > config_snapshot.max_tcp_jitter_millis
+            || metrics.udp_jitter_millis() > config_snapshot.max_udp_jitter_millis)
+            && let Ok(mut log) = OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(log_dir.join("netmark.log"))
-            {
-                let _ = writeln!(
-                    log,
-                    "{} ERROR jitter exceeded TCP={}ms UDP={}ms",
-                    core::timestamp(),
-                    metrics.tcp_jitter_millis(),
-                    metrics.udp_jitter_millis()
-                );
-            }
+        {
+            let _ = writeln!(
+                log,
+                "{} ERROR jitter exceeded TCP={}ms UDP={}ms",
+                core::timestamp(),
+                metrics.tcp_jitter_millis(),
+                metrics.udp_jitter_millis()
+            );
         }
+        // The loop ticks once per second, so these totals are already bytes/sec.
         let line = format!(
-            "Server: TCP {} bytes, UDP {} bytes (lost {}, out-of-order {}, jitter {} ms) Received | Client: TCP {} bytes, UDP {} bytes Sent",
-            values[5], values[7], lost, order, jitter, values[1], values[3]
+            "up {} bytes/sec, down {} bytes/sec | Client sent: TCP {} bytes, UDP/IP {} bytes | Server received: TCP {} bytes, UDP/IP {} bytes (lost {}, out-of-order {}, jitter {} ms)",
+            values[1] + values[3],
+            values[5] + values[7],
+            values[1],
+            values[3],
+            values[5],
+            values[7],
+            lost,
+            order,
+            jitter
         );
         let mut output = output.lock().unwrap();
         if writeln!(output, "{line}").is_err() || output.flush().is_err() {

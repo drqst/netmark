@@ -87,12 +87,21 @@ pub struct RunReport {
     pub elapsed: Duration,
     pub sent_tcp_bytes: u64,
     pub sent_udp_bytes: u64,
+    pub sent_ip_bytes: u64,
     pub received_tcp_bytes: u64,
     pub received_udp_bytes: u64,
+    pub received_ip_bytes: u64,
+    /// Upload bandwidth over the run.
+    pub sent_bytes_per_second: u64,
+    /// Download bandwidth over the run.
+    pub received_bytes_per_second: u64,
     pub lost_udp_packets: u64,
     pub out_of_order_udp_packets: u64,
     pub tcp_jitter_millis: u64,
     pub udp_jitter_millis: u64,
+    pub webrtc_sent_messages: u64,
+    pub webrtc_received_messages: u64,
+    pub webrtc_invalid_frames: u64,
     /// Client/server reconciliation of the run; absent when no client ran or the
     /// server could not be reached for the debrief.
     pub debrief: Option<Debrief>,
@@ -100,15 +109,30 @@ pub struct RunReport {
 
 impl RunReport {
     pub fn sent_bytes(&self) -> u64 {
-        self.sent_tcp_bytes + self.sent_udp_bytes
+        self.sent_tcp_bytes + self.sent_udp_bytes + self.sent_ip_bytes
     }
     pub fn received_bytes(&self) -> u64 {
-        self.received_tcp_bytes + self.received_udp_bytes
+        self.received_tcp_bytes + self.received_udp_bytes + self.received_ip_bytes
     }
-    /// Bytes per second sent over the wall-clock duration of the run.
+    /// Upload bandwidth; kept as an alias of `sent_bytes_per_second`.
     pub fn throughput_bytes_per_second(&self) -> u64 {
-        let seconds = self.elapsed.as_secs_f64().max(1.0);
-        (self.sent_bytes() as f64 / seconds) as u64
+        self.sent_bytes_per_second
+    }
+    /// The one line every surface prints for a finished run.
+    pub fn summary(&self) -> String {
+        format!(
+            "run {} result={} sent_bytes={} received_bytes={} up={} bytes/sec down={} bytes/sec{}",
+            self.run_id,
+            self.result,
+            self.sent_bytes(),
+            self.received_bytes(),
+            self.sent_bytes_per_second,
+            self.received_bytes_per_second,
+            self.failure_reason
+                .as_deref()
+                .map(|reason| format!(" reason=\"{reason}\""))
+                .unwrap_or_default()
+        )
     }
 }
 
@@ -206,6 +230,7 @@ impl TestRunner {
         let totals = metrics.run_totals();
         let (lost, out_of_order) = metrics.udp_status();
         let (tcp_jitter, udp_jitter) = (metrics.tcp_jitter_millis(), metrics.udp_jitter_millis());
+        let (webrtc_sent, webrtc_received, webrtc_invalid) = metrics.webrtc_counts();
         let mut report = RunReport {
             run_id,
             passed: outcome.result == "ok",
@@ -214,12 +239,19 @@ impl TestRunner {
             elapsed,
             sent_tcp_bytes: totals[1],
             sent_udp_bytes: totals[3],
+            sent_ip_bytes: totals[9],
             received_tcp_bytes: totals[5],
             received_udp_bytes: totals[7],
+            received_ip_bytes: totals[11],
+            sent_bytes_per_second: outcome.sent_bytes_per_second,
+            received_bytes_per_second: outcome.received_bytes_per_second,
             lost_udp_packets: lost,
             out_of_order_udp_packets: out_of_order,
             tcp_jitter_millis: tcp_jitter,
             udp_jitter_millis: udp_jitter,
+            webrtc_sent_messages: webrtc_sent,
+            webrtc_received_messages: webrtc_received,
+            webrtc_invalid_frames: webrtc_invalid,
             debrief,
         };
 
@@ -252,17 +284,7 @@ impl TestRunner {
             if let Some(debrief) = &report.debrief {
                 println!("auto mode: {}", debrief.summary());
             }
-            println!(
-                "auto mode: run {} finished result={} sent_bytes={}{}",
-                report.run_id,
-                report.result,
-                report.sent_bytes(),
-                report
-                    .failure_reason
-                    .as_deref()
-                    .map(|reason| format!(" reason=\"{reason}\""))
-                    .unwrap_or_default()
-            );
+            println!("auto mode: {}", report.summary());
         }
         Ok(report)
     }
