@@ -1,6 +1,7 @@
 mod cli_textout;
 mod core;
 mod metrics;
+mod monitor;
 
 use core::{Config, DEFAULT_REMOTE, Metrics, PacketType, SqlState, StartGate};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
@@ -8,6 +9,7 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use metrics::ExternalSqlMetrics;
 use std::fs::{OpenOptions, create_dir_all};
 use std::io::{self, BufRead, Write};
+use std::net::TcpStream;
 use std::process::{ChildStdin, Command, Stdio};
 use std::sync::{
     Arc, Mutex,
@@ -58,9 +60,11 @@ fn main() {
     let sql = Arc::new(SqlState::new());
     sql.enable()
         .expect("cannot initialize local SQLite database");
-    let external = Arc::new(Mutex::new(None::<Arc<ExternalSqlMetrics>>));
-    let monitor_target = Arc::new(Mutex::new(None::<String>));
-    let monitor_running = Arc::new(AtomicBool::new(false));
+    let external = Arc::new(Mutex::new(load_default_metrics_sink()));
+    let monitor = Arc::new(monitor::MonitorState::new());
+    monitor
+        .clone()
+        .spawn_worker(log_dir.clone(), Arc::clone(&sql));
     let (output_stdin, stdout_guard) = start_output_process();
     let output = Arc::new(Mutex::new(output_stdin));
     {
@@ -73,15 +77,6 @@ fn main() {
             Arc::clone(&external),
         );
         thread::spawn(move || report_loop(args));
-    }
-    {
-        let args = (
-            log_dir.clone(),
-            Arc::clone(&monitor_target),
-            Arc::clone(&monitor_running),
-            Arc::clone(&sql),
-        );
-        thread::spawn(move || monitor_loop(args));
     }
     let mut cli_log = OpenOptions::new()
         .append(true)
@@ -130,7 +125,7 @@ fn main() {
             }) if modifiers.contains(KeyModifiers::CONTROL) => {
                 cli_textout::line("");
                 running.store(false, Ordering::Relaxed);
-                monitor_running.store(false, Ordering::Relaxed);
+                monitor.stop(&log_dir);
                 disable_raw_mode().ok();
                 clear_input_line();
                 cli_textout::line("exiting");
@@ -201,11 +196,7 @@ fn main() {
                         cli_textout::line("Server stopped");
                     }
                     ["server", "runtime", seconds] => set_runtime(&config, false, seconds),
-                    ["configure", rest @ ..] => match configure(&config, rest) {
-                        Ok(()) => cli_textout::line("configuration updated"),
-                        Err(error) => cli_textout::line(format!("configure error: {error}")),
-                    },
-                    ["metrics", "add", "sql", connection] => {
+                    ["configure", "metrics", connection] => {
                         match ExternalSqlMetrics::connect(connection) {
                             Ok(sink) => {
                                 *external.lock().unwrap() = Some(Arc::new(sink));
@@ -214,14 +205,46 @@ fn main() {
                             Err(error) => cli_textout::line(format!("metrics error: {error}")),
                         }
                     }
+                    ["configure", rest @ ..] => match configure(&config, rest) {
+                        Ok(()) => cli_textout::line("configuration updated"),
+                        Err(error) => cli_textout::line(format!("configure error: {error}")),
+                    },
+                    ["metrics", "status"] => {
+                        let status = external
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .map(|sink| sink.status())
+                            .unwrap_or_else(|| "not connected".to_string());
+                        cli_textout::line(format!("metrics SQL: {status}"));
+                    }
+                    ["metrics", "enable"] => match load_default_metrics_sink() {
+                        Some(sink) => {
+                            *external.lock().unwrap() = Some(sink);
+                            cli_textout::line("external SQL metrics enabled");
+                        }
+                        None => cli_textout::line("external SQL metrics could not connect"),
+                    },
+                    ["metrics", "disable"] => {
+                        *external.lock().unwrap() = None;
+                        cli_textout::line("external SQL metrics disabled");
+                    }
                     ["monitor", "IP", target] | ["monitor", "ip", target] => {
                         let target = normalize_http_target(target);
-                        *monitor_target.lock().unwrap() = Some(target.clone());
+                        monitor.set_target(target.clone());
                         cli_textout::line(format!("monitor target set to {target}"));
                     }
                     ["selftest"] => {
                         run_selftest(&config, &stopping, &running, &metrics, &sql, &log_dir)
                     }
+                    ["benchmark", "duration", seconds] => match seconds.parse::<u64>() {
+                        Ok(seconds) if seconds > 0 => {
+                            run_benchmark(&remote, seconds, &sql, &log_dir)
+                        }
+                        _ => cli_textout::line(
+                            "benchmark duration must be a positive number of seconds",
+                        ),
+                    },
                     ["clean"] => {
                         cli_textout::line(
                             "Are you sure? This will delete all data from runs on this instance of netmark.",
@@ -229,8 +252,17 @@ fn main() {
                         cli_textout::line("Confirm with Y or N.");
                         clean_confirmation = true;
                     }
-                    ["monitor", "start"] => monitor_running.store(true, Ordering::Relaxed),
-                    ["monitor", "stop"] => monitor_running.store(false, Ordering::Relaxed),
+                    ["monitor", "start"] => {
+                        if let Some(id) = monitor.start(&log_dir) {
+                            cli_textout::line(format!("monitor started {id}"));
+                        } else {
+                            cli_textout::line("monitor already running");
+                        }
+                    }
+                    ["monitor", "stop"] => {
+                        monitor.stop(&log_dir);
+                        cli_textout::line("monitor stopped");
+                    }
                     ["monitor", "history"] => show_monitor_history(&log_dir),
                     ["start"] => {
                         run_id = sql.next_run_id(run_id + 1);
@@ -272,7 +304,16 @@ fn main() {
                         cli_textout::line("stopped");
                     }
                     ["status"] => {
-                        cli_textout::line(traffic_status(&metrics, running.load(Ordering::Relaxed)))
+                        let (monitor_on, monitor_id, calls, successes, failures) = monitor.status();
+                        cli_textout::line(format!(
+                            "{}; monitor {} id {} calls {} successes {} failures {}",
+                            traffic_status(&metrics, running.load(Ordering::Relaxed)),
+                            if monitor_on { "on" } else { "off" },
+                            monitor_id,
+                            calls,
+                            successes,
+                            failures
+                        ));
                     }
                     ["sql", "enable"] => match sql.enable() {
                         Ok(()) => cli_textout::line("sql enabled"),
@@ -325,7 +366,7 @@ fn main() {
     }
     stopping.store(true, Ordering::Relaxed);
     running.store(false, Ordering::Relaxed);
-    monitor_running.store(false, Ordering::Relaxed);
+    monitor.stop(&log_dir);
     disable_raw_mode().ok();
     write_run_event(&log_dir, run_id, "Completed");
     sql.complete_run(run_id, "aborted");
@@ -344,6 +385,24 @@ fn set_runtime(config: &Arc<Mutex<Config>>, client: bool, value: &str) {
             cli_textout::line(format!("runtime set to {value} seconds"));
         }
         Err(_) => cli_textout::line("runtime must be a non-negative integer"),
+    }
+}
+fn load_default_metrics_sink() -> Option<Arc<ExternalSqlMetrics>> {
+    let executable_config = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|dir| dir.join("netmark.config")));
+    let config_path = executable_config
+        .filter(|path| path.exists())
+        .unwrap_or_else(|| std::path::PathBuf::from("netmark.config"));
+    let contents = std::fs::read_to_string(config_path).ok()?;
+    let document: serde_yaml::Value = serde_yaml::from_str(&contents).ok()?;
+    let connection = document.get("metrics")?.get("sql")?.as_str()?;
+    match ExternalSqlMetrics::connect(connection) {
+        Ok(sink) => Some(Arc::new(sink)),
+        Err(error) => {
+            cli_textout::line(format!("metrics SQL connection failed: {error}"));
+            None
+        }
     }
 }
 fn normalize_http_target(target: &str) -> String {
@@ -404,10 +463,57 @@ fn run_selftest(
         thread::sleep(Duration::from_secs(10));
         stop.store(true, Ordering::Relaxed);
         state.store(false, Ordering::Relaxed);
+        cli_textout::raw("\r\n");
         sql_state.complete_run(run_id, "ok");
         write_run_event(&logs, run_id, "Completed");
+        cli_textout::raw("\r\n");
         cli_textout::line(format!("selftest completed run {run_id}"));
     });
+}
+fn run_benchmark(remote: &str, seconds: u64, sql: &SqlState, log_dir: &std::path::Path) {
+    let run_id = sql.next_run_id(1);
+    write_run_event(log_dir, run_id, "Starting");
+    sql.start_run(run_id);
+    let mut stream = match TcpStream::connect(format!("{remote}:9000")) {
+        Ok(stream) => stream,
+        Err(error) => {
+            sql.complete_run(run_id, "error");
+            write_run_event(log_dir, run_id, "Completed");
+            cli_textout::line(format!("benchmark run {run_id} failed: {error}"));
+            return;
+        }
+    };
+    let packet = [0u8; 64 * 1024];
+    let started = Instant::now();
+    let mut bytes = 0u64;
+    while started.elapsed() < Duration::from_secs(seconds) {
+        if stream.write_all(&packet).is_err() {
+            break;
+        }
+        bytes += packet.len() as u64;
+    }
+    let elapsed_ms = started.elapsed().as_millis().max(1) as u64;
+    let bytes_per_second = bytes.saturating_mul(1000) / elapsed_ms;
+    if let Ok(mut log) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_dir.join("client.log"))
+    {
+        let _ = writeln!(
+            log,
+            "{} TCP benchmark run={} bytes={} elapsed_ms={} bytes_per_second={}",
+            core::timestamp(),
+            run_id,
+            bytes,
+            elapsed_ms,
+            bytes_per_second
+        );
+    }
+    sql.complete_run(run_id, if bytes > 0 { "ok" } else { "error" });
+    write_run_event(log_dir, run_id, "Completed");
+    cli_textout::line(format!(
+        "benchmark run {run_id}: {bytes} bytes in {elapsed_ms} ms ({bytes_per_second} bytes/sec)"
+    ));
 }
 fn configure(config: &Arc<Mutex<Config>>, args: &[&str]) -> Result<(), String> {
     if let ["jitter", value] = args {
@@ -595,45 +701,6 @@ fn show_monitor_history(log_dir: &std::path::Path) {
         }
     }
 }
-fn monitor_loop(
-    (log_dir, target, running, sql): (
-        std::path::PathBuf,
-        Arc<Mutex<Option<String>>>,
-        Arc<AtomicBool>,
-        Arc<SqlState>,
-    ),
-) {
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-    {
-        Ok(value) => value,
-        Err(_) => return,
-    };
-    while !std::thread::panicking() {
-        if running.load(Ordering::Relaxed) {
-            if let Some(target) = target.lock().unwrap().clone() {
-                if let Err(error) = client
-                    .get(&target)
-                    .send()
-                    .and_then(|response| response.error_for_status())
-                    .and_then(|response| response.bytes().map(|_| ()))
-                {
-                    let time = core::timestamp();
-                    if let Ok(mut alarm) = OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(log_dir.join("alarm.log"))
-                    {
-                        let _ = writeln!(alarm, "{} {} {}", time, target, error);
-                    }
-                    sql.record_alarm(&time, &target, &error.to_string());
-                }
-            }
-        }
-        thread::sleep(Duration::from_secs(30));
-    }
-}
 fn report_loop(
     (metrics, stopping, running, sql, output, external): (
         Arc<Metrics>,
@@ -683,27 +750,31 @@ fn print_help(stdout_guard: &Arc<Mutex<()>>, output: &Arc<Mutex<ChildStdin>>) {
     let _guard = stdout_guard.lock().unwrap();
     let rows = vec![
         vec!["server".into(), "receiving side of traffic".into()],
-        vec!["enable".into(), "enable server traffic".into()],
-        vec!["disable".into(), "disable server traffic".into()],
+        vec!["server enable".into(), "enable server traffic".into()],
+        vec!["server disable".into(), "disable server traffic".into()],
         vec![
-            "runtime <seconds>".into(),
+            "server runtime <seconds>".into(),
             "limit server runtime; zero is unlimited".into(),
         ],
         vec!["client".into(), "sending side of traffic".into()],
-        vec!["enable".into(), "enable client traffic".into()],
-        vec!["disable".into(), "disable client traffic".into()],
-        vec!["remote <ip>".into(), "set client destination".into()],
+        vec!["client enable".into(), "enable client traffic".into()],
+        vec!["client disable".into(), "disable client traffic".into()],
+        vec!["client remote <ip>".into(), "set client destination".into()],
         vec![
-            "runtime <seconds>".into(),
+            "client runtime <seconds>".into(),
             "limit client runtime; zero is unlimited".into(),
         ],
         vec![
-            "http check <url>".into(),
+            "client http check <url>".into(),
             "load one HTTP or HTTPS page".into(),
         ],
         vec![
             "selftest".into(),
             "send UDP traffic to localhost and stop automatically".into(),
+        ],
+        vec![
+            "benchmark duration <seconds>".into(),
+            "flood the remote server with TCP and report bandwidth".into(),
         ],
         vec![
             "configure tcp bytes <rate>".into(),
@@ -722,8 +793,16 @@ fn print_help(stdout_guard: &Arc<Mutex<()>>, output: &Arc<Mutex<ChildStdin>>) {
             "set UDP send jitter".into(),
         ],
         vec![
-            "metrics add sql <connection>".into(),
-            "publish one-second metrics externally".into(),
+            "metrics enable".into(),
+            "enable external SQL metrics using netmark.config".into(),
+        ],
+        vec![
+            "metrics disable".into(),
+            "disable external SQL metrics".into(),
+        ],
+        vec![
+            "configure metrics <connection>".into(),
+            "override the configured external SQL target".into(),
         ],
         vec![
             "monitor IP <url>".into(),
@@ -737,11 +816,13 @@ fn print_help(stdout_guard: &Arc<Mutex<()>>, output: &Arc<Mutex<ChildStdin>>) {
             "monitor history".into(),
             "show monitor events and alarms".into(),
         ],
-        vec!["start | stop".into(), "start or stop a traffic run".into()],
+        vec!["start".into(), "start a traffic run".into()],
+        vec!["stop".into(), "stop the traffic run".into()],
         vec!["status".into(), "show current counters".into()],
+        vec!["sql enable".into(), "enable local SQLite snapshots".into()],
         vec![
-            "sql enable | disable".into(),
-            "control local SQLite snapshots".into(),
+            "sql disable".into(),
+            "disable local SQLite snapshots".into(),
         ],
         vec![
             "clean".into(),
