@@ -19,6 +19,124 @@ use std::time::{Duration, Instant};
 /// Wall-clock length of `selftest`.
 pub const SELFTEST_SECONDS: u64 = 3;
 
+/// The set of clients this instance drives, each with its own id starting at 0.
+pub struct Clients {
+    clients: Mutex<Vec<configuration::ClientConfig>>,
+}
+
+impl Clients {
+    pub fn new(mut clients: Vec<configuration::ClientConfig>) -> Self {
+        if clients.is_empty() {
+            clients.push(configuration::ClientConfig::new(0));
+        }
+        clients.sort_by_key(|client| client.id);
+        Self {
+            clients: Mutex::new(clients),
+        }
+    }
+    pub fn list(&self) -> Vec<configuration::ClientConfig> {
+        self.clients.lock().unwrap().clone()
+    }
+    pub fn enabled(&self) -> Vec<configuration::ClientConfig> {
+        self.clients
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|client| client.enabled)
+            .cloned()
+            .collect()
+    }
+    pub fn any_enabled(&self) -> bool {
+        self.clients.lock().unwrap().iter().any(|c| c.enabled)
+    }
+    /// Applies `change` to one client, reporting whether that id exists.
+    pub fn update(&self, id: u64, change: impl FnOnce(&mut configuration::ClientConfig)) -> bool {
+        let mut clients = self.clients.lock().unwrap();
+        match clients.iter_mut().find(|client| client.id == id) {
+            Some(client) => {
+                change(client);
+                true
+            }
+            None => false,
+        }
+    }
+    pub fn get(&self, id: u64) -> Option<configuration::ClientConfig> {
+        self.clients
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|client| client.id == id)
+            .cloned()
+    }
+    /// Adds a client using the lowest free id and returns it.
+    pub fn add(&self) -> u64 {
+        let mut clients = self.clients.lock().unwrap();
+        let id = (0..).find(|id| !clients.iter().any(|c| c.id == *id)).unwrap();
+        clients.push(configuration::ClientConfig::new(id));
+        clients.sort_by_key(|client| client.id);
+        id
+    }
+    pub fn remove(&self, id: u64) -> bool {
+        let mut clients = self.clients.lock().unwrap();
+        let before = clients.len();
+        clients.retain(|client| client.id != id);
+        clients.len() != before
+    }
+    pub fn replace(&self, clients: Vec<configuration::ClientConfig>) {
+        *self.clients.lock().unwrap() = Clients::new(clients).list();
+    }
+}
+
+/// Subcommand dispatcher for `client <id> <...>`.
+pub fn client_command(clients: &Clients, id: u64, args: &[&str], log_dir: &std::path::Path) {
+    if clients.get(id).is_none() {
+        cli_textout::line(format!("no client {id}; use: client add"));
+        return;
+    }
+    match args {
+        ["enable"] => {
+            clients.update(id, |client| client.enabled = true);
+            cli_textout::line(format!("client {id} enabled"));
+        }
+        ["disable"] => {
+            clients.update(id, |client| client.enabled = false);
+            cli_textout::line(format!("client {id} disabled"));
+        }
+        ["remote", host] => {
+            clients.update(id, |client| client.remote = (*host).to_string());
+            cli_textout::line(format!("client {id} remote set to {host}"));
+        }
+        ["runtime", value] => match value.parse::<u64>() {
+            Ok(value) => {
+                clients.update(id, |client| client.runtime = Some(value));
+                cli_textout::line(format!("client {id} runtime set to {value} seconds"));
+            }
+            Err(_) => cli_textout::line("runtime must be a non-negative integer"),
+        },
+        ["jitter", value] => match value.parse::<u64>() {
+            Ok(value) => {
+                clients.update(id, |client| client.jitter_millis = Some(value));
+                cli_textout::line(format!("client {id} jitter set to {value} ms"));
+            }
+            Err(_) => cli_textout::line("jitter must be milliseconds"),
+        },
+        ["http", "check", url] => client_http_check(log_dir, url),
+        ["status"] => {
+            cli_textout::line(clients.get(id).map(|c| c.summary()).unwrap_or_default())
+        }
+        _ => cli_textout::line(CLIENT_USAGE),
+    }
+}
+
+pub const CLIENT_USAGE: &str = "client: list | add | delete <id> | <id> enable | <id> disable | <id> remote <ip> | <id> runtime <seconds> | <id> jitter <ms> | <id> http check <url> | <id> status";
+
+/// Subcommand: client list
+pub fn list_clients(clients: &Clients) {
+    for client in clients.list() {
+        cli_textout::line(client.summary());
+    }
+}
+
 /// Subcommand: client runtime <seconds> | server runtime <seconds>
 pub fn set_runtime(config: &Arc<Mutex<Config>>, client: bool, value: &str) {
     match value.parse::<u64>() {
@@ -81,16 +199,20 @@ pub fn load_default_metrics_sink() -> Option<Arc<ExternalSqlMetrics>> {
 pub fn save_configuration(
     path: &std::path::Path,
     config: &Config,
+    clients: &Clients,
     external: &Arc<Mutex<Option<Arc<ExternalSqlMetrics>>>>,
     smtp: &Arc<Mutex<configuration::SmtpConfig>>,
+    restapi: &Arc<Mutex<configuration::RestApiConfig>>,
 ) -> Result<(), String> {
     let mut document = configuration::load(path).unwrap_or_default();
     document.traffic = crate::traffic_config_from(config);
+    document.clients = clients.list();
     document.admin.emails = config.admin_emails.clone();
     if let Some(sink) = external.lock().unwrap().as_ref() {
         document.metrics.sql = Some(sink.connection_string().to_string());
     }
     document.smtp = smtp.lock().unwrap().clone();
+    document.restapi = restapi.lock().unwrap().clone();
     let contents = serde_yaml::to_string(&document).map_err(|error| error.to_string())?;
     std::fs::write(path, contents).map_err(|error| error.to_string())
 }
@@ -100,11 +222,14 @@ pub fn save_configuration(
 pub fn reset_configuration(
     path: &std::path::Path,
     config: &Arc<Mutex<Config>>,
+    clients: &Clients,
     external: &Arc<Mutex<Option<Arc<ExternalSqlMetrics>>>>,
     smtp: &Arc<Mutex<configuration::SmtpConfig>>,
+    restapi: &Arc<Mutex<configuration::RestApiConfig>>,
 ) {
     let file_config = configuration::load(path).unwrap_or_default();
     *config.lock().unwrap() = crate::config_from_file(&file_config);
+    clients.replace(file_config.clients);
     *external.lock().unwrap() = file_config
         .metrics
         .sql
@@ -112,6 +237,7 @@ pub fn reset_configuration(
         .and_then(|connection| ExternalSqlMetrics::connect(connection).ok())
         .map(Arc::new);
     *smtp.lock().unwrap() = file_config.smtp;
+    *restapi.lock().unwrap() = file_config.restapi;
 }
 
 /// Subcommand: admin smtp enabled | admin smtp disabled — turns SMTP use on or
@@ -200,10 +326,11 @@ pub fn run_selftest(
         return;
     }
     let run_id = sql.next_run_id(1);
+    sql.set_role(core::ROLE_BOTH);
     {
         let mut config = config.lock().unwrap();
         config.packet_type = PacketType::Udp;
-        config.rate = 1;
+        config.udp_rate = 1;
         config.udp_packet_size = 1024;
         config.client_runtime = SELFTEST_SECONDS;
         config.server_runtime = SELFTEST_SECONDS;
@@ -227,6 +354,13 @@ pub fn run_selftest(
         Arc::clone(metrics),
         DEFAULT_REMOTE.to_string(),
         log_dir.to_path_buf(),
+        0,
+    );
+    core::spawn_debrief_responder(
+        Arc::clone(stopping),
+        Arc::clone(metrics),
+        Arc::clone(sql),
+        log_dir.to_path_buf(),
     );
     sql.start_run(run_id);
     gate.start();
@@ -243,11 +377,30 @@ pub fn run_selftest(
         stop.store(true, Ordering::Relaxed);
         state.store(false, Ordering::Relaxed);
         cli_textout::raw("\r\n");
-        let outcome = crate::evaluate_run(
+        let mut outcome = crate::evaluate_run(
             &state_metrics,
             &state_config.lock().unwrap(),
             Some(Duration::from_secs(SELFTEST_SECONDS)),
         );
+        match core::run_debrief(
+            DEFAULT_REMOTE,
+            run_id,
+            PacketType::Udp,
+            &state_metrics,
+            &sql_state,
+            &logs,
+        ) {
+            Ok(debrief) => {
+                cli_textout::line(debrief.summary());
+                if let Some(reason) = debrief.mismatch_reason() {
+                    outcome.add_failure(format!("debrief mismatch: {reason}"));
+                }
+            }
+            Err(error) => {
+                cli_textout::line(&error);
+                outcome.add_failure(error);
+            }
+        }
         sql_state.complete_run(
             run_id,
             outcome.result,
@@ -466,15 +619,32 @@ pub fn print_help(
             "limit server runtime; zero is unlimited".into(),
         ],
         vec!["client".into(), "sending side of traffic".into()],
-        vec!["client enable".into(), "enable client traffic".into()],
-        vec!["client disable".into(), "disable client traffic".into()],
-        vec!["client remote <ip>".into(), "set client destination".into()],
         vec![
-            "client runtime <seconds>".into(),
-            "limit client runtime; zero is unlimited".into(),
+            "client list".into(),
+            "show every client and its settings".into(),
         ],
         vec![
-            "client http check <url>".into(),
+            "client add | client delete <id>".into(),
+            "add a client with the next free id, or remove one".into(),
+        ],
+        vec![
+            "client <id> enable | disable".into(),
+            "enable or disable one client; <id> starts at 0".into(),
+        ],
+        vec![
+            "client <id> remote <ip>".into(),
+            "set that client's destination".into(),
+        ],
+        vec![
+            "client <id> runtime <seconds>".into(),
+            "limit that client's runtime; zero is unlimited".into(),
+        ],
+        vec![
+            "client <id> jitter <ms>".into(),
+            "set that client's send jitter".into(),
+        ],
+        vec![
+            "client <id> http check <url>".into(),
             "load one HTTP or HTTPS page".into(),
         ],
         vec![
@@ -556,6 +726,15 @@ pub fn print_help(
         vec![
             "admin smtp status".into(),
             "check the connection to the SMTP server".into(),
+        ],
+        vec![
+            "restapi enable [<address>]".into(),
+            "serve the REST API; defaults to 127.0.0.1:8081".into(),
+        ],
+        vec!["restapi disable".into(), "stop serving the REST API".into()],
+        vec![
+            "restapi status".into(),
+            "show whether the REST API is serving and where".into(),
         ],
         vec!["start".into(), "start a traffic run".into()],
         vec!["stop".into(), "stop the traffic run".into()],

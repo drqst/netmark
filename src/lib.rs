@@ -8,6 +8,7 @@ pub mod configuration;
 pub mod core;
 pub mod metrics;
 pub mod monitor;
+pub mod restapi;
 pub mod sdk;
 pub mod smtp;
 
@@ -33,7 +34,7 @@ pub fn config_from_file(file_config: &configuration::FileConfig) -> Config {
 
 pub fn config_from_traffic(traffic: &configuration::TrafficConfig) -> Config {
     Config {
-        rate: traffic.rate,
+        udp_rate: traffic.udp_rate,
         packet_type: PacketType::parse(&traffic.packet_type).unwrap_or(PacketType::Tcp),
         tcp_bytes_per_second: traffic.tcp_bytes_per_second,
         udp_packet_size: traffic.udp_packet_size,
@@ -49,9 +50,25 @@ pub fn config_from_traffic(traffic: &configuration::TrafficConfig) -> Config {
     }
 }
 
+/// Per-client view of the traffic settings, applying that client's runtime and
+/// jitter overrides on top of the profile-wide values.
+pub fn client_config(
+    traffic: &configuration::TrafficConfig,
+    client: &configuration::ClientConfig,
+) -> Config {
+    let mut config = config_from_traffic(traffic);
+    if let Some(runtime) = client.runtime {
+        config.client_runtime = runtime;
+    }
+    if let Some(jitter) = client.jitter_millis {
+        config.client_jitter_millis = jitter;
+    }
+    config
+}
+
 pub fn traffic_config_from(config: &Config) -> configuration::TrafficConfig {
     configuration::TrafficConfig {
-        rate: config.rate,
+        udp_rate: config.udp_rate,
         packet_type: config.packet_type.as_str().to_string(),
         tcp_bytes_per_second: config.tcp_bytes_per_second,
         udp_packet_size: config.udp_packet_size,
@@ -73,6 +90,17 @@ pub struct RunOutcome {
     pub sent_bytes: u64,
     pub result: &'static str,
     pub failure_reason: Option<String>,
+}
+
+impl RunOutcome {
+    /// Adds a reason discovered after the traffic evaluation, such as a failed debrief.
+    pub fn add_failure(&mut self, reason: String) {
+        self.result = "fail";
+        self.failure_reason = Some(match self.failure_reason.take() {
+            Some(existing) => format!("{existing}; {reason}"),
+            None => reason,
+        });
+    }
 }
 
 pub fn evaluate_run(metrics: &Metrics, config: &Config, elapsed: Option<Duration>) -> RunOutcome {
@@ -180,13 +208,23 @@ pub fn default_log_dir() -> std::path::PathBuf {
         .join("log")
 }
 
+/// What one executed profile produced.
+pub(crate) struct ProfileRun {
+    pub run_id: u64,
+    pub metrics: Arc<Metrics>,
+    pub elapsed: Duration,
+    pub outcome: RunOutcome,
+    pub debrief: Option<core::Debrief>,
+}
+
 /// Executes one profile, driving both roles and returning the raw outcome plus
-/// the metrics collected. Shared by auto mode and by [`sdk::TestRunner`].
+/// the metrics collected and the end-of-run debrief. Shared by auto mode and by
+/// [`sdk::TestRunner`].
 pub(crate) fn execute_profile(
     profile: &configuration::TestProfile,
     log_dir: &std::path::Path,
     before: impl FnOnce(u64, &Arc<Metrics>) -> Result<(), String>,
-) -> Result<(u64, Arc<Metrics>, Duration, RunOutcome), String> {
+) -> Result<ProfileRun, String> {
     create_dir_all(log_dir).map_err(|error| error.to_string())?;
     for name in ["client.log", "server.log", "netmark.log"] {
         OpenOptions::new()
@@ -195,8 +233,10 @@ pub(crate) fn execute_profile(
             .open(log_dir.join(name))
             .map_err(|error| error.to_string())?;
     }
-    let sql = SqlState::new();
+    let sql = Arc::new(SqlState::new());
     sql.enable().map_err(|error| error.to_string())?;
+    let clients: Vec<_> = profile.enabled_clients().cloned().collect();
+    sql.set_role(core::role_name(!clients.is_empty(), profile.server.enabled));
     let external = profile
         .metrics
         .sql
@@ -204,6 +244,7 @@ pub(crate) fn execute_profile(
         .and_then(|connection| ExternalSqlMetrics::connect(connection).ok())
         .map(Arc::new);
     let config = Arc::new(Mutex::new(config_from_traffic(&profile.traffic)));
+    let packet_type = config.lock().unwrap().packet_type;
     let stopping = Arc::new(AtomicBool::new(false));
     let metrics = Arc::new(Metrics::new());
     let run_id = sql.next_run_id(1);
@@ -219,15 +260,22 @@ pub(crate) fn execute_profile(
             Arc::clone(&metrics),
             log_dir.to_path_buf(),
         );
+        core::spawn_debrief_responder(
+            Arc::clone(&stopping),
+            Arc::clone(&metrics),
+            Arc::clone(&sql),
+            log_dir.to_path_buf(),
+        );
     }
-    if profile.client.enabled {
+    for client in &clients {
         core::spawn_client(
-            Arc::clone(&config),
+            Arc::new(Mutex::new(client_config(&profile.traffic, client))),
             Arc::clone(&gate),
             Arc::clone(&stopping),
             Arc::clone(&metrics),
-            profile.client.remote.clone(),
+            client.remote.clone(),
             log_dir.to_path_buf(),
+            client.id,
         );
     }
     sql.start_run(run_id);
@@ -238,7 +286,32 @@ pub(crate) fn execute_profile(
     thread::sleep(Duration::from_millis(250));
     let elapsed = started.elapsed();
     write_run_event(log_dir, run_id, "Completed");
-    let outcome = evaluate_run(&metrics, &config.lock().unwrap(), Some(elapsed));
+    let mut outcome = evaluate_run(&metrics, &config.lock().unwrap(), Some(elapsed));
+    // Counters are per instance, not per client, so one debrief covers every
+    // client this instance drove; it goes to the lowest-numbered client's remote.
+    let debrief = clients.iter().min_by_key(|client| client.id).map(|client| {
+        core::run_debrief(
+            &client.remote,
+            run_id,
+            packet_type,
+            &metrics,
+            &sql,
+            log_dir,
+        )
+    });
+    let debrief = match debrief {
+        Some(Ok(debrief)) => {
+            if let Some(reason) = debrief.mismatch_reason() {
+                outcome.add_failure(format!("debrief mismatch: {reason}"));
+            }
+            Some(debrief)
+        }
+        Some(Err(error)) => {
+            outcome.add_failure(error);
+            None
+        }
+        None => None,
+    };
     sql.complete_run(
         run_id,
         outcome.result,
@@ -246,7 +319,13 @@ pub(crate) fn execute_profile(
         outcome.failure_reason.as_deref(),
     );
     record_final_metrics(external.as_ref(), run_id, &metrics);
-    Ok((run_id, metrics, elapsed, outcome))
+    Ok(ProfileRun {
+        run_id,
+        metrics,
+        elapsed,
+        outcome,
+        debrief,
+    })
 }
 
 /// Auto mode: runs one non-interactive test from a YAML test profile and exits.

@@ -4,11 +4,12 @@
 # no hooks are registered there.
 server:
   enabled: true
-client:
-  enabled: true
-  remote: 127.0.0.1
+clients:
+  - id: 0
+    enabled: true
+    remote: 127.0.0.1
 traffic:
-  rate: 10
+  udp_rate: 10
   packet_type: udp
   tcp_bytes_per_second: 1024
   udp_packet_size: 1024

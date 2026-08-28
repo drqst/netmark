@@ -1,10 +1,11 @@
 server:
   enabled: true
-client:
-  enabled: true
-  remote: 127.0.0.1
+clients:
+  - id: 0
+    enabled: true
+    remote: 127.0.0.1
 traffic:
-  rate: 100
+  udp_rate: 100
   packet_type: tcp
   tcp_bytes_per_second: 10240
   udp_packet_size: 1024

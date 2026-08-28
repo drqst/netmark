@@ -6,11 +6,15 @@ pub struct FileConfig {
     #[serde(default)]
     pub traffic: TrafficConfig,
     #[serde(default)]
+    pub clients: Vec<ClientConfig>,
+    #[serde(default)]
     pub metrics: MetricsConfig,
     #[serde(default)]
     pub admin: AdminConfig,
     #[serde(default)]
     pub smtp: SmtpConfig,
+    #[serde(default)]
+    pub restapi: RestApiConfig,
 }
 
 /// Mirrors `core::Config` so the same settings apply whether they come from the
@@ -18,7 +22,8 @@ pub struct FileConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct TrafficConfig {
-    pub rate: u64,
+    /// UDP packets per second; ignored for TCP, which is paced by `tcp_bytes_per_second`.
+    pub udp_rate: u64,
     pub packet_type: String,
     pub tcp_bytes_per_second: u64,
     pub udp_packet_size: usize,
@@ -36,7 +41,7 @@ pub struct TrafficConfig {
 impl Default for TrafficConfig {
     fn default() -> Self {
         Self {
-            rate: 100,
+            udp_rate: 100,
             packet_type: "tcp".to_string(),
             tcp_bytes_per_second: 1024,
             udp_packet_size: 1024,
@@ -71,6 +76,25 @@ pub struct AdminConfig {
     pub emails: Vec<String>,
 }
 
+pub const DEFAULT_RESTAPI_ADDRESS: &str = "127.0.0.1:8081";
+
+/// Where the REST API listens. It is unauthenticated and can start traffic runs,
+/// so it stays on the loopback interface unless deliberately moved.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct RestApiConfig {
+    pub enabled: bool,
+    pub address: String,
+}
+impl Default for RestApiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            address: DEFAULT_RESTAPI_ADDRESS.to_string(),
+        }
+    }
+}
+
 pub fn path_near_executable() -> Option<PathBuf> {
     std::env::current_exe()
         .ok()?
@@ -90,7 +114,7 @@ pub fn load(path: &Path) -> Result<FileConfig, String> {
 #[serde(default)]
 pub struct TestProfile {
     pub server: RoleConfig,
-    pub client: ClientRoleConfig,
+    pub clients: Vec<ClientConfig>,
     pub traffic: TrafficConfig,
     pub metrics: MetricsConfig,
     pub duration_seconds: u64,
@@ -100,12 +124,20 @@ impl Default for TestProfile {
     fn default() -> Self {
         Self {
             server: RoleConfig::default(),
-            client: ClientRoleConfig::default(),
+            clients: vec![ClientConfig::new(0)],
             traffic: TrafficConfig::default(),
             metrics: MetricsConfig::default(),
             duration_seconds: 3,
             hooks: HooksConfig::default(),
         }
+    }
+}
+impl TestProfile {
+    pub fn client(&self, id: u64) -> Option<&ClientConfig> {
+        self.clients.iter().find(|client| client.id == id)
+    }
+    pub fn enabled_clients(&self) -> impl Iterator<Item = &ClientConfig> {
+        self.clients.iter().filter(|client| client.enabled)
     }
 }
 
@@ -124,18 +156,47 @@ pub struct RoleConfig {
     pub enabled: bool,
 }
 
+/// One sending client. A netmark instance can drive several at once, each with
+/// its own id, destination, and optional runtime and jitter overrides.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
-pub struct ClientRoleConfig {
+pub struct ClientConfig {
+    pub id: u64,
     pub enabled: bool,
     pub remote: String,
+    /// Overrides `traffic.client_runtime` when set.
+    pub runtime: Option<u64>,
+    /// Overrides `traffic.client_jitter_millis` when set.
+    pub jitter_millis: Option<u64>,
 }
-impl Default for ClientRoleConfig {
+impl Default for ClientConfig {
     fn default() -> Self {
+        Self::new(0)
+    }
+}
+impl ClientConfig {
+    pub fn new(id: u64) -> Self {
         Self {
+            id,
             enabled: false,
             remote: "127.0.0.1".to_string(),
+            runtime: None,
+            jitter_millis: None,
         }
+    }
+    pub fn summary(&self) -> String {
+        format!(
+            "client {} {} remote={}{}{}",
+            self.id,
+            if self.enabled { "enabled" } else { "disabled" },
+            self.remote,
+            self.runtime
+                .map(|value| format!(" runtime={value}"))
+                .unwrap_or_default(),
+            self.jitter_millis
+                .map(|value| format!(" jitter_millis={value}"))
+                .unwrap_or_default()
+        )
     }
 }
 

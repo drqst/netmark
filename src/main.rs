@@ -66,6 +66,15 @@ fn main() {
             .map(Arc::new),
     ));
     let smtp = Arc::new(Mutex::new(file_config.smtp.clone()));
+    let restapi_config = Arc::new(Mutex::new(file_config.restapi.clone()));
+    let clients = Arc::new(Clients::new(file_config.clients.clone()));
+    let restapi = Arc::new(netmark::restapi::RestApi::new(
+        Arc::clone(&clients),
+        log_dir.clone(),
+    ));
+    if let Some(error) = netmark::restapi::start_if_enabled(&restapi, &file_config.restapi) {
+        eprintln!("REST API not started: {error}");
+    }
     let monitor = Arc::new(monitor::MonitorState::new());
     monitor
         .clone()
@@ -89,14 +98,12 @@ fn main() {
         .unwrap();
     let mut input = String::new();
     let mut server_enabled = false;
-    let mut client_enabled = false;
-    let mut remote = DEFAULT_REMOTE.to_string();
     let mut run_id = 0u64;
     let mut run_started: Option<Instant> = None;
     let mut cli_mode = true;
     let mut clean_confirmation = false;
     enable_raw_mode().expect("cannot enable terminal input");
-    print_prompt(server_enabled, client_enabled, false);
+    print_prompt(server_enabled, clients.any_enabled(), false);
     loop {
         if !event::poll(Duration::from_millis(100)).unwrap() {
             continue;
@@ -144,7 +151,7 @@ fn main() {
                 running.store(false, Ordering::Relaxed);
                 cli_mode = true;
                 cli_textout::line("stopped");
-                print_prompt(server_enabled, client_enabled, false);
+                print_prompt(server_enabled, clients.any_enabled(), false);
             }
             Event::Key(KeyEvent {
                 code: KeyCode::Tab, ..
@@ -157,7 +164,7 @@ fn main() {
                 if cli_mode {
                     print_prompt(
                         server_enabled,
-                        client_enabled,
+                        clients.any_enabled(),
                         running.load(Ordering::Relaxed),
                     );
                 }
@@ -176,25 +183,53 @@ fn main() {
                 // user-facing verbs from plain control flow; their implementations
                 // live in cli.rs, tagged the same way.
                 match line.split_whitespace().collect::<Vec<_>>().as_slice() {
-                    // Command: client — Subcommands: enable, disable, remote, http check, runtime
-                    ["client"] => cli_textout::line(
-                        "client: enable | disable | remote <ip> | runtime <seconds>",
-                    ),
-                    ["client", "enable"] => {
-                        client_enabled = true;
-                        cli_textout::line("client enabled");
+                    // Command: client — every subcommand that configures or controls
+                    // a client takes its id; the bare form is shorthand for client 0.
+                    ["client"] => cli_textout::line(CLIENT_USAGE),
+                    ["client", "list"] => list_clients(&clients),
+                    ["client", "add"] => {
+                        let id = clients.add();
+                        cli_textout::line(format!("client {id} added"));
                     }
-                    ["client", "disable"] => {
-                        client_enabled = false;
-                        stopping.store(true, Ordering::Relaxed);
-                        cli_textout::line("Client stopped");
+                    ["client", "delete", id] => match id.parse::<u64>() {
+                        Ok(id) if clients.remove(id) => {
+                            cli_textout::line(format!("client {id} deleted"))
+                        }
+                        Ok(id) => cli_textout::line(format!("no client {id}")),
+                        Err(_) => cli_textout::line("client id must be a number"),
+                    },
+                    ["client", id, rest @ ..] if id.parse::<u64>().is_ok() => {
+                        client_command(&clients, id.parse().unwrap(), rest, &log_dir)
                     }
-                    ["client", "remote", host] => {
-                        remote = (*host).into();
-                        cli_textout::line(format!("client remote set to {remote}"));
+                    ["client", rest @ ..] => client_command(&clients, 0, rest, &log_dir),
+                    // Command: restapi — Subcommands: enable, disable, status
+                    ["restapi"] => {
+                        cli_textout::line("restapi: enable [<address>] | disable | status")
                     }
-                    ["client", "http", "check", url] => client_http_check(&log_dir, url),
-                    ["client", "runtime", seconds] => set_runtime(&config, true, seconds),
+                    ["restapi", "enable"] | ["restapi", "enable", _] => {
+                        let address = match line.split_whitespace().nth(2) {
+                            Some(address) => address.to_string(),
+                            None => restapi_config.lock().unwrap().address.clone(),
+                        };
+                        match restapi.enable(&address) {
+                            Ok(()) => {
+                                let mut settings = restapi_config.lock().unwrap();
+                                settings.enabled = true;
+                                settings.address = address.clone();
+                                cli_textout::line(format!("REST API enabled on http://{address}"));
+                            }
+                            Err(error) => cli_textout::line(error),
+                        }
+                    }
+                    ["restapi", "disable"] => {
+                        restapi.disable();
+                        restapi_config.lock().unwrap().enabled = false;
+                        cli_textout::line("REST API disabled");
+                    }
+                    ["restapi", "status"] => cli_textout::line(restapi.status()),
+                    ["restapi", ..] => {
+                        cli_textout::line("restapi: enable [<address>] | disable | status")
+                    }
                     // Command: admin — Subcommands: add email, delete email, smtp
                     ["admin"] => cli_textout::line(
                         "admin: add email <address> | delete email <address> | smtp enabled | smtp disabled | smtp status",
@@ -219,9 +254,6 @@ fn main() {
                     }
                     ["admin", ..] => cli_textout::line(
                         "admin: add email <address> | delete email <address> | smtp enabled | smtp disabled | smtp status",
-                    ),
-                    ["client", ..] => cli_textout::line(
-                        "client: enable | disable | remote <ip> | http check <url> | runtime <seconds>",
                     ),
                     // Command: server — Subcommands: enable, disable, runtime
                     ["server"] => cli_textout::line("server: enable | disable | runtime <seconds>"),
@@ -251,14 +283,27 @@ fn main() {
                     }
                     ["configure", "save"] => {
                         let snapshot = config.lock().unwrap().clone();
-                        match save_configuration(&config_path, &snapshot, &external, &smtp)
-                        {
+                        match save_configuration(
+                            &config_path,
+                            &snapshot,
+                            &clients,
+                            &external,
+                            &smtp,
+                            &restapi_config,
+                        ) {
                             Ok(()) => cli_textout::line("configuration saved to netmark.config"),
                             Err(error) => cli_textout::line(format!("config save error: {error}")),
                         }
                     }
                     ["configure", "reset"] => {
-                        reset_configuration(&config_path, &config, &external, &smtp);
+                        reset_configuration(
+                            &config_path,
+                            &config,
+                            &clients,
+                            &external,
+                            &smtp,
+                            &restapi_config,
+                        );
                         cli_textout::line("configuration reset to defaults");
                     }
                     ["configure", "smtp", value] => {
@@ -325,9 +370,15 @@ fn main() {
                     // Command: benchmark — Subcommand: duration <seconds>
                     ["benchmark"] => cli_textout::line("benchmark: duration <seconds>"),
                     ["benchmark", "duration", seconds] => match seconds.parse::<u64>() {
-                        Ok(seconds) if seconds > 0 => {
-                            run_benchmark(&remote, seconds, &sql, &log_dir)
-                        }
+                        Ok(seconds) if seconds > 0 => run_benchmark(
+                            &clients
+                                .get(0)
+                                .map(|client| client.remote)
+                                .unwrap_or_else(|| DEFAULT_REMOTE.to_string()),
+                            seconds,
+                            &sql,
+                            &log_dir,
+                        ),
                         _ => cli_textout::line(
                             "benchmark duration must be a positive number of seconds",
                         ),
@@ -360,7 +411,9 @@ fn main() {
                     }
                     // Command: start
                     ["start"] => {
+                        let enabled = clients.enabled();
                         run_id = sql.next_run_id(run_id + 1);
+                        sql.set_role(core::role_name(!enabled.is_empty(), server_enabled));
                         stopping.store(false, Ordering::Relaxed);
                         metrics.snapshot();
                         metrics.reset_run();
@@ -375,22 +428,33 @@ fn main() {
                                 Arc::clone(&metrics),
                                 log_dir.clone(),
                             );
+                            core::spawn_debrief_responder(
+                                Arc::clone(&stopping),
+                                Arc::clone(&metrics),
+                                Arc::clone(&sql),
+                                log_dir.clone(),
+                            );
                         }
-                        if client_enabled {
+                        for client in &enabled {
+                            let traffic = netmark::traffic_config_from(&config.lock().unwrap());
                             core::spawn_client(
-                                Arc::clone(&config),
+                                Arc::new(Mutex::new(netmark::client_config(&traffic, client))),
                                 Arc::clone(&gate),
                                 Arc::clone(&stopping),
                                 Arc::clone(&metrics),
-                                remote.clone(),
+                                client.remote.clone(),
                                 log_dir.clone(),
+                                client.id,
                             );
                         }
                         sql.start_run(run_id);
                         running.store(true, Ordering::Relaxed);
                         gate.start();
                         cli_mode = false;
-                        cli_textout::line(format!("started run {run_id}"));
+                        cli_textout::line(format!(
+                            "started run {run_id} with {} client(s)",
+                            enabled.len()
+                        ));
                     }
                     // Command: stop
                     ["stop"] => {
@@ -399,7 +463,33 @@ fn main() {
                         cli_mode = true;
                         write_run_event(&log_dir, run_id, "Completed");
                         let elapsed = run_started.take().map(|started| started.elapsed());
-                        let outcome = evaluate_run(&metrics, &config.lock().unwrap(), elapsed);
+                        let mut outcome = evaluate_run(&metrics, &config.lock().unwrap(), elapsed);
+                        // Counters are per instance, so one debrief covers every
+                        // client; it goes to the lowest-numbered client's remote.
+                        if let Some(client) =
+                            clients.enabled().into_iter().min_by_key(|client| client.id)
+                        {
+                            let packet_type = config.lock().unwrap().packet_type;
+                            match core::run_debrief(
+                                &client.remote,
+                                run_id,
+                                packet_type,
+                                &metrics,
+                                &sql,
+                                &log_dir,
+                            ) {
+                                Ok(debrief) => {
+                                    cli_textout::line(debrief.summary());
+                                    if let Some(reason) = debrief.mismatch_reason() {
+                                        outcome.add_failure(format!("debrief mismatch: {reason}"));
+                                    }
+                                }
+                                Err(error) => {
+                                    cli_textout::line(&error);
+                                    outcome.add_failure(error);
+                                }
+                            }
+                        }
                         sql.complete_run(
                             run_id,
                             outcome.result,
@@ -429,6 +519,9 @@ fn main() {
                                 Ok(Some(row)) => {
                                     cli_textout::line(format!("Run {id}:"));
                                     cli_textout::line(row);
+                                    for line in sql.debriefs(id).unwrap_or_default() {
+                                        cli_textout::line(line);
+                                    }
                                 }
                                 Ok(None) => {
                                     cli_textout::line(format!("no local record for run {id}"))
@@ -452,7 +545,7 @@ fn main() {
                 if cli_mode && !clean_confirmation {
                     redraw_prompt(
                         server_enabled,
-                        client_enabled,
+                        clients.any_enabled(),
                         running.load(Ordering::Relaxed),
                     );
                 }

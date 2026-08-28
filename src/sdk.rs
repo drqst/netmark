@@ -24,7 +24,7 @@
 //! ```
 
 use crate::configuration::{self, TestProfile};
-use crate::core::Metrics;
+use crate::core::{Debrief, Metrics};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -93,6 +93,9 @@ pub struct RunReport {
     pub out_of_order_udp_packets: u64,
     pub tcp_jitter_millis: u64,
     pub udp_jitter_millis: u64,
+    /// Client/server reconciliation of the run; absent when no client ran or the
+    /// server could not be reached for the debrief.
+    pub debrief: Option<Debrief>,
 }
 
 impl RunReport {
@@ -175,25 +178,30 @@ impl TestRunner {
         let log_dir = self.log_dir.as_path();
         let verbose = self.verbose;
 
-        let (run_id, metrics, elapsed, outcome) =
-            crate::execute_profile(profile, log_dir, |run_id, metrics| {
-                if verbose {
-                    println!("auto mode: started run {run_id}");
-                }
-                for (name, hook) in &before {
-                    let context = HookContext {
-                        phase: Phase::Before,
-                        run_id,
-                        profile,
-                        log_dir,
-                        metrics,
-                        elapsed: Duration::ZERO,
-                        report: None,
-                    };
-                    hook(&context).map_err(|error| format!("before hook {name} failed: {error}"))?;
-                }
-                Ok(())
-            })?;
+        let crate::ProfileRun {
+            run_id,
+            metrics,
+            elapsed,
+            outcome,
+            debrief,
+        } = crate::execute_profile(profile, log_dir, |run_id, metrics| {
+            if verbose {
+                println!("auto mode: started run {run_id}");
+            }
+            for (name, hook) in &before {
+                let context = HookContext {
+                    phase: Phase::Before,
+                    run_id,
+                    profile,
+                    log_dir,
+                    metrics,
+                    elapsed: Duration::ZERO,
+                    report: None,
+                };
+                hook(&context).map_err(|error| format!("before hook {name} failed: {error}"))?;
+            }
+            Ok(())
+        })?;
 
         let totals = metrics.run_totals();
         let (lost, out_of_order) = metrics.udp_status();
@@ -212,6 +220,7 @@ impl TestRunner {
             out_of_order_udp_packets: out_of_order,
             tcp_jitter_millis: tcp_jitter,
             udp_jitter_millis: udp_jitter,
+            debrief,
         };
 
         let mut hook_failures = Vec::new();
@@ -240,6 +249,9 @@ impl TestRunner {
         }
 
         if verbose {
+            if let Some(debrief) = &report.debrief {
+                println!("auto mode: {}", debrief.summary());
+            }
             println!(
                 "auto mode: run {} finished result={} sent_bytes={}{}",
                 report.run_id,

@@ -9,9 +9,9 @@ use netmark::sdk::TestRunner;
 fn main() -> Result<(), String> {
     let mut profile = TestProfile::default();
     profile.server.enabled = true;
-    profile.client.enabled = true;
+    profile.clients[0].enabled = true;
     profile.traffic.packet_type = "udp".to_string();
-    profile.traffic.rate = 10;
+    profile.traffic.udp_rate = 10;
     profile.duration_seconds = 3;
     profile.hooks.before = vec!["announce".to_string()];
     profile.hooks.after = vec!["require_traffic".to_string()];

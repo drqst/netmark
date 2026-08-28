@@ -1,0 +1,438 @@
+openapi: 3.0.3
+info:
+  title: netmark REST API
+  version: "1.0.0"
+  description: |
+    HTTP interface to the netmark SDK (`netmark::sdk::TestRunner`). It exposes the
+    same test profiles the CLI and the YAML profiles use, runs them, and returns
+    the run report including the end-of-run client/server debrief.
+
+    The API is unauthenticated and can start traffic runs. It therefore binds to
+    `127.0.0.1:8081` by default and should only be exposed on another interface
+    behind a trusted network boundary or a reverse proxy that authenticates.
+
+    Enable it from the netmark CLI with `restapi enable` and turn it off with
+    `restapi disable`.
+servers:
+  - url: http://127.0.0.1:8081
+    description: Default loopback binding
+
+tags:
+  - name: service
+    description: Service metadata and contract
+  - name: runs
+    description: Starting and inspecting traffic runs
+  - name: clients
+    description: The sending clients this instance drives
+
+paths:
+  /api/v1/health:
+    get:
+      tags: [service]
+      summary: Liveness and current activity
+      operationId: getHealth
+      responses:
+        "200":
+          description: The service is up
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+
+  /api/v1/openapi.yaml:
+    get:
+      tags: [service]
+      summary: This document
+      description: Returns the OpenAPI contract compiled into the running binary.
+      operationId: getOpenApi
+      responses:
+        "200":
+          description: The OpenAPI document
+          content:
+            application/yaml:
+              schema:
+                type: string
+
+  /api/v1/profile:
+    get:
+      tags: [runs]
+      summary: A default test profile to use as a template
+      operationId: getDefaultProfile
+      responses:
+        "200":
+          description: A test profile with built-in defaults
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TestProfile"
+
+  /api/v1/clients:
+    get:
+      tags: [clients]
+      summary: The clients configured on this instance
+      description: |
+        Each client has its own id, starting at 0, and its own destination. The
+        same ids are used by the CLI commands `client <id> ...`.
+      operationId: listClients
+      responses:
+        "200":
+          description: The configured clients
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [clients]
+                properties:
+                  clients:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Client"
+
+  /api/v1/runs:
+    get:
+      tags: [runs]
+      summary: All runs recorded in this host's local SQLite database
+      description: |
+        Every line carries `role=`, which states whether the host that wrote the
+        row acted as `client`, `server`, `client+server` or `none`.
+      operationId: listRuns
+      responses:
+        "200":
+          description: One summary line per run
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [runs]
+                properties:
+                  runs:
+                    type: array
+                    items:
+                      type: string
+                      example: "2026-08-28T12:34:16.109Z run 215 role=client+server ok sent_bytes=51200"
+        "500":
+          $ref: "#/components/responses/Error"
+    post:
+      tags: [runs]
+      summary: Run a test profile and return its report
+      description: |
+        Runs the profile synchronously; the response is sent when the run and its
+        debrief have completed. Only one run may be in progress at a time.
+      operationId: startRun
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TestProfile"
+      responses:
+        "200":
+          description: The completed run report
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RunReport"
+        "400":
+          $ref: "#/components/responses/Error"
+        "409":
+          description: A run is already in progress
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/v1/runs/{runId}:
+    get:
+      tags: [runs]
+      summary: One run and both sides of its debrief
+      operationId: getRun
+      parameters:
+        - name: runId
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+      responses:
+        "200":
+          description: The stored run
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StoredRun"
+        "400":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "500":
+          $ref: "#/components/responses/Error"
+
+components:
+  responses:
+    Error:
+      description: The request could not be completed
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+
+    Health:
+      type: object
+      required: [status, version, running]
+      properties:
+        status:
+          type: string
+          example: ok
+        version:
+          type: string
+          example: "0.1.0"
+        running:
+          type: boolean
+          description: Whether a run started through this API is in progress
+
+    Client:
+      type: object
+      required: [id, enabled, remote]
+      properties:
+        id:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Client id, starting at 0
+        enabled:
+          type: boolean
+        remote:
+          type: string
+          description: Destination host or IP
+          example: 127.0.0.1
+        runtime:
+          type: integer
+          format: int64
+          nullable: true
+          description: Overrides traffic.client_runtime for this client
+        jitter_millis:
+          type: integer
+          format: int64
+          nullable: true
+          description: Overrides traffic.client_jitter_millis for this client
+
+    Traffic:
+      type: object
+      properties:
+        udp_rate:
+          type: integer
+          format: int64
+          description: UDP packets per second; ignored for TCP
+        packet_type:
+          type: string
+          enum: [tcp, udp]
+        tcp_bytes_per_second:
+          type: integer
+          format: int64
+        udp_packet_size:
+          type: integer
+          format: int64
+        client_runtime:
+          type: integer
+          format: int64
+          description: Seconds; 0 is unlimited
+        server_runtime:
+          type: integer
+          format: int64
+        jitter_millis:
+          type: integer
+          format: int64
+        client_jitter_millis:
+          type: integer
+          format: int64
+        server_jitter_millis:
+          type: integer
+          format: int64
+        max_tcp_jitter_millis:
+          type: integer
+          format: int64
+          description: A run fails above this measured TCP jitter
+        max_udp_jitter_millis:
+          type: integer
+          format: int64
+        limit:
+          type: integer
+          format: int64
+          description: Minimum acceptable bytes/sec; 0 disables the check
+
+    Hooks:
+      type: object
+      description: |
+        Names of Rust callbacks registered on `netmark::sdk::TestRunner`. Runs
+        started over HTTP have no registered hooks, so a profile that names one
+        is rejected with 400.
+      properties:
+        before:
+          type: array
+          items:
+            type: string
+        after:
+          type: array
+          items:
+            type: string
+
+    TestProfile:
+      type: object
+      properties:
+        server:
+          type: object
+          properties:
+            enabled:
+              type: boolean
+        clients:
+          type: array
+          items:
+            $ref: "#/components/schemas/Client"
+        traffic:
+          $ref: "#/components/schemas/Traffic"
+        metrics:
+          type: object
+          properties:
+            sql:
+              type: string
+              nullable: true
+              description: External SQL connection string for the final metrics row
+        duration_seconds:
+          type: integer
+          format: int64
+          minimum: 1
+        hooks:
+          $ref: "#/components/schemas/Hooks"
+
+    Debrief:
+      type: object
+      description: |
+        End-of-run reconciliation between the sending and the receiving side.
+        Packets and bytes must correlate exactly, with no loss and no reordering.
+      required:
+        - run_id
+        - role
+        - protocol
+        - sent_packets
+        - sent_bytes
+        - received_packets
+        - received_bytes
+        - lost_packets
+        - out_of_order_packets
+        - matched
+      properties:
+        run_id:
+          type: integer
+          format: int64
+        role:
+          type: string
+          enum: [client, server]
+          description: Which side produced this record
+        protocol:
+          type: string
+          enum: [tcp, udp]
+        sent_packets:
+          type: integer
+          format: int64
+        sent_bytes:
+          type: integer
+          format: int64
+        received_packets:
+          type: integer
+          format: int64
+        received_bytes:
+          type: integer
+          format: int64
+        lost_packets:
+          type: integer
+          format: int64
+        out_of_order_packets:
+          type: integer
+          format: int64
+        matched:
+          type: boolean
+        mismatch_reason:
+          type: string
+          nullable: true
+
+    RunReport:
+      type: object
+      required: [run_id, passed, result]
+      properties:
+        run_id:
+          type: integer
+          format: int64
+        passed:
+          type: boolean
+        result:
+          type: string
+          enum: [ok, fail]
+        failure_reason:
+          type: string
+          nullable: true
+        elapsed_millis:
+          type: integer
+          format: int64
+        sent_tcp_bytes:
+          type: integer
+          format: int64
+        sent_udp_bytes:
+          type: integer
+          format: int64
+        received_tcp_bytes:
+          type: integer
+          format: int64
+        received_udp_bytes:
+          type: integer
+          format: int64
+        sent_bytes:
+          type: integer
+          format: int64
+        received_bytes:
+          type: integer
+          format: int64
+        throughput_bytes_per_second:
+          type: integer
+          format: int64
+        lost_udp_packets:
+          type: integer
+          format: int64
+        out_of_order_udp_packets:
+          type: integer
+          format: int64
+        tcp_jitter_millis:
+          type: integer
+          format: int64
+        udp_jitter_millis:
+          type: integer
+          format: int64
+        debrief:
+          allOf:
+            - $ref: "#/components/schemas/Debrief"
+          nullable: true
+
+    StoredRun:
+      type: object
+      required: [run_id, summary, debriefs]
+      properties:
+        run_id:
+          type: integer
+          format: int64
+        summary:
+          type: string
+          description: Includes the role of the host that recorded the run
+          example: "started 2026-08-28T12:34:13.101Z completed 2026-08-28T12:34:16.116Z role client+server result ok sent_bytes=51200"
+        debriefs:
+          type: array
+          description: One entry per role that recorded a debrief for this run
+          items:
+            type: string
