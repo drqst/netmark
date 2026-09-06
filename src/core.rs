@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead, Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64 as RandomState;
 use std::sync::{
@@ -45,6 +46,7 @@ const TCP_HEADER_LEN: usize = 10;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PacketType {
     Tcp,
+    Sctp,
     Udp,
     /// Payload carried directly in IPv4 packets, with no transport header.
     Ip,
@@ -53,6 +55,7 @@ impl PacketType {
     pub fn parse(value: &str) -> Option<Self> {
         match value.to_ascii_lowercase().as_str() {
             "tcp" => Some(Self::Tcp),
+            "sctp" => Some(Self::Sctp),
             "udp" => Some(Self::Udp),
             "ip" | "rawip" => Some(Self::Ip),
             _ => None,
@@ -61,6 +64,7 @@ impl PacketType {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Tcp => "tcp",
+            Self::Sctp => "sctp",
             Self::Udp => "udp",
             Self::Ip => "ip",
         }
@@ -73,6 +77,8 @@ pub struct Config {
     pub udp_rate: u64,
     pub packet_type: PacketType,
     pub tcp_bytes_per_second: u64,
+    /// Requested TCP socket window in bytes; 0 leaves the OS default unchanged.
+    pub tcp_window_size: u32,
     pub udp_packet_size: usize,
     pub client_runtime: u64,
     pub server_runtime: u64,
@@ -92,6 +98,7 @@ impl Default for Config {
             udp_rate: 100,
             packet_type: PacketType::Tcp,
             tcp_bytes_per_second: 1024,
+            tcp_window_size: 0,
             udp_packet_size: 1024,
             client_runtime: 0,
             server_runtime: 0,
@@ -171,6 +178,9 @@ pub struct Metrics {
     webrtc_invalid_frames: AtomicU64,
     last_udp_timestamps: Mutex<Option<(i64, i64)>>,
     last_tcp_timestamps: Mutex<Option<(i64, i64)>>,
+    tcp_mss: AtomicU64,
+    tcp_mtu: AtomicU64,
+    tcp_window_size: AtomicU64,
 }
 impl Metrics {
     pub fn new() -> Self {
@@ -209,6 +219,9 @@ impl Metrics {
             webrtc_invalid_frames: AtomicU64::new(0),
             last_udp_timestamps: Mutex::new(None),
             last_tcp_timestamps: Mutex::new(None),
+            tcp_mss: AtomicU64::new(0),
+            tcp_mtu: AtomicU64::new(0),
+            tcp_window_size: AtomicU64::new(0),
         }
     }
     fn add(&self, sent: bool, protocol: PacketType, bytes: usize) {
@@ -219,7 +232,7 @@ impl Metrics {
     /// are counted per complete timestamped frame.
     fn add_counts(&self, sent: bool, protocol: PacketType, packets: u64, bytes: u64) {
         let (total_packets, total, run_packets, run_total) = match (sent, protocol) {
-            (true, PacketType::Tcp) => (
+            (true, PacketType::Tcp | PacketType::Sctp) => (
                 &self.sent_tcp_packets,
                 &self.sent_tcp_bytes,
                 &self.run_sent_tcp_packets,
@@ -231,7 +244,7 @@ impl Metrics {
                 &self.run_sent_udp_packets,
                 &self.run_sent_udp_bytes,
             ),
-            (false, PacketType::Tcp) => (
+            (false, PacketType::Tcp | PacketType::Sctp) => (
                 &self.received_tcp_packets,
                 &self.received_tcp_bytes,
                 &self.run_received_tcp_packets,
@@ -312,9 +325,9 @@ impl Metrics {
     pub fn run_counts(&self, sent: bool, protocol: PacketType) -> (u64, u64) {
         let totals = self.run_totals();
         match (sent, protocol) {
-            (true, PacketType::Tcp) => (totals[0], totals[1]),
+            (true, PacketType::Tcp | PacketType::Sctp) => (totals[0], totals[1]),
             (true, PacketType::Udp) => (totals[2], totals[3]),
-            (false, PacketType::Tcp) => (totals[4], totals[5]),
+            (false, PacketType::Tcp | PacketType::Sctp) => (totals[4], totals[5]),
             (false, PacketType::Udp) => (totals[6], totals[7]),
             (true, PacketType::Ip) => (totals[8], totals[9]),
             (false, PacketType::Ip) => (totals[10], totals[11]),
@@ -362,6 +375,9 @@ impl Metrics {
         self.udp_jitter_millis.store(0, Ordering::Relaxed);
         self.lost_udp_packets.store(0, Ordering::Relaxed);
         self.out_of_order_udp_packets.store(0, Ordering::Relaxed);
+        self.tcp_mss.store(0, Ordering::Relaxed);
+        self.tcp_mtu.store(0, Ordering::Relaxed);
+        self.tcp_window_size.store(0, Ordering::Relaxed);
     }
     /// Live counters since the last call, used for the once-per-second bandwidth
     /// display; raw IP is folded into the UDP slots because both are datagrams.
@@ -380,6 +396,20 @@ impl Metrics {
             self.received_udp_bytes.swap(0, Ordering::Relaxed)
                 + self.received_ip_bytes.swap(0, Ordering::Relaxed),
         ]
+    }
+    /// TCP transport values observed on the connected client socket. Zero means
+    /// the active transport is not TCP or the platform could not report it.
+    pub fn tcp_transport(&self) -> (u64, u64, u64) {
+        (
+            self.tcp_mss.load(Ordering::Relaxed),
+            self.tcp_mtu.load(Ordering::Relaxed),
+            self.tcp_window_size.load(Ordering::Relaxed),
+        )
+    }
+    fn record_tcp_transport(&self, mss: u64, mtu: u64, window_size: u64) {
+        self.tcp_mss.store(mss, Ordering::Relaxed);
+        self.tcp_mtu.store(mtu, Ordering::Relaxed);
+        self.tcp_window_size.store(window_size, Ordering::Relaxed);
     }
     pub fn udp_status(&self) -> (u64, u64) {
         (
@@ -412,7 +442,9 @@ impl Metrics {
         let value = jitter.as_millis() as u64;
         self.jitter_millis.fetch_max(value, Ordering::Relaxed);
         match protocol {
-            PacketType::Tcp => self.tcp_jitter_millis.fetch_max(value, Ordering::Relaxed),
+            PacketType::Tcp | PacketType::Sctp => {
+                self.tcp_jitter_millis.fetch_max(value, Ordering::Relaxed)
+            }
             // Raw IP is a datagram transport, so it shares the UDP jitter budget.
             PacketType::Udp | PacketType::Ip => {
                 self.udp_jitter_millis.fetch_max(value, Ordering::Relaxed)
@@ -923,7 +955,7 @@ fn serve_debrief(
     let (received_packets, received_bytes) = metrics.run_counts(false, packet_type);
     let (lost, out_of_order) = match packet_type {
         PacketType::Udp | PacketType::Ip => metrics.udp_status(),
-        PacketType::Tcp => (0, 0),
+        PacketType::Tcp | PacketType::Sctp => (0, 0),
     };
     let debrief = Debrief {
         run_id,
@@ -1007,6 +1039,15 @@ pub fn spawn_server(
                 &metrics,
                 log,
                 config.server_runtime,
+                config.tcp_window_size,
+                &config.webrtc,
+            ),
+            PacketType::Sctp => sctp_server(
+                &gate,
+                &stopping,
+                &metrics,
+                log,
+                config.server_runtime,
                 &config.webrtc,
             ),
             PacketType::Udp => udp_server(
@@ -1070,6 +1111,18 @@ pub fn spawn_client(
         match config.packet_type {
             PacketType::Tcp => tcp_client(
                 config.tcp_bytes_per_second,
+                config.tcp_window_size,
+                &stopping,
+                &metrics,
+                log,
+                &remote,
+                config.client_runtime,
+                config.client_jitter_millis,
+                client_id,
+                &config.webrtc,
+            ),
+            PacketType::Sctp => sctp_client(
+                config.tcp_bytes_per_second,
                 &stopping,
                 &metrics,
                 log,
@@ -1122,6 +1175,7 @@ fn tcp_server(
     metrics: &Arc<Metrics>,
     mut log: File,
     runtime: u64,
+    window_size: u32,
     webrtc: &crate::webrtc::Settings,
 ) {
     let listener = match TcpListener::bind(address("0.0.0.0")) {
@@ -1137,9 +1191,10 @@ fn tcp_server(
     while !stopping.load(Ordering::Relaxed) && !expired(started, runtime) {
         match listener.accept() {
             Ok((mut stream, _)) => {
+                configure_tcp_socket(&stream, window_size);
                 stream.set_nonblocking(true).ok();
                 let mut buffer = [0; PACKET_SIZE];
-                let mut frame_reader = TcpFrameReader::new(webrtc.enabled);
+                let mut frame_reader = TcpFrameReader::new(webrtc.enabled, PacketType::Tcp);
                 while !stopping.load(Ordering::Relaxed) && !expired(started, runtime) {
                     match stream.read(&mut buffer) {
                         Ok(0) => break,
@@ -1158,6 +1213,50 @@ fn tcp_server(
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(10))
             }
+            Err(_) => break,
+        }
+    }
+}
+
+fn sctp_server(
+    gate: &StartGate,
+    stopping: &AtomicBool,
+    metrics: &Arc<Metrics>,
+    mut log: File,
+    runtime: u64,
+    webrtc: &crate::webrtc::Settings,
+) {
+    let listener = match crate::sctp::SctpListener::bind(PORT) {
+        Ok(listener) => listener,
+        Err(error) => {
+            writeln!(log, "{} SCTP server unavailable: {error}", timestamp()).ok();
+            eprintln!("server error: SCTP unavailable: {error}");
+            return;
+        }
+    };
+    listener.set_nonblocking(true).ok();
+    gate.wait();
+    let started = Instant::now();
+    while !stopping.load(Ordering::Relaxed) && !expired(started, runtime) {
+        match listener.accept() {
+            Ok(mut stream) => {
+                stream.set_nonblocking(true).ok();
+                let mut buffer = [0; PACKET_SIZE];
+                let mut frame_reader = TcpFrameReader::new(webrtc.enabled, PacketType::Sctp);
+                while !stopping.load(Ordering::Relaxed) && !expired(started, runtime) {
+                    match stream.read(&mut buffer) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            metrics.add_counts(false, PacketType::Sctp, 0, n as u64);
+                            frame_reader.feed(&buffer[..n], metrics);
+                            writeln!(log, "{} SCTP {n} bytes", timestamp()).ok();
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(10)),
+                        Err(_) => break,
+                    }
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(10)),
             Err(_) => break,
         }
     }
@@ -1274,9 +1373,45 @@ fn receive_datagram(
     }
     writeln!(log, "{} {} {n} bytes", timestamp(), protocol.as_str().to_uppercase()).ok();
 }
+
+fn configure_tcp_socket(stream: &TcpStream, window_size: u32) {
+    if window_size == 0 {
+        return;
+    }
+    let value = window_size.min(i32::MAX as u32) as libc::c_int;
+    // SAFETY: the stream's descriptor and `value` pointer are valid.
+    unsafe {
+        let _ = libc::setsockopt(
+            stream.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF,
+            (&raw const value).cast(), std::mem::size_of_val(&value) as libc::socklen_t,
+        );
+        let _ = libc::setsockopt(
+            stream.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVBUF,
+            (&raw const value).cast(), std::mem::size_of_val(&value) as libc::socklen_t,
+        );
+    }
+}
+
+fn socket_option(stream: &TcpStream, level: libc::c_int, option: libc::c_int) -> u64 {
+    let mut value: libc::c_int = 0;
+    let mut length = std::mem::size_of_val(&value) as libc::socklen_t;
+    // SAFETY: the stream descriptor, output pointer and output length are valid.
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(), level, option, (&raw mut value).cast(), &raw mut length,
+        )
+    };
+    if result == 0 && value > 0 {
+        value as u64
+    } else {
+        0
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn tcp_client(
     bytes_per_second: u64,
+    window_size: u32,
     stopping: &AtomicBool,
     metrics: &Arc<Metrics>,
     mut log: File,
@@ -1296,8 +1431,15 @@ fn tcp_client(
             Err(_) => thread::sleep(Duration::from_millis(10)),
         }
     };
-    send_tcp_packets(
+    configure_tcp_socket(&stream, window_size);
+    metrics.record_tcp_transport(
+        socket_option(&stream, libc::IPPROTO_TCP, libc::TCP_MAXSEG),
+        socket_option(&stream, libc::IPPROTO_IP, libc::IP_MTU),
+        socket_option(&stream, libc::SOL_SOCKET, libc::SO_SNDBUF),
+    );
+    send_stream_packets(
         bytes_per_second,
+        PacketType::Tcp,
         stopping,
         metrics,
         &mut log,
@@ -1307,6 +1449,33 @@ fn tcp_client(
         webrtc,
         |p| stream.write_all(p),
     );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sctp_client(
+    bytes_per_second: u64,
+    stopping: &AtomicBool,
+    metrics: &Arc<Metrics>,
+    mut log: File,
+    remote: &str,
+    runtime: u64,
+    jitter_millis: u64,
+    client_id: u64,
+    webrtc: &crate::webrtc::Settings,
+) {
+    let destination = match crate::sctp::resolve(remote) {
+        Ok(destination) => destination,
+        Err(error) => { writeln!(log, "{} SCTP client unavailable: {error}", timestamp()).ok(); return; }
+    };
+    let started = Instant::now();
+    let mut stream = loop {
+        if stopping.load(Ordering::Relaxed) || expired(started, runtime) { return; }
+        match crate::sctp::SctpStream::connect(destination, PORT) {
+            Ok(stream) => break stream,
+            Err(_) => thread::sleep(Duration::from_millis(10)),
+        }
+    };
+    send_stream_packets(bytes_per_second, PacketType::Sctp, stopping, metrics, &mut log, runtime, jitter_millis, client_id, webrtc, |packet| stream.write_all(packet));
 }
 #[allow(clippy::too_many_arguments)]
 fn udp_client(
@@ -1385,9 +1554,28 @@ fn ip_client(
         |p| socket.send_to(p, destination).map(|_| ()),
     );
 }
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn send_tcp_packets<F>(
     bytes_per_second: u64,
+    stopping: &AtomicBool,
+    metrics: &Arc<Metrics>,
+    log: &mut File,
+    runtime: u64,
+    jitter_millis: u64,
+    client_id: u64,
+    webrtc: &crate::webrtc::Settings,
+    send: F,
+) where
+    F: FnMut(&[u8]) -> io::Result<()>,
+{
+    send_stream_packets(bytes_per_second, PacketType::Tcp, stopping, metrics, log, runtime, jitter_millis, client_id, webrtc, send);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_stream_packets<F>(
+    bytes_per_second: u64,
+    protocol: PacketType,
     stopping: &AtomicBool,
     metrics: &Arc<Metrics>,
     log: &mut File,
@@ -1409,17 +1597,17 @@ pub(crate) fn send_tcp_packets<F>(
         if send(&packet).is_err() {
             return;
         }
-        metrics.add_counts(true, PacketType::Tcp, frames, packet.len() as u64);
+        metrics.add_counts(true, protocol, frames, packet.len() as u64);
         for _ in 0..messages {
             metrics.record_webrtc_sent();
         }
         let now = Instant::now();
         metrics.record_jitter(
-            PacketType::Tcp,
+            protocol,
             now.duration_since(previous_send).abs_diff(interval),
         );
         previous_send = now;
-        writeln!(log, "{} TCP {} bytes client={client_id}", timestamp(), packet.len()).ok();
+        writeln!(log, "{} {} {} bytes client={client_id}", timestamp(), protocol.as_str().to_uppercase(), packet.len()).ok();
         thread::sleep(jittered_delay(interval, jitter_millis));
     }
 }
@@ -1530,13 +1718,15 @@ enum TcpFrameState {
 struct TcpFrameReader {
     state: TcpFrameState,
     webrtc: bool,
+    protocol: PacketType,
     channels: crate::webrtc::Receiver,
 }
 impl TcpFrameReader {
-    fn new(webrtc: bool) -> Self {
+    fn new(webrtc: bool, protocol: PacketType) -> Self {
         Self {
             state: TcpFrameState::Header(Vec::with_capacity(TCP_HEADER_LEN)),
             webrtc,
+            protocol,
             channels: crate::webrtc::Receiver::default(),
         }
     }
@@ -1553,7 +1743,7 @@ impl TcpFrameReader {
                         let timestamp_ms = i64::from_be_bytes(buffer[..8].try_into().unwrap());
                         let length = u16::from_be_bytes(buffer[8..10].try_into().unwrap()) as usize;
                         metrics.tcp_timestamp_jitter(timestamp_ms);
-                        metrics.add_counts(false, PacketType::Tcp, 1, 0);
+                        metrics.add_counts(false, self.protocol, 1, 0);
                         self.state = if length == 0 {
                             TcpFrameState::Header(Vec::with_capacity(TCP_HEADER_LEN))
                         } else {

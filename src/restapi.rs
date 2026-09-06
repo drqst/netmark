@@ -212,6 +212,7 @@ impl RestApi {
 fn report_json(report: &crate::sdk::RunReport) -> Value {
     json!({
         "run_id": report.run_id,
+        "packet_type": report.packet_type,
         "passed": report.passed,
         "result": report.result,
         "failure_reason": report.failure_reason,
@@ -222,6 +223,9 @@ fn report_json(report: &crate::sdk::RunReport) -> Value {
         "received_tcp_bytes": report.received_tcp_bytes,
         "received_udp_bytes": report.received_udp_bytes,
         "received_ip_bytes": report.received_ip_bytes,
+        "tcp_mss": report.tcp_mss,
+        "tcp_mtu": report.tcp_mtu,
+        "tcp_window_size": report.tcp_window_size,
         "sent_bytes": report.sent_bytes(),
         "received_bytes": report.received_bytes(),
         "sent_bytes_per_second": report.sent_bytes_per_second,

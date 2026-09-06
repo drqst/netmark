@@ -44,11 +44,13 @@ impl Default for WebRtcConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct TrafficConfig {
-    /// UDP packets per second; ignored for TCP, which is paced by `tcp_bytes_per_second`.
+    /// UDP packets per second; ignored for TCP and SCTP, which are paced by `tcp_bytes_per_second`.
     pub udp_rate: u64,
-    /// `tcp`, `udp` or `ip`.
+    /// `tcp`, `sctp`, `udp` or `ip`.
     pub packet_type: String,
     pub tcp_bytes_per_second: u64,
+    /// Requested TCP send/receive window in bytes; 0 uses the operating-system default.
+    pub tcp_window_size: u32,
     pub udp_packet_size: usize,
     pub client_runtime: u64,
     pub server_runtime: u64,
@@ -67,6 +69,7 @@ impl Default for TrafficConfig {
             udp_rate: 100,
             packet_type: "tcp".to_string(),
             tcp_bytes_per_second: 1024,
+            tcp_window_size: 0,
             udp_packet_size: 1024,
             client_runtime: 0,
             server_runtime: 0,
@@ -243,4 +246,3 @@ pub fn load_test_profile(path: &Path) -> Result<TestProfile, String> {
     let contents = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
     serde_yaml::from_str(&contents).map_err(|error| error.to_string())
 }
-

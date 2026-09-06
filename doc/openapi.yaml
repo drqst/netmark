@@ -240,13 +240,19 @@ components:
           description: UDP packets per second; ignored for TCP
         packet_type:
           type: string
-          enum: [tcp, udp, ip]
+          enum: [tcp, sctp, udp, ip]
           description: |
+            `sctp` is a reliable message-oriented transport and requires SCTP
+            support in the host kernel.
             `ip` carries the payload directly in IPv4 packets using protocol
             number 253 and needs CAP_NET_RAW.
         tcp_bytes_per_second:
           type: integer
           format: int64
+        tcp_window_size:
+          type: integer
+          format: int32
+          description: TCP socket send/receive window in bytes; 0 uses the OS default
         udp_packet_size:
           type: integer
           format: int64
@@ -372,6 +378,9 @@ components:
         run_id:
           type: integer
           format: int64
+        packet_type:
+          type: string
+          enum: [tcp, sctp, udp, ip]
         role:
           type: string
           enum: [client, server]
@@ -439,6 +448,18 @@ components:
         received_ip_bytes:
           type: integer
           format: int64
+        tcp_mss:
+          type: integer
+          format: int64
+          description: Negotiated TCP maximum segment size; 0 when unavailable
+        tcp_mtu:
+          type: integer
+          format: int64
+          description: Path MTU reported by the TCP socket; 0 when unavailable
+        tcp_window_size:
+          type: integer
+          format: int64
+          description: Effective TCP send buffer; 0 when unavailable
         sent_bytes:
           type: integer
           format: int64

@@ -187,8 +187,9 @@ still works.
 
 | Command | Effect |
 | --- | --- |
-| `configure type <tcp\|udp\|ip>` | Pick the transport |
+| `configure type <tcp\|sctp\|udp\|ip>` | Pick the transport |
 | `configure tcp bytes <bytes/sec>` | TCP bytes per second |
+| `configure tcp window <bytes>` | TCP send/receive window; 0 uses the OS default |
 | `configure tcp jitter <ms>` | Deliberate jitter added to TCP sends |
 | `configure tcp maxjitter <ms>` | Fail the run above this measured TCP jitter |
 | `configure udp_rate <packets/sec>` | UDP packets per second; also paces raw IP |
@@ -287,8 +288,9 @@ clients:
     webrtc: null        # true | false | null to follow the webrtc section
 traffic:
   udp_rate: 10                 # UDP packets per second; also paces raw IP
-  packet_type: udp             # tcp | udp | ip
+  packet_type: udp             # tcp | sctp | udp | ip
   tcp_bytes_per_second: 10240
+  tcp_window_size: 0            # 0 uses the OS default
   udp_packet_size: 1024
   client_runtime: 3
   server_runtime: 3
@@ -323,7 +325,7 @@ echo $?    # 0 = pass, 1 = fail
 
 ## Transports
 
-`configure type` and `traffic.packet_type` select one of three.
+`configure type` and `traffic.packet_type` select one of four.
 
 ### TCP
 
@@ -331,6 +333,13 @@ A byte stream paced to `tcp_bytes_per_second`. A send timestamp is embedded ever
 100 bytes so the receiver can measure jitter on a stream that has no packet
 boundaries. Those timestamped chunks are what both sides count as packets, so the
 two counts line up exactly.
+
+### SCTP
+
+A reliable, message-oriented SCTP association paced by `tcp_bytes_per_second`.
+The host kernel must support SCTP; netmark reports the socket error if it does
+not. SCTP shares the stream framing and TCP jitter budget, while TCP-only MSS,
+MTU and window values remain zero for SCTP runs.
 
 ### UDP
 
@@ -544,6 +553,11 @@ Every run reports upload and download bandwidth, everywhere:
 - **External SQL**, in the same two columns of `netmark_metrics`.
 - **REST API**, as `sent_bytes_per_second` and `received_bytes_per_second`.
 - **SDK**, on `RunReport`.
+
+For TCP runs, the final stdout/log line, REST response, SDK report and `status`
+table also show the negotiated MSS, path MTU and effective socket send window.
+Set both TCP socket buffers with `tcp_window_size` (or `configure tcp window`);
+the value `0` keeps the operating-system default.
 
 Bandwidth is bytes moved divided by the wall-clock length of the run, floored at
 one second so a very short run cannot report an inflated figure.

@@ -81,6 +81,8 @@ impl HookRegistry {
 #[derive(Debug, Clone)]
 pub struct RunReport {
     pub run_id: u64,
+    /// Transport selected for this run: tcp, sctp, udp, or ip.
+    pub packet_type: String,
     pub passed: bool,
     pub result: String,
     pub failure_reason: Option<String>,
@@ -91,6 +93,9 @@ pub struct RunReport {
     pub received_tcp_bytes: u64,
     pub received_udp_bytes: u64,
     pub received_ip_bytes: u64,
+    pub tcp_mss: u64,
+    pub tcp_mtu: u64,
+    pub tcp_window_size: u64,
     /// Upload bandwidth over the run.
     pub sent_bytes_per_second: u64,
     /// Download bandwidth over the run.
@@ -233,6 +238,7 @@ impl TestRunner {
         let (webrtc_sent, webrtc_received, webrtc_invalid) = metrics.webrtc_counts();
         let mut report = RunReport {
             run_id,
+            packet_type: profile.traffic.packet_type.clone(),
             passed: outcome.result == "ok",
             result: outcome.result.to_string(),
             failure_reason: outcome.failure_reason,
@@ -243,6 +249,9 @@ impl TestRunner {
             received_tcp_bytes: totals[5],
             received_udp_bytes: totals[7],
             received_ip_bytes: totals[11],
+            tcp_mss: outcome.tcp_mss,
+            tcp_mtu: outcome.tcp_mtu,
+            tcp_window_size: outcome.tcp_window_size,
             sent_bytes_per_second: outcome.sent_bytes_per_second,
             received_bytes_per_second: outcome.received_bytes_per_second,
             lost_udp_packets: lost,

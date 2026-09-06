@@ -41,6 +41,21 @@ fn config_defaults_are_local() {
 }
 
 #[test]
+fn sctp_and_tcp_window_round_trip_through_traffic_config() {
+    let traffic = crate::configuration::TrafficConfig {
+        packet_type: "sctp".to_string(),
+        tcp_window_size: 65_536,
+        ..Default::default()
+    };
+    let config = crate::config_from_traffic(&traffic);
+    assert_eq!(config.packet_type, PacketType::Sctp);
+    assert_eq!(config.tcp_window_size, 65_536);
+    let round_trip = crate::traffic_config_from(&config);
+    assert_eq!(round_trip.packet_type, "sctp");
+    assert_eq!(round_trip.tcp_window_size, 65_536);
+}
+
+#[test]
 fn persisted_run_ids_are_incremental() {
     let sql = SqlState::new();
     sql.enable().unwrap();
@@ -237,6 +252,7 @@ fn three_second_udp_client_server_logs_match() {
         udp_rate: 10,
         packet_type: PacketType::Udp,
         tcp_bytes_per_second: 1024,
+        tcp_window_size: 0,
         udp_packet_size: 1024,
         client_runtime: 3,
         server_runtime: 3,

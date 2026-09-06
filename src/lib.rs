@@ -11,6 +11,7 @@ pub mod monitor;
 pub mod rawip;
 pub mod restapi;
 pub mod sdk;
+pub mod sctp;
 pub mod smtp;
 pub mod webrtc;
 
@@ -58,6 +59,7 @@ pub fn config_from_traffic(traffic: &configuration::TrafficConfig) -> Config {
         udp_rate: traffic.udp_rate,
         packet_type: PacketType::parse(&traffic.packet_type).unwrap_or(PacketType::Tcp),
         tcp_bytes_per_second: traffic.tcp_bytes_per_second,
+        tcp_window_size: traffic.tcp_window_size,
         udp_packet_size: traffic.udp_packet_size,
         client_runtime: traffic.client_runtime,
         server_runtime: traffic.server_runtime,
@@ -96,6 +98,7 @@ pub fn traffic_config_from(config: &Config) -> configuration::TrafficConfig {
         udp_rate: config.udp_rate,
         packet_type: config.packet_type.as_str().to_string(),
         tcp_bytes_per_second: config.tcp_bytes_per_second,
+        tcp_window_size: config.tcp_window_size,
         udp_packet_size: config.udp_packet_size,
         client_runtime: config.client_runtime,
         server_runtime: config.server_runtime,
@@ -119,6 +122,9 @@ pub struct RunOutcome {
     pub received_bytes_per_second: u64,
     pub result: &'static str,
     pub failure_reason: Option<String>,
+    pub tcp_mss: u64,
+    pub tcp_mtu: u64,
+    pub tcp_window_size: u64,
 }
 
 impl RunOutcome {
@@ -143,12 +149,15 @@ impl RunOutcome {
     /// The one line every surface prints for a finished run.
     pub fn report_line(&self, run_id: u64) -> String {
         format!(
-            "run {run_id} result={} sent_bytes={} received_bytes={} up={} bytes/sec down={} bytes/sec{}",
+            "run {run_id} result={} sent_bytes={} received_bytes={} up={} bytes/sec down={} bytes/sec tcp_mss={} tcp_mtu={} tcp_window_size={}{}",
             self.result,
             self.sent_bytes,
             self.received_bytes,
             self.sent_bytes_per_second,
             self.received_bytes_per_second,
+            self.tcp_mss,
+            self.tcp_mtu,
+            self.tcp_window_size,
             self.failure_reason
                 .as_deref()
                 .map(|reason| format!(" reason=\"{reason}\""))
@@ -208,6 +217,9 @@ pub fn evaluate_run(metrics: &Metrics, config: &Config, elapsed: Option<Duration
         } else {
             Some(reasons.join("; "))
         },
+        tcp_mss: metrics.tcp_transport().0,
+        tcp_mtu: metrics.tcp_transport().1,
+        tcp_window_size: metrics.tcp_transport().2,
     }
 }
 

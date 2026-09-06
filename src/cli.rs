@@ -617,6 +617,13 @@ pub fn configure(config: &Arc<Mutex<Config>>, args: &[&str]) -> Result<(), Strin
         config.lock().unwrap().tcp_bytes_per_second = value;
         return Ok(());
     }
+    if let ["tcp", "window", value] = args {
+        let value = value
+            .parse()
+            .map_err(|_| "TCP window must be a number of bytes (0 uses the OS default)")?;
+        config.lock().unwrap().tcp_window_size = value;
+        return Ok(());
+    }
     if let ["udp", "packetsize", value] = args {
         let value = value
             .parse()
@@ -635,7 +642,7 @@ pub fn configure(config: &Arc<Mutex<Config>>, args: &[&str]) -> Result<(), Strin
         return Ok(());
     }
     if let ["type", value] = args {
-        let packet_type = PacketType::parse(value).ok_or("type must be tcp, udp or ip")?;
+        let packet_type = PacketType::parse(value).ok_or("type must be tcp, sctp, udp or ip")?;
         config.lock().unwrap().packet_type = packet_type;
         return Ok(());
     }
@@ -649,7 +656,7 @@ pub fn configure(config: &Arc<Mutex<Config>>, args: &[&str]) -> Result<(), Strin
     Err(CONFIGURE_USAGE.into())
 }
 
-pub const CONFIGURE_USAGE: &str = "configure: metrics <connection> | save | reset | smtp <host[:port]> | type <tcp|udp|ip> | tcp bytes <bytes/sec> | tcp jitter <ms> | tcp maxjitter <ms> | udp_rate <packets/sec> | udp packetsize <bytes> | udp jitter <ms> | udp max jitter <ms> | bandwidth limit <bytes/sec>";
+pub const CONFIGURE_USAGE: &str = "configure: metrics <connection> | save | reset | smtp <host[:port]> | type <tcp|sctp|udp|ip> | tcp bytes <bytes/sec> | tcp window <bytes> | tcp jitter <ms> | tcp maxjitter <ms> | udp_rate <packets/sec> | udp packetsize <bytes> | udp jitter <ms> | udp max jitter <ms> | bandwidth limit <bytes/sec>";
 
 /// Subcommand: client http check <url>
 pub fn client_http_check(log_dir: &std::path::Path, url: &str) {
@@ -720,6 +727,7 @@ pub fn status_rows(metrics: &Metrics, context: &StatusContext<'_>) -> Vec<Vec<St
     let values = metrics.run_totals();
     let (lost, order) = metrics.udp_status();
     let (webrtc_sent, webrtc_received, webrtc_invalid) = metrics.webrtc_counts();
+    let (mss, mtu, window_size) = metrics.tcp_transport();
     let elapsed = context.elapsed.unwrap_or_default();
     let sent = metrics.run_sent_total();
     let received = metrics.run_received_total();
@@ -795,6 +803,14 @@ pub fn status_rows(metrics: &Metrics, context: &StatusContext<'_>) -> Vec<Vec<St
         ),
     ]);
     rows.push(vec!["Metrics SQL".into(), context.metrics_sql.clone()]);
+    rows.push(vec![
+        "TCP transport".into(),
+        if mss == 0 && mtu == 0 && window_size == 0 {
+            "not available (TCP not connected)".into()
+        } else {
+            format!("MSS {mss} bytes, MTU {mtu} bytes, window {window_size} bytes")
+        },
+    ]);
     rows.push(vec!["REST API".into(), context.restapi.clone()]);
     rows.push(vec!["SMTP".into(), enabled_word(context.smtp).into()]);
     rows
@@ -891,12 +907,16 @@ pub fn help_rows() -> Vec<Vec<String>> {
             "flood the remote server with TCP and report bandwidth".into(),
         ],
         vec![
-            "configure type <tcp|udp|ip>".into(),
-            "pick the transport; ip is raw IPv4 and needs CAP_NET_RAW".into(),
+            "configure type <tcp|sctp|udp|ip>".into(),
+            "pick the transport; SCTP needs kernel support and raw IP needs CAP_NET_RAW".into(),
         ],
         vec![
             "configure tcp bytes <bytes/sec>".into(),
             "set TCP bytes per second".into(),
+        ],
+        vec![
+            "configure tcp window <bytes>".into(),
+            "set TCP send/receive window; 0 uses the OS default".into(),
         ],
         vec![
             "configure tcp jitter <ms>".into(),
