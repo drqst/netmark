@@ -61,6 +61,31 @@ pub struct TrafficConfig {
     pub max_udp_jitter_millis: u64,
     /// Minimum acceptable throughput in bytes/sec for a run to pass; 0 disables the check.
     pub limit: u64,
+    /// Per-transport failure limits, set with `configure limits`.
+    pub limits: LimitsConfig,
+}
+
+/// One set of limits per transport; every value is 0 (not checked) by default.
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct LimitsConfig {
+    pub tcp: ProtocolLimitsConfig,
+    pub sctp: ProtocolLimitsConfig,
+    pub udp: ProtocolLimitsConfig,
+    pub ip: ProtocolLimitsConfig,
+}
+
+/// The limits netmark checks after a run; 0 means the limit is not checked.
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct ProtocolLimitsConfig {
+    pub min_sent_bytes: u64,
+    pub min_received_bytes: u64,
+    pub min_sent_bytes_per_second: u64,
+    pub min_received_bytes_per_second: u64,
+    pub max_jitter_millis: u64,
+    pub max_lost_packets: u64,
+    pub max_out_of_order_packets: u64,
 }
 
 impl Default for TrafficConfig {
@@ -79,6 +104,7 @@ impl Default for TrafficConfig {
             max_tcp_jitter_millis: 1000,
             max_udp_jitter_millis: 1000,
             limit: 0,
+            limits: LimitsConfig::default(),
         }
     }
 }

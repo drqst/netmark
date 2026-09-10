@@ -416,9 +416,27 @@ pub fn normalize_http_target(target: &str) -> String {
     }
 }
 
-/// Command: selftest — sends UDP traffic to localhost for 3 seconds and stops
-/// automatically. Returns the line announcing the run; the completion line is
-/// printed asynchronously when the run ends.
+/// The transports `selftest` exercises, in this order.
+pub const SELFTEST_PROTOCOLS: [PacketType; 4] = [
+    PacketType::Udp,
+    PacketType::Tcp,
+    PacketType::Sctp,
+    PacketType::Ip,
+];
+
+/// Whether this host can carry a transport at all, so `selftest` can skip one
+/// with a reason (no SCTP in the kernel, no CAP_NET_RAW) instead of failing.
+pub fn selftest_availability(packet_type: PacketType) -> Result<(), String> {
+    match packet_type {
+        PacketType::Sctp => crate::sctp::availability(),
+        PacketType::Ip => crate::rawip::availability(),
+        PacketType::Tcp | PacketType::Udp => Ok(()),
+    }
+}
+
+/// Command: selftest — sends traffic to localhost over every protocol in turn,
+/// each for a few seconds, and stops automatically. Returns the line announcing
+/// the sequence; each leg and the completion line are printed as they happen.
 pub fn run_selftest(
     config: &Arc<Mutex<Config>>,
     stopping: &Arc<AtomicBool>,
@@ -431,11 +449,83 @@ pub fn run_selftest(
     if running.swap(true, Ordering::Relaxed) {
         return "already running".to_string();
     }
+    let mut planned = Vec::new();
+    let mut skipped = Vec::new();
+    for packet_type in SELFTEST_PROTOCOLS {
+        match selftest_availability(packet_type) {
+            Ok(()) => planned.push(packet_type),
+            Err(error) => skipped.push(format!("{} ({error})", packet_type.as_str())),
+        }
+    }
+    if planned.is_empty() {
+        running.store(false, Ordering::Relaxed);
+        return format!("selftest cannot run: no transport is available; {}", skipped.join(", "));
+    }
+    let announcement = format!(
+        "selftest running {}{}",
+        planned
+            .iter()
+            .map(|packet_type| packet_type.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+        if skipped.is_empty() {
+            String::new()
+        } else {
+            format!("; skipping {}", skipped.join(", "))
+        }
+    );
+    let stop = Arc::clone(stopping);
+    let state = Arc::clone(running);
+    let sql_state = Arc::clone(sql);
+    let state_metrics = Arc::clone(metrics);
+    let state_external = Arc::clone(external);
+    let state_config = Arc::clone(config);
+    let logs = log_dir.to_path_buf();
+    thread::spawn(move || {
+        let mut failures = 0;
+        for (index, packet_type) in planned.iter().enumerate() {
+            if index > 0 {
+                // Let the previous leg's sockets close before the next one binds.
+                thread::sleep(Duration::from_secs(1));
+            }
+            if !selftest_leg(
+                *packet_type,
+                &state_config,
+                &stop,
+                &state_metrics,
+                &sql_state,
+                &state_external,
+                &logs,
+            ) {
+                failures += 1;
+            }
+        }
+        state.store(false, Ordering::Relaxed);
+        cli_textout::raw("\r\n");
+        cli_textout::line(format!(
+            "selftest completed {} transports, {failures} failed",
+            planned.len()
+        ));
+    });
+    announcement
+}
+
+/// One `selftest` leg: a short localhost run over a single transport. Returns
+/// whether the run passed.
+fn selftest_leg(
+    packet_type: PacketType,
+    config: &Arc<Mutex<Config>>,
+    stopping: &Arc<AtomicBool>,
+    metrics: &Arc<Metrics>,
+    sql: &Arc<SqlState>,
+    external: &Arc<Mutex<Option<Arc<ExternalSqlMetrics>>>>,
+    log_dir: &std::path::Path,
+) -> bool {
     let run_id = sql.next_run_id(1);
     sql.set_role(core::ROLE_BOTH);
     {
         let mut config = config.lock().unwrap();
-        config.packet_type = PacketType::Udp;
+        config.packet_type = packet_type;
         config.udp_rate = 1;
         config.udp_packet_size = 1024;
         config.client_runtime = SELFTEST_SECONDS;
@@ -470,56 +560,48 @@ pub fn run_selftest(
     );
     sql.start_run(run_id);
     gate.start();
-    let announcement = format!("selftest started run {run_id}");
-    let stop = Arc::clone(stopping);
-    let state = Arc::clone(running);
-    let sql_state = Arc::clone(sql);
-    let state_metrics = Arc::clone(metrics);
-    let state_external = Arc::clone(external);
-    let state_config = Arc::clone(config);
-    let logs = log_dir.to_path_buf();
-    thread::spawn(move || {
-        thread::sleep(Duration::from_secs(SELFTEST_SECONDS));
-        stop.store(true, Ordering::Relaxed);
-        state.store(false, Ordering::Relaxed);
-        cli_textout::raw("\r\n");
-        let mut outcome = crate::evaluate_run(
-            &state_metrics,
-            &state_config.lock().unwrap(),
-            Some(Duration::from_secs(SELFTEST_SECONDS)),
-        );
-        match core::run_debrief(
-            DEFAULT_REMOTE,
-            run_id,
-            PacketType::Udp,
-            &state_metrics,
-            &sql_state,
-            &logs,
-        ) {
-            Ok(debrief) => {
-                cli_textout::line(debrief.summary());
-                if let Some(reason) = debrief.mismatch_reason() {
-                    outcome.add_failure(format!("debrief mismatch: {reason}"));
-                }
-            }
-            Err(error) => {
-                cli_textout::line(&error);
-                outcome.add_failure(error);
+    cli_textout::raw("\r\n");
+    cli_textout::line(format!(
+        "selftest {} started run {run_id}",
+        packet_type.as_str()
+    ));
+    thread::sleep(Duration::from_secs(SELFTEST_SECONDS));
+    stopping.store(true, Ordering::Relaxed);
+    cli_textout::raw("\r\n");
+    let mut outcome = crate::evaluate_run(
+        metrics,
+        &config.lock().unwrap(),
+        Some(Duration::from_secs(SELFTEST_SECONDS)),
+    );
+    match core::run_debrief(
+        DEFAULT_REMOTE,
+        run_id,
+        packet_type,
+        metrics,
+        sql,
+        log_dir,
+    ) {
+        Ok(debrief) => {
+            cli_textout::line(debrief.summary());
+            if let Some(reason) = debrief.mismatch_reason() {
+                outcome.add_failure(format!("debrief mismatch: {reason}"));
             }
         }
-        sql_state.complete_run(run_id, &outcome.summary());
-        crate::record_final_metrics(
-            state_external.lock().unwrap().as_ref(),
-            run_id,
-            &state_metrics,
-            &outcome,
-        );
-        crate::write_run_event(&logs, run_id, "Completed");
-        crate::write_log_line(&logs, &outcome.report_line(run_id));
-        cli_textout::raw("\r\n");
-        cli_textout::line(format!("selftest completed {}", outcome.report_line(run_id)));
-    });
-    announcement
+        Err(error) => {
+            cli_textout::line(&error);
+            outcome.add_failure(error);
+        }
+    }
+    sql.complete_run(run_id, &outcome.summary());
+    crate::record_final_metrics(external.lock().unwrap().as_ref(), run_id, metrics, &outcome);
+    crate::write_run_event(log_dir, run_id, "Completed");
+    crate::write_log_line(log_dir, &outcome.report_line(run_id));
+    cli_textout::line(format!(
+        "selftest {} {}",
+        packet_type.as_str(),
+        outcome.report_line(run_id)
+    ));
+    outcome.result == "ok"
 }
 
 /// Command: benchmark duration <seconds> — floods the remote server with TCP and
@@ -657,7 +739,97 @@ pub fn configure(config: &Arc<Mutex<Config>>, args: &[&str]) -> Result<(), Strin
     Err(CONFIGURE_USAGE.into())
 }
 
-pub const CONFIGURE_USAGE: &str = "configure: metrics <connection> | save | reset | smtp <host[:port]> | type <tcp|sctp|udp|ip> | tcp bytes <bytes/sec> | tcp window <bytes> | tcp jitter <ms> | tcp maxjitter <ms> | udp_rate <packets/sec> | udp packetsize <bytes> | udp jitter <ms> | udp max jitter <ms> | bandwidth limit <bytes/sec>";
+/// Subcommand: configure limits — per-protocol thresholds that fail a run.
+/// Returns the line or table to print.
+pub fn configure_limits(config: &Arc<Mutex<Config>>, args: &[&str]) -> Result<String, String> {
+    match args {
+        [] | ["status"] => Ok(limits_table(&config.lock().unwrap().limits, None)),
+        [protocol] | [protocol, "status"] => {
+            let packet_type = parse_limit_protocol(protocol)?;
+            Ok(limits_table(
+                &config.lock().unwrap().limits,
+                Some(packet_type),
+            ))
+        }
+        [protocol, "clear"] => {
+            let packet_type = parse_limit_protocol(protocol)?;
+            *config.lock().unwrap().limits.get_mut(packet_type) = crate::core::Limits::default();
+            Ok(format!("{} limits cleared", packet_type.as_str()))
+        }
+        [protocol, parameter, value] => {
+            let packet_type = parse_limit_protocol(protocol)?;
+            if !crate::core::Limits::supports(packet_type, parameter) {
+                return Err(format!(
+                    "{} has no limit called \"{parameter}\"; it accepts: {}",
+                    packet_type.as_str(),
+                    limit_parameters(packet_type).join(", ")
+                ));
+            }
+            let value: u64 = value
+                .parse()
+                .map_err(|_| format!("{parameter} must be a whole number (0 removes the limit)"))?;
+            config
+                .lock()
+                .unwrap()
+                .limits
+                .get_mut(packet_type)
+                .set(parameter, value);
+            Ok(if value == 0 {
+                format!("{} {parameter} limit removed", packet_type.as_str())
+            } else {
+                format!("{} {parameter} limit set to {value}", packet_type.as_str())
+            })
+        }
+        _ => Err(LIMITS_USAGE.into()),
+    }
+}
+
+fn parse_limit_protocol(protocol: &str) -> Result<PacketType, String> {
+    PacketType::parse(protocol)
+        .ok_or_else(|| "limits are set per protocol: tcp, sctp, udp or ip".to_string())
+}
+
+/// The limit parameters that mean something for a transport.
+pub fn limit_parameters(packet_type: PacketType) -> Vec<&'static str> {
+    crate::core::LIMIT_PARAMETERS
+        .into_iter()
+        .filter(|parameter| crate::core::Limits::supports(packet_type, parameter))
+        .collect()
+}
+
+/// The table `configure limits [protocol]` prints: every limit, with `not set`
+/// where a limit is disabled.
+pub fn limits_table(limits: &crate::core::LimitSet, only: Option<PacketType>) -> String {
+    let protocols: Vec<PacketType> = match only {
+        Some(packet_type) => vec![packet_type],
+        None => vec![
+            PacketType::Tcp,
+            PacketType::Sctp,
+            PacketType::Udp,
+            PacketType::Ip,
+        ],
+    };
+    let mut rows = Vec::new();
+    for packet_type in protocols {
+        let values = limits.get(packet_type);
+        for parameter in limit_parameters(packet_type) {
+            let value = values.get(parameter).unwrap_or(0);
+            rows.push(vec![
+                format!("{} {parameter}", packet_type.as_str()),
+                if value == 0 {
+                    "not set".to_string()
+                } else {
+                    value.to_string()
+                },
+            ]);
+        }
+    }
+    cli_textout::table_lines(&rows, &[40, 40]).join("\n")
+}
+
+pub const LIMITS_USAGE: &str = "configure limits: [<tcp|sctp|udp|ip>] status | <tcp|sctp|udp|ip> <parameter> <value> | <tcp|sctp|udp|ip> clear";
+
+pub const CONFIGURE_USAGE: &str = "configure: metrics <connection> | save | reset | smtp <host[:port]> | type <tcp|sctp|udp|ip> | tcp bytes <bytes/sec> | tcp window <bytes> | tcp jitter <ms> | tcp maxjitter <ms> | udp_rate <packets/sec> | udp packetsize <bytes> | udp jitter <ms> | udp max jitter <ms> | bandwidth limit <bytes/sec> | limits <tcp|sctp|udp|ip> <parameter> <value>";
 
 /// Subcommand: client http check <url>
 pub fn client_http_check(log_dir: &std::path::Path, url: &str) -> String {
@@ -954,6 +1126,12 @@ pub fn help_for(topic: &[&str]) -> Result<Vec<Vec<String>>, String> {
     if topic == ["sctp"] {
         return Ok(sctp_help_rows());
     }
+    // "help configure limits <protocol>" lists the parameters that protocol has.
+    if let ["configure", "limits", protocol] = topic
+        && let Some(packet_type) = PacketType::parse(protocol)
+    {
+        return Ok(limit_parameter_help_rows(packet_type));
+    }
     let rows: Vec<Vec<String>> = help_rows()
         .into_iter()
         .filter(|row| row[0].split('|').any(|label| label_matches(label, topic)))
@@ -966,6 +1144,30 @@ pub fn help_for(topic: &[&str]) -> Result<Vec<Vec<String>>, String> {
     } else {
         Ok(rows)
     }
+}
+
+/// The parameters one protocol accepts under `configure limits`, with what each
+/// one means, so the operator does not have to guess.
+pub fn limit_parameter_help_rows(packet_type: PacketType) -> Vec<Vec<String>> {
+    let protocol = packet_type.as_str();
+    limit_parameters(packet_type)
+        .into_iter()
+        .map(|parameter| {
+            let meaning = match parameter {
+                "min-sent-bytes" => "fail below this many bytes sent in the run",
+                "min-received-bytes" => "fail below this many bytes received in the run",
+                "min-sent-bytes-per-second" => "fail below this sending throughput",
+                "min-received-bytes-per-second" => "fail below this receiving throughput",
+                "max-jitter-millis" => "fail above this measured jitter",
+                "max-lost-packets" => "fail above this many lost packets",
+                _ => "fail above this many out-of-order packets",
+            };
+            vec![
+                format!("configure limits {protocol} {parameter} <value>"),
+                meaning.to_string(),
+            ]
+        })
+        .collect()
 }
 
 /// A help row answers a topic when its command words match word for word.
@@ -1027,7 +1229,7 @@ pub fn help_rows() -> Vec<Vec<String>> {
         ],
         vec![
             "selftest".into(),
-            "send UDP traffic to localhost and stop automatically".into(),
+            "run udp, tcp, sctp and ip to localhost in turn and stop automatically".into(),
         ],
         vec![
             "benchmark duration <seconds>".into(),
@@ -1076,6 +1278,22 @@ pub fn help_rows() -> Vec<Vec<String>> {
         vec![
             "configure bandwidth limit <bytes/sec>".into(),
             "minimum acceptable throughput; 0 disables the check".into(),
+        ],
+        vec![
+            "configure limits".into(),
+            "show every per-protocol limit that can fail a run".into(),
+        ],
+        vec![
+            "configure limits <tcp|sctp|udp|ip> status".into(),
+            "show the limits for one protocol".into(),
+        ],
+        vec![
+            "configure limits <tcp|sctp|udp|ip> <parameter> <value>".into(),
+            "fail a run when the protocol misses this limit; 0 removes it".into(),
+        ],
+        vec![
+            "configure limits <tcp|sctp|udp|ip> clear".into(),
+            "remove every limit for one protocol".into(),
         ],
         vec![
             "webrtc enable | disable".into(),

@@ -262,6 +262,7 @@ fn three_second_udp_client_server_logs_match() {
         max_tcp_jitter_millis: 1000,
         max_udp_jitter_millis: 1000,
         limit_bytes_per_second: 0,
+        limits: crate::core::LimitSet::default(),
         webrtc: crate::webrtc::Settings::default(),
         admin_emails: Vec::new(),
     }));
@@ -1879,4 +1880,182 @@ fn rest_api_with_a_session_runs_cli_commands() {
 
     api.disable();
     let _ = std::fs::remove_dir_all(&log_dir);
+}
+
+#[test]
+fn help_answers_a_topic_for_every_command() {
+    for topic in [
+        vec!["start"],
+        vec!["stop"],
+        vec!["status"],
+        vec!["configure", "type"],
+        vec!["client", "0", "remote"],
+        vec!["configure", "limits"],
+    ] {
+        let rows = crate::cli::help_for(&topic).unwrap_or_else(|error| {
+            panic!("help {} answered nothing: {error}", topic.join(" "));
+        });
+        assert!(
+            !rows.is_empty(),
+            "help {} answered an empty page",
+            topic.join(" ")
+        );
+    }
+    // Every top-level command in the completion list is documented.
+    for command in crate::cli::COMMANDS {
+        if matches!(*command, "quit" | "exit") {
+            continue;
+        }
+        let topic: Vec<&str> = command.split_whitespace().collect();
+        assert!(
+            crate::cli::help_for(&topic).is_ok(),
+            "help {command} answered nothing"
+        );
+    }
+    assert!(crate::cli::help_for(&["nonsense"]).is_err());
+    // "help sctp" is the detailed page, not the one-line summary.
+    assert_eq!(
+        crate::cli::help_for(&["sctp"]).unwrap(),
+        crate::cli::sctp_help_rows()
+    );
+}
+
+#[test]
+fn selftest_covers_every_protocol() {
+    let protocols: Vec<&str> = crate::cli::SELFTEST_PROTOCOLS
+        .iter()
+        .map(|packet_type| packet_type.as_str())
+        .collect();
+    for protocol in ["tcp", "sctp", "udp", "ip"] {
+        assert!(
+            protocols.contains(&protocol),
+            "selftest does not cover {protocol}"
+        );
+    }
+    // TCP and UDP always work; the other two report why they cannot run instead
+    // of failing the whole sequence.
+    assert!(crate::cli::selftest_availability(PacketType::Tcp).is_ok());
+    assert!(crate::cli::selftest_availability(PacketType::Udp).is_ok());
+    for packet_type in [PacketType::Sctp, PacketType::Ip] {
+        if let Err(reason) = crate::cli::selftest_availability(packet_type) {
+            assert!(!reason.is_empty(), "a skipped transport needs a reason");
+        }
+    }
+}
+
+#[test]
+fn limits_are_configured_per_protocol() {
+    let config = Arc::new(Mutex::new(Config::default()));
+    assert_eq!(
+        crate::cli::configure_limits(&config, &["udp", "max-lost-packets", "5"]),
+        Ok("udp max-lost-packets limit set to 5".to_string())
+    );
+    assert_eq!(config.lock().unwrap().limits.udp.max_lost_packets, 5);
+    // Only the protocol that was named is changed.
+    assert_eq!(config.lock().unwrap().limits.tcp.max_lost_packets, 0);
+
+    for protocol in ["tcp", "sctp", "ip"] {
+        crate::cli::configure_limits(&config, &[protocol, "min-sent-bytes", "1024"])
+            .unwrap_or_else(|error| panic!("{protocol} limit was refused: {error}"));
+    }
+    assert_eq!(config.lock().unwrap().limits.sctp.min_sent_bytes, 1024);
+
+    // Lost packets are a UDP measurement, so the other transports refuse them
+    // and say which parameters they do accept.
+    let error = crate::cli::configure_limits(&config, &["tcp", "max-lost-packets", "5"])
+        .expect_err("TCP has no lost-packet counter");
+    assert!(error.contains("min-sent-bytes"), "{error}");
+    assert!(crate::cli::configure_limits(&config, &["tcp", "nonsense", "5"]).is_err());
+    assert!(crate::cli::configure_limits(&config, &["tcp", "min-sent-bytes", "x"]).is_err());
+    assert!(crate::cli::configure_limits(&config, &["nonsense", "min-sent-bytes", "5"]).is_err());
+
+    let table = crate::cli::configure_limits(&config, &["udp", "status"]).unwrap();
+    assert!(table.contains("udp max-lost-packets"), "{table}");
+    assert!(table.contains('5'), "{table}");
+    let all = crate::cli::configure_limits(&config, &[]).unwrap();
+    for protocol in ["tcp", "sctp", "udp", "ip"] {
+        assert!(all.contains(protocol), "{all} is missing {protocol}");
+    }
+
+    crate::cli::configure_limits(&config, &["udp", "clear"]).unwrap();
+    assert_eq!(config.lock().unwrap().limits.udp, crate::core::Limits::default());
+    // Zero removes a single limit.
+    crate::cli::configure_limits(&config, &["tcp", "min-sent-bytes", "0"]).unwrap();
+    assert_eq!(config.lock().unwrap().limits.tcp.min_sent_bytes, 0);
+}
+
+#[test]
+fn a_missed_limit_fails_the_run() {
+    let metrics = Metrics::new();
+    metrics.add_test_bytes(true, PacketType::Tcp, 1024);
+    metrics.add_test_bytes(false, PacketType::Tcp, 1024);
+    let mut config = Config {
+        packet_type: PacketType::Tcp,
+        ..Config::default()
+    };
+    let elapsed = Some(Duration::from_secs(1));
+
+    let outcome = crate::evaluate_run(&metrics, &config, elapsed);
+    assert_eq!(outcome.result, "ok", "{:?}", outcome.failure_reason);
+
+    config.limits.tcp.min_sent_bytes_per_second = 100_000;
+    let outcome = crate::evaluate_run(&metrics, &config, elapsed);
+    assert_eq!(outcome.result, "fail");
+    let reason = outcome.failure_reason.unwrap();
+    assert!(reason.contains("tcp sent bytes/sec"), "{reason}");
+
+    // A limit set for another transport is not applied to this run.
+    let mut other = Config {
+        packet_type: PacketType::Udp,
+        ..Config::default()
+    };
+    other.limits.tcp.min_sent_bytes_per_second = 100_000;
+    assert_eq!(crate::evaluate_run(&metrics, &other, elapsed).result, "ok");
+}
+
+#[test]
+fn limits_survive_a_configuration_round_trip() {
+    let mut config = Config::default();
+    config.limits.udp.max_out_of_order_packets = 7;
+    config.limits.sctp.min_received_bytes = 2048;
+    let traffic = crate::traffic_config_from(&config);
+    let restored = crate::config_from_traffic(&traffic);
+    assert_eq!(restored.limits, config.limits);
+}
+
+#[test]
+fn the_kubernetes_cluster_is_three_containers_with_a_test_script() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let postgres = std::fs::read_to_string(root.join("k8s/postgres.yaml")).unwrap();
+    let netmark = std::fs::read_to_string(root.join("k8s/netmark.yaml")).unwrap();
+    // One PostgreSQL container and one volume container that owns the claim,
+    // plus the web server container in the other manifest.
+    assert!(postgres.contains("- name: postgres"), "no postgres container");
+    assert!(postgres.contains("- name: volume"), "no volume container");
+    assert!(
+        postgres.contains("claimName: netmark-postgres-data"),
+        "the pod does not mount the data volume"
+    );
+    assert!(netmark.contains("- name: netmark"), "no web server container");
+    assert!(netmark.contains("--serve"), "the web server is not served");
+
+    let script = root.join("k8s/cluster-test.sh");
+    let cases = std::fs::read_to_string(&script).unwrap();
+    for expectation in [
+        "kubernetes api reachable",
+        "postgres container is deployed",
+        "volume container is deployed",
+        "data volume is bound",
+        "postgres accepts connections",
+        "web server reports live status",
+        "web CLI answers the status command",
+    ] {
+        assert!(cases.contains(expectation), "no cluster test for {expectation}");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&script).unwrap().permissions().mode();
+        assert!(mode & 0o111 != 0, "k8s/cluster-test.sh is not executable");
+    }
 }

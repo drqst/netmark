@@ -280,6 +280,11 @@ impl Session {
                 }
                 Err(_) => "UDP max jitter must be milliseconds".to_string(),
             },
+            ["configure", "limits", rest @ ..] => {
+                match cli::configure_limits(&self.config, rest) {
+                    Ok(output) | Err(output) => output,
+                }
+            }
             ["configure"] => CONFIGURE_USAGE.to_string(),
             ["configure", rest @ ..] => match configure(&self.config, rest) {
                 Ok(()) => "configuration updated".to_string(),

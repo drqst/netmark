@@ -70,6 +70,7 @@ pub fn config_from_traffic(traffic: &configuration::TrafficConfig) -> Config {
         max_tcp_jitter_millis: traffic.max_tcp_jitter_millis,
         max_udp_jitter_millis: traffic.max_udp_jitter_millis,
         limit_bytes_per_second: traffic.limit,
+        limits: limit_set_from(&traffic.limits),
         webrtc: webrtc::Settings::default(),
         admin_emails: Vec::new(),
     }
@@ -109,6 +110,49 @@ pub fn traffic_config_from(config: &Config) -> configuration::TrafficConfig {
         max_tcp_jitter_millis: config.max_tcp_jitter_millis,
         max_udp_jitter_millis: config.max_udp_jitter_millis,
         limit: config.limit_bytes_per_second,
+        limits: limits_config_from(&config.limits),
+    }
+}
+
+fn limits_from(limits: &configuration::ProtocolLimitsConfig) -> core::Limits {
+    core::Limits {
+        min_sent_bytes: limits.min_sent_bytes,
+        min_received_bytes: limits.min_received_bytes,
+        min_sent_bytes_per_second: limits.min_sent_bytes_per_second,
+        min_received_bytes_per_second: limits.min_received_bytes_per_second,
+        max_jitter_millis: limits.max_jitter_millis,
+        max_lost_packets: limits.max_lost_packets,
+        max_out_of_order_packets: limits.max_out_of_order_packets,
+    }
+}
+
+fn protocol_limits_config_from(limits: &core::Limits) -> configuration::ProtocolLimitsConfig {
+    configuration::ProtocolLimitsConfig {
+        min_sent_bytes: limits.min_sent_bytes,
+        min_received_bytes: limits.min_received_bytes,
+        min_sent_bytes_per_second: limits.min_sent_bytes_per_second,
+        min_received_bytes_per_second: limits.min_received_bytes_per_second,
+        max_jitter_millis: limits.max_jitter_millis,
+        max_lost_packets: limits.max_lost_packets,
+        max_out_of_order_packets: limits.max_out_of_order_packets,
+    }
+}
+
+pub fn limit_set_from(limits: &configuration::LimitsConfig) -> core::LimitSet {
+    core::LimitSet {
+        tcp: limits_from(&limits.tcp),
+        sctp: limits_from(&limits.sctp),
+        udp: limits_from(&limits.udp),
+        ip: limits_from(&limits.ip),
+    }
+}
+
+pub fn limits_config_from(limits: &core::LimitSet) -> configuration::LimitsConfig {
+    configuration::LimitsConfig {
+        tcp: protocol_limits_config_from(&limits.tcp),
+        sctp: protocol_limits_config_from(&limits.sctp),
+        udp: protocol_limits_config_from(&limits.udp),
+        ip: protocol_limits_config_from(&limits.ip),
     }
 }
 
@@ -207,6 +251,15 @@ pub fn evaluate_run(metrics: &Metrics, config: &Config, elapsed: Option<Duration
             ));
         }
     }
+    check_limits(
+        metrics,
+        config,
+        sent_bytes,
+        received_bytes,
+        sent_bytes_per_second,
+        received_bytes_per_second,
+        &mut reasons,
+    );
     RunOutcome {
         sent_bytes,
         received_bytes,
@@ -222,6 +275,57 @@ pub fn evaluate_run(metrics: &Metrics, config: &Config, elapsed: Option<Duration
         tcp_mtu: metrics.tcp_transport().1,
         tcp_window_size: metrics.tcp_transport().2,
     }
+}
+
+/// Applies the per-transport limits set with `configure limits` to a finished
+/// run, adding one reason per limit that was not met.
+fn check_limits(
+    metrics: &Metrics,
+    config: &Config,
+    sent_bytes: u64,
+    received_bytes: u64,
+    sent_bytes_per_second: u64,
+    received_bytes_per_second: u64,
+    reasons: &mut Vec<String>,
+) {
+    let packet_type = config.packet_type;
+    let limits = config.limits.get(packet_type);
+    let jitter = match packet_type {
+        core::PacketType::Udp => metrics.udp_jitter_millis(),
+        core::PacketType::Ip => 0,
+        core::PacketType::Tcp | core::PacketType::Sctp => metrics.tcp_jitter_millis(),
+    };
+    let (lost, out_of_order) = metrics.udp_status();
+    let protocol = packet_type.as_str();
+    let mut below = |name: &str, measured: u64, limit: u64| {
+        if limit > 0 && measured < limit {
+            reasons.push(format!("{protocol} {name} {measured} below limit {limit}"));
+        }
+    };
+    below("sent bytes", sent_bytes, limits.min_sent_bytes);
+    below("received bytes", received_bytes, limits.min_received_bytes);
+    below(
+        "sent bytes/sec",
+        sent_bytes_per_second,
+        limits.min_sent_bytes_per_second,
+    );
+    below(
+        "received bytes/sec",
+        received_bytes_per_second,
+        limits.min_received_bytes_per_second,
+    );
+    let mut above = |name: &str, measured: u64, limit: u64| {
+        if limit > 0 && measured > limit {
+            reasons.push(format!("{protocol} {name} {measured} above limit {limit}"));
+        }
+    };
+    above("jitter ms", jitter, limits.max_jitter_millis);
+    above("lost packets", lost, limits.max_lost_packets);
+    above(
+        "out-of-order packets",
+        out_of_order,
+        limits.max_out_of_order_packets,
+    );
 }
 
 /// Writes the single final metrics report for a run to the external database, if

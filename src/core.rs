@@ -71,6 +71,96 @@ impl PacketType {
     }
 }
 
+/// Limits that decide whether a run fails, kept per transport because each one
+/// is measured differently. A zero value means the limit is not checked.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Limits {
+    pub min_sent_bytes: u64,
+    pub min_received_bytes: u64,
+    pub min_sent_bytes_per_second: u64,
+    pub min_received_bytes_per_second: u64,
+    pub max_jitter_millis: u64,
+    pub max_lost_packets: u64,
+    pub max_out_of_order_packets: u64,
+}
+
+/// The parameters `configure limits <protocol> <parameter> <value>` accepts, in
+/// the order they are listed and checked.
+pub const LIMIT_PARAMETERS: [&str; 7] = [
+    "min-sent-bytes",
+    "min-received-bytes",
+    "min-sent-bytes-per-second",
+    "min-received-bytes-per-second",
+    "max-jitter-millis",
+    "max-lost-packets",
+    "max-out-of-order-packets",
+];
+
+impl Limits {
+    /// Whether a parameter can be measured for a transport; UDP is the only one
+    /// that counts lost and out-of-order packets, and raw IP has no jitter clock.
+    pub fn supports(packet_type: PacketType, parameter: &str) -> bool {
+        match parameter {
+            "max-lost-packets" | "max-out-of-order-packets" => packet_type == PacketType::Udp,
+            "max-jitter-millis" => packet_type != PacketType::Ip,
+            _ => LIMIT_PARAMETERS.contains(&parameter),
+        }
+    }
+    pub fn get(&self, parameter: &str) -> Option<u64> {
+        Some(match parameter {
+            "min-sent-bytes" => self.min_sent_bytes,
+            "min-received-bytes" => self.min_received_bytes,
+            "min-sent-bytes-per-second" => self.min_sent_bytes_per_second,
+            "min-received-bytes-per-second" => self.min_received_bytes_per_second,
+            "max-jitter-millis" => self.max_jitter_millis,
+            "max-lost-packets" => self.max_lost_packets,
+            "max-out-of-order-packets" => self.max_out_of_order_packets,
+            _ => return None,
+        })
+    }
+    pub fn set(&mut self, parameter: &str, value: u64) -> bool {
+        match parameter {
+            "min-sent-bytes" => self.min_sent_bytes = value,
+            "min-received-bytes" => self.min_received_bytes = value,
+            "min-sent-bytes-per-second" => self.min_sent_bytes_per_second = value,
+            "min-received-bytes-per-second" => self.min_received_bytes_per_second = value,
+            "max-jitter-millis" => self.max_jitter_millis = value,
+            "max-lost-packets" => self.max_lost_packets = value,
+            "max-out-of-order-packets" => self.max_out_of_order_packets = value,
+            _ => return false,
+        }
+        true
+    }
+}
+
+/// One set of limits per transport.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LimitSet {
+    pub tcp: Limits,
+    pub sctp: Limits,
+    pub udp: Limits,
+    pub ip: Limits,
+}
+
+impl LimitSet {
+    pub fn get(&self, packet_type: PacketType) -> &Limits {
+        match packet_type {
+            PacketType::Tcp => &self.tcp,
+            PacketType::Sctp => &self.sctp,
+            PacketType::Udp => &self.udp,
+            PacketType::Ip => &self.ip,
+        }
+    }
+    pub fn get_mut(&mut self, packet_type: PacketType) -> &mut Limits {
+        match packet_type {
+            PacketType::Tcp => &mut self.tcp,
+            PacketType::Sctp => &mut self.sctp,
+            PacketType::Udp => &mut self.udp,
+            PacketType::Ip => &mut self.ip,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Config {
     /// UDP packets per second; ignored for TCP, which is paced by `tcp_bytes_per_second`.
@@ -89,6 +179,8 @@ pub struct Config {
     pub max_udp_jitter_millis: u64,
     /// Minimum acceptable throughput in bytes/sec for a run to be considered a pass; 0 disables the check.
     pub limit_bytes_per_second: u64,
+    /// Per-transport limits set with `configure limits`; a failed limit fails the run.
+    pub limits: LimitSet,
     pub webrtc: crate::webrtc::Settings,
     pub admin_emails: Vec<String>,
 }
@@ -108,6 +200,7 @@ impl Default for Config {
             max_tcp_jitter_millis: 1000,
             max_udp_jitter_millis: 1000,
             limit_bytes_per_second: 0,
+            limits: LimitSet::default(),
             webrtc: crate::webrtc::Settings::default(),
             admin_emails: Vec::new(),
         }

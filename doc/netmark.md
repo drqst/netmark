@@ -73,8 +73,8 @@ Build it:
 cargo build --release
 ```
 
-Check that it works on one machine — this sends UDP to localhost for three
-seconds and reports the result:
+Check that it works on one machine — this sends traffic to localhost over every
+protocol in turn, three seconds each, and reports the result of each one:
 
 ```sh
 ./target/release/netmark
@@ -122,7 +122,10 @@ Run `netmark` with no arguments. The prompt shows which roles are active:
 Client | Server >
 ```
 
-- **`help`** lists every command.
+- **`help`** lists every command. `help <command>` narrows it to one command and
+  its subcommands, in the same words the command itself uses: `help start`,
+  `help configure tcp`, `help client 0 remote`, `help configure limits udp`.
+  `help sctp` opens the detailed SCTP page.
 - **Up and down arrows** walk the command history. Position 0 is the line you are
   typing; pressing up moves back through earlier commands and pressing down comes
   forward again, returning your unfinished line when you reach position 0.
@@ -166,7 +169,8 @@ interface and REST API listen on is visible without opening the configuration.
 
 ## Command reference
 
-Everything the prompt accepts. `help` prints the same list.
+Everything the prompt accepts. `help` prints the same list, and `help <command>`
+prints just the rows for that command.
 
 ### Roles
 
@@ -202,8 +206,46 @@ still works.
 | `configure udp jitter <ms>` | Deliberate jitter added to UDP sends |
 | `configure udp max jitter <ms>` | Fail the run above this measured UDP jitter |
 | `configure bandwidth limit <bytes/sec>` | Minimum acceptable throughput; 0 disables |
+| `configure limits` | Show every per-protocol limit that can fail a run |
+| `configure limits <tcp\|sctp\|udp\|ip> status` | Show one protocol's limits |
+| `configure limits <tcp\|sctp\|udp\|ip> <parameter> <value>` | Set a limit; 0 removes it |
+| `configure limits <tcp\|sctp\|udp\|ip> clear` | Remove every limit for one protocol |
 | `configure save` | Write the current settings to netmark.config |
 | `configure reset` | Reload netmark.config, discarding session changes |
+
+#### Per-protocol limits
+
+`configure limits` decides when a run fails, per transport, so the same limit
+never has to mean two things. `help configure limits tcp` lists the parameters
+one protocol accepts:
+
+| Parameter | Protocols | Fails the run when |
+| --- | --- | --- |
+| `min-sent-bytes` | all | fewer bytes were sent in the run |
+| `min-received-bytes` | all | fewer bytes were received in the run |
+| `min-sent-bytes-per-second` | all | the sending throughput was lower |
+| `min-received-bytes-per-second` | all | the receiving throughput was lower |
+| `max-jitter-millis` | tcp, sctp, udp | the measured jitter was higher |
+| `max-lost-packets` | udp | more packets were lost |
+| `max-out-of-order-packets` | udp | more packets arrived out of order |
+
+A value of 0 means the limit is not checked, which is the default for all of
+them. Only the limits of the transport a run used are applied, and every limit
+that was missed is named in the run's failure reason. `configure save` writes
+them to `netmark.config` under `traffic.limits`.
+
+```
+> configure limits udp max-lost-packets 5
+udp max-lost-packets limit set to 5
+> configure limits udp status
+udp min-sent-bytes                       not set
+udp min-received-bytes                   not set
+udp min-sent-bytes-per-second            not set
+udp min-received-bytes-per-second        not set
+udp max-jitter-millis                    not set
+udp max-lost-packets                     5
+udp max-out-of-order-packets             not set
+```
 
 ### WebRTC
 
@@ -252,7 +294,7 @@ clients:
 | `start` / `stop` | Start and stop a run; `stop` names the transport it stopped, ends an SCTP association and debriefs over the same transport |
 | `sctp` | Detailed SCTP help: kernel support, how to select, run and stop it |
 | `sctp status` | Whether the kernel can open an SCTP socket |
-| `selftest` | Three seconds of UDP to localhost, start to verdict |
+| `selftest` | Three seconds to localhost over udp, tcp, sctp and ip in turn, each start to verdict; a transport this host cannot carry is skipped with the reason |
 | `benchmark duration <seconds>` | Flood the remote with TCP and report bandwidth |
 | `status` | Current counters, bandwidth up and down, and the state of everything else, as a table |
 | `list` | Every run with its role, result and bandwidth |
@@ -692,9 +734,11 @@ that authenticates.
 ## The web interface and the web CLI
 
 `GET /` on the REST API address serves a self-contained page with a **web CLI**:
-a browser terminal over `POST /api/v1/cli` that understands `help`, `status`,
-`list`, `show <id>`, `clients`, `sctp` and `profile`. Runs are started by posting a
-profile — JSON or an unchanged YAML file from `profiles/` — to `/api/v1/runs`.
+a browser terminal over `POST /api/v1/cli`. It runs the same command core as the
+shell CLI (`src/session.rs`), so every command in the reference above behaves the
+same way and prints byte-identical output in both places, and its prompt shows
+the same roles. Runs can also be started by posting a profile — JSON or an
+unchanged YAML file from `profiles/` — to `/api/v1/runs`.
 
 Above the terminal the page shows a **status section**: what is running right
 now, the transport in use, whether the kernel supports SCTP, the current run and
