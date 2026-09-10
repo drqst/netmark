@@ -846,6 +846,67 @@ fn enabled_word(enabled: bool) -> &'static str {
     if enabled { "enabled" } else { "disabled" }
 }
 
+/// Command: sctp — the detailed help page for the SCTP transport, shown by the
+/// CLI as a table and by the web CLI as text.
+pub fn sctp_help_rows() -> Vec<Vec<String>> {
+    vec![
+        vec![
+            "what it is".into(),
+            "SCTP (IP protocol 132) as a one-to-one stream, framed and counted exactly like TCP".into(),
+        ],
+        vec![
+            "kernel support".into(),
+            format!(
+                "{}; Linux needs the sctp module (modprobe sctp)",
+                crate::restapi::sctp_status()
+            ),
+        ],
+        vec![
+            "select it".into(),
+            "configure type sctp (or packet_type: sctp in a test profile)".into(),
+        ],
+        vec![
+            "run it".into(),
+            "server enable and/or client <id> enable, then start; both roles use port 9000".into(),
+        ],
+        vec![
+            "stop it".into(),
+            "stop ends the association, debriefs the server over protocol=sctp and prints transport=sctp".into(),
+        ],
+        vec![
+            "pacing".into(),
+            "configure tcp bytes <bytes/sec> paces SCTP too; udp_rate and packet size do not apply".into(),
+        ],
+        vec![
+            "jitter limits".into(),
+            "SCTP shares the TCP jitter budget: configure tcp jitter <ms> and configure tcp maxjitter <ms>".into(),
+        ],
+        vec![
+            "counters".into(),
+            "SCTP bytes are reported in the TCP/SCTP columns of status, debriefs and metrics".into(),
+        ],
+        vec![
+            "limits".into(),
+            "IPv4 destinations only, one association per client, and no multi-homing or multi-streaming".into(),
+        ],
+        vec![
+            "status".into(),
+            "status shows the SCTP row here and on the web page, live while a run is going".into(),
+        ],
+    ]
+}
+
+pub fn print_sctp_help(
+    stdout_guard: &Arc<Mutex<()>>,
+    output: &Arc<Mutex<std::process::ChildStdin>>,
+) {
+    let mut output = output.lock().unwrap();
+    let _ = writeln!(output, "HIDE");
+    let _ = output.flush();
+    let _guard = stdout_guard.lock().unwrap();
+    cli_textout::table(&sctp_help_rows(), &[16, 84]);
+}
+
 pub fn print_status(metrics: &Metrics, context: &StatusContext<'_>) {
     cli_textout::table(&status_rows(metrics, context), &[16, 80]);
 }
@@ -935,6 +996,10 @@ pub fn help_rows() -> Vec<Vec<String>> {
         vec![
             "configure type <tcp|sctp|udp|ip>".into(),
             "pick the transport; SCTP needs kernel support and raw IP needs CAP_NET_RAW".into(),
+        ],
+        vec![
+            "sctp".into(),
+            "detailed SCTP help: kernel support, how to select, run and stop it".into(),
         ],
         vec![
             "configure tcp bytes <bytes/sec>".into(),

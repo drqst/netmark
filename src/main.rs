@@ -97,7 +97,7 @@ fn main() {
     let monitor = Arc::new(monitor::MonitorState::new());
     monitor
         .clone()
-        .spawn_worker(log_dir.clone(), Arc::clone(&sql));
+        .spawn_worker(log_dir.clone(), Arc::clone(&external));
     let (output_stdin, stdout_guard) = start_output_process();
     let output = Arc::new(Mutex::new(output_stdin));
     {
@@ -168,7 +168,7 @@ fn main() {
             }) if modifiers.contains(KeyModifiers::CONTROL) => {
                 cli_textout::line("");
                 running.store(false, Ordering::Relaxed);
-                monitor.stop(&log_dir);
+                monitor.stop(&log_dir, &sql);
                 disable_raw_mode().ok();
                 clear_input_line();
                 cli_textout::line("exiting");
@@ -441,14 +441,14 @@ fn main() {
                     }
                     // Subcommand: monitor start
                     ["monitor", "start"] => {
-                        if let Some(id) = monitor.start(&log_dir) {
+                        if let Some(id) = monitor.start(&log_dir, &sql) {
                             cli_textout::line(format!("monitor started {id}"));
                         } else {
                             cli_textout::line("monitor already running");
                         }
                     }
                     ["monitor", "stop"] => {
-                        monitor.stop(&log_dir);
+                        monitor.stop(&log_dir, &sql);
                         cli_textout::line("monitor stopped");
                     }
                     // Subcommand: monitor history
@@ -559,7 +559,13 @@ fn main() {
                             &outcome,
                         );
                         netmark::write_log_line(&log_dir, &outcome.report_line(run_id));
-                        cli_textout::line(format!("stopped {}", outcome.report_line(run_id)));
+                        // The transport is named on stop so an SCTP run is not
+                        // mistaken for the TCP counters it shares.
+                        cli_textout::line(format!(
+                            "stopped transport={} {}",
+                            config.lock().unwrap().packet_type.as_str(),
+                            outcome.report_line(run_id)
+                        ));
                     }
                     // Command: status
                     ["status"] => print_status(
@@ -610,6 +616,12 @@ fn main() {
                         Ok(()) => {}
                         Err(error) => cli_textout::line(format!("sql error: {error}")),
                     },
+                    // Command: sctp — the detailed SCTP help page
+                    ["sctp"] => print_sctp_help(&stdout_guard, &output),
+                    ["sctp", "status"] => {
+                        cli_textout::line(format!("SCTP: {}", netmark::restapi::sctp_status()))
+                    }
+                    ["sctp", ..] => cli_textout::line("sctp: (no argument for the help page) | status"),
                     // Command: help
                     ["help"] => print_help(&stdout_guard, &output),
                     // Command: quit | exit
@@ -642,7 +654,7 @@ fn main() {
     }
     stopping.store(true, Ordering::Relaxed);
     running.store(false, Ordering::Relaxed);
-    monitor.stop(&log_dir);
+    monitor.stop(&log_dir, &sql);
     disable_raw_mode().ok();
     if let Some(started) = run_started {
         write_run_event(&log_dir, run_id, "Completed");

@@ -546,6 +546,7 @@ impl SqlState {
         let connection = Connection::open(database_path()).map_err(|e| e.to_string())?;
         connection.execute_batch("CREATE TABLE IF NOT EXISTS run_counter (id INTEGER PRIMARY KEY CHECK (id = 1), next_id INTEGER NOT NULL); INSERT OR IGNORE INTO run_counter (id, next_id) VALUES (1, 1);").map_err(|e| e.to_string())?;
         connection.execute_batch("CREATE TABLE IF NOT EXISTS runs (id INTEGER PRIMARY KEY, started_utc TEXT NOT NULL); CREATE TABLE IF NOT EXISTS alarms (timestamp_utc TEXT NOT NULL, target TEXT NOT NULL, error TEXT NOT NULL);").map_err(|e| e.to_string())?;
+        connection.execute_batch(MONITOR_STATUS_TABLE).map_err(|e| e.to_string())?;
         connection.execute_batch("CREATE TABLE IF NOT EXISTS debriefs (run_id INTEGER NOT NULL, timestamp_utc TEXT NOT NULL, role TEXT NOT NULL, protocol TEXT NOT NULL, sent_packets INTEGER NOT NULL, sent_bytes INTEGER NOT NULL, received_packets INTEGER NOT NULL, received_bytes INTEGER NOT NULL, lost_packets INTEGER NOT NULL, out_of_order_packets INTEGER NOT NULL, matched INTEGER NOT NULL, mismatch_reason TEXT, PRIMARY KEY (run_id, role));").map_err(|e| e.to_string())?;
         let _ = connection.execute("UPDATE run_counter SET next_id = MAX(next_id, COALESCE((SELECT MAX(id) + 1 FROM runs), 1)) WHERE id = 1", []);
         let _ = connection.execute("ALTER TABLE runs ADD COLUMN completed_utc TEXT", []);
@@ -626,7 +627,9 @@ impl SqlState {
         connection
             .as_ref()
             .ok_or_else(|| "local SQL is disabled".to_string())?
-            .execute_batch("DELETE FROM alarms; DELETE FROM debriefs; DELETE FROM runs;")
+            .execute_batch(
+                "DELETE FROM alarms; DELETE FROM monitor_status; DELETE FROM debriefs; DELETE FROM runs;",
+            )
             .map_err(|error| error.to_string())
     }
     /// Stores this host's side of an end-of-run debrief. The client and the server
@@ -749,24 +752,30 @@ impl SqlState {
             .optional()
             .map_err(|e| e.to_string())
     }
-    pub fn record_alarm(&self, timestamp_utc: &str, target: &str, error: &str) {
+    /// Local SQLite keeps only that the monitor was started or stopped; every
+    /// check it performs is written to the external (PostgreSQL) database.
+    pub fn record_monitor_status(&self, timestamp_utc: &str, monitor_id: u64, status: &str) {
         if !self.enabled.load(Ordering::Relaxed) {
             return;
         }
         let role = self.role();
         let mut connection = self.connection.lock().unwrap();
-        if connection.is_none() && let Ok(value) = Connection::open(database_path()) {
-                let _ = value.execute_batch("CREATE TABLE IF NOT EXISTS alarms (timestamp_utc TEXT NOT NULL, target TEXT NOT NULL, error TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'unknown')");
-                *connection = Some(value);
+        if connection.is_none()
+            && let Ok(value) = Connection::open(database_path())
+        {
+            *connection = Some(value);
         }
         if let Some(connection) = connection.as_ref() {
+            let _ = connection.execute_batch(MONITOR_STATUS_TABLE);
             let _ = connection.execute(
-                "INSERT INTO alarms (timestamp_utc, target, error, role) VALUES (?1, ?2, ?3, ?4)",
-                params![timestamp_utc, target, error, role],
+                "INSERT INTO monitor_status (timestamp_utc, monitor_id, status, role) VALUES (?1, ?2, ?3, ?4)",
+                params![timestamp_utc, monitor_id, status, role],
             );
         }
     }
 }
+
+const MONITOR_STATUS_TABLE: &str = "CREATE TABLE IF NOT EXISTS monitor_status (timestamp_utc TEXT NOT NULL, monitor_id INTEGER NOT NULL, status TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'unknown')";
 
 pub fn timestamp() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
@@ -1476,6 +1485,12 @@ fn sctp_client(
         }
     };
     send_stream_packets(bytes_per_second, PacketType::Sctp, stopping, metrics, &mut log, runtime, jitter_millis, client_id, webrtc, |packet| stream.write_all(packet));
+    // `stop` ends the association explicitly so the receiving side sees the end
+    // of the run at once instead of waiting for its own runtime to expire.
+    match stream.shutdown() {
+        Ok(()) => { writeln!(log, "{} SCTP association closed", timestamp()).ok(); }
+        Err(error) => { writeln!(log, "{} SCTP shutdown failed: {error}", timestamp()).ok(); }
+    }
 }
 #[allow(clippy::too_many_arguments)]
 fn udp_client(

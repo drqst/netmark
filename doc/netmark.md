@@ -249,7 +249,9 @@ clients:
 
 | Command | Effect |
 | --- | --- |
-| `start` / `stop` | Start and stop a run |
+| `start` / `stop` | Start and stop a run; `stop` names the transport it stopped, ends an SCTP association and debriefs over the same transport |
+| `sctp` | Detailed SCTP help: kernel support, how to select, run and stop it |
+| `sctp status` | Whether the kernel can open an SCTP socket |
 | `selftest` | Three seconds of UDP to localhost, start to verdict |
 | `benchmark duration <seconds>` | Flood the remote with TCP and report bandwidth |
 | `status` | Current counters, bandwidth up and down, and the state of everything else, as a table |
@@ -344,7 +346,10 @@ two counts line up exactly.
 A reliable, message-oriented SCTP association paced by `tcp_bytes_per_second`.
 The host kernel must support SCTP; netmark reports the socket error if it does
 not. SCTP shares the stream framing and TCP jitter budget, while TCP-only MSS,
-MTU and window values remain zero for SCTP runs.
+MTU and window values remain zero for SCTP runs. `stop` ends the association so
+the receiving side sees the end of the run at once. The `sctp` command prints a
+detailed help page covering all of that, including whether this kernel supports
+SCTP; it is available in the web CLI too.
 
 ### UDP
 
@@ -605,8 +610,8 @@ In `log/` next to the binary:
 
 ### Local SQLite
 
-`log/netmark.sqlite`, always on. Three tables — `runs`, `debriefs` and `alarms` —
-and **every one of them has a `role` column** saying which side wrote the row:
+`log/netmark.sqlite`, always on. Four tables — `runs`, `debriefs`, `alarms` and
+`monitor_status` — and **every one of them has a `role` column** saying which side wrote the row:
 `client`, `server`, `client+server` or `none`. A database copied off any host
 therefore says plainly what that host was doing.
 
@@ -616,6 +621,9 @@ SELECT run_id, role, matched, mismatch_reason FROM debriefs;
 ```
 
 Millisecond-level metrics are never stored here; they only go to external SQL.
+The same is true of monitoring: SQLite keeps only `monitor_status`, one row for
+each time the monitor was started or stopped, while every check itself is stored
+in the external database.
 
 ### External SQL
 
@@ -632,8 +640,17 @@ for you, if you want one.
 ## Monitoring and alerts
 
 `monitor IP <url>` and `monitor start` fetch a URL every 30 seconds, counting
-successes and failures and logging every failure to `alarm.log` and the `alarms`
-table.
+successes and failures and logging every failure to `alarm.log`.
+
+**All monitor data is stored in the external (PostgreSQL) database**, one row per
+check in `netmark_monitor` with the timestamp, monitor id, call id, target,
+result, latency in milliseconds and the failure detail. The local SQLite database
+holds only the start and stop status, in `monitor_status`. Checks made while no
+external database is connected are logged but not stored.
+
+```sql
+SELECT timestamp_utc, target, result, latency_millis FROM netmark_monitor ORDER BY timestamp_utc;
+```
 
 SMTP is configured with `configure smtp <host[:port]>` and turned on with
 `admin smtp enabled`, which first opens a connection and completes an EHLO
@@ -676,7 +693,7 @@ that authenticates.
 
 `GET /` on the REST API address serves a self-contained page with a **web CLI**:
 a browser terminal over `POST /api/v1/cli` that understands `help`, `status`,
-`list`, `show <id>`, `clients` and `profile`. Runs are started by posting a
+`list`, `show <id>`, `clients`, `sctp` and `profile`. Runs are started by posting a
 profile — JSON or an unchanged YAML file from `profiles/` — to `/api/v1/runs`.
 
 Above the terminal the page shows a **status section**: what is running right

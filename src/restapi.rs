@@ -393,6 +393,7 @@ impl RestApi {
                 "  list          runs recorded in the local database\n",
                 "  show <id>     summary and debriefs for one run\n",
                 "  clients       configured clients\n",
+                "  sctp          detailed SCTP help and kernel support\n",
                 "  profile       the default test profile as JSON\n",
                 "\n",
                 "Start runs by POSTing a profile (JSON or YAML) to /api/v1/runs,\n",
@@ -400,6 +401,11 @@ impl RestApi {
             )
             .to_string(),
             ["status"] => self.status_text(),
+            ["sctp"] => crate::cli::sctp_help_rows()
+                .iter()
+                .map(|row| format!("{:<16}{}", row[0], row[1]))
+                .collect::<Vec<_>>()
+                .join("\n"),
             ["list"] => match SqlState::new().run_list() {
                 Ok(runs) if runs.is_empty() => "no runs recorded".to_string(),
                 Ok(runs) => runs.join("\n"),

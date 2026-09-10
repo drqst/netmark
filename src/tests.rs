@@ -1647,3 +1647,142 @@ fn start_at_blocks_until_the_agreed_instant() {
     let error = crate::wait_until(Some("tuesday")).unwrap_err();
     assert!(error.contains("RFC 3339"), "{error}");
 }
+
+/// The web server address is reported the same way at start-up and in `status`,
+/// including the port, and says so plainly when nothing is listening.
+#[test]
+fn the_web_server_port_is_reported() {
+    assert_eq!(
+        crate::cli::web_server_status("0.0.0.0:8080", "127.0.0.1:8081"),
+        "listening on http://0.0.0.0:8080 (port 8080)"
+    );
+    let stopped = crate::cli::web_server_status("", "127.0.0.1:8081");
+    assert!(stopped.starts_with("not listening"), "{stopped}");
+    assert!(stopped.contains("127.0.0.1:8081"), "{stopped}");
+}
+
+/// The `sctp` help page documents the whole life cycle of an SCTP run, so the
+/// CLI and the web CLI can both explain the transport without the manual.
+#[test]
+fn the_sctp_help_page_covers_the_transport() {
+    let rows = crate::cli::sctp_help_rows();
+    assert!(
+        rows.iter().all(|row| row.len() == 2),
+        "every help row must be a label and a value"
+    );
+    let labels: Vec<&str> = rows.iter().map(|row| row[0].as_str()).collect();
+    for label in [
+        "what it is",
+        "kernel support",
+        "select it",
+        "run it",
+        "stop it",
+        "counters",
+    ] {
+        assert!(labels.contains(&label), "sctp help has no {label} row");
+    }
+    assert!(
+        crate::cli::help_rows()
+            .iter()
+            .any(|row| row[0] == "sctp" && !row[1].is_empty()),
+        "help does not mention the sctp command"
+    );
+}
+
+/// The status the web page polls has to describe what is happening right now,
+/// including the transport, SCTP support and the byte counters of a live run.
+#[test]
+fn live_status_follows_a_run() {
+    let api = Arc::new(crate::restapi::RestApi::new(
+        Arc::new(Clients::new(Vec::new())),
+        std::env::temp_dir(),
+    ));
+    let metrics = Arc::new(Metrics::new());
+    api.live().attach_metrics(Arc::clone(&metrics));
+
+    assert!(api.live().activity().starts_with("idle"));
+
+    metrics.add_test_bytes(true, PacketType::Sctp, 4096);
+    api.live().update(
+        true,
+        7,
+        PacketType::Sctp,
+        true,
+        1,
+        Some(Duration::from_secs(2)),
+    );
+    let activity = api.live().activity();
+    assert!(activity.contains("SCTP"), "{activity}");
+    assert!(activity.contains("run 7"), "{activity}");
+
+    api.live().update(false, 7, PacketType::Sctp, true, 1, None);
+    assert!(api.live().activity().starts_with("idle"));
+}
+
+/// Monitor checks belong in the external database; the local SQLite database
+/// only records that the monitor was started and stopped.
+#[test]
+fn monitor_status_is_the_only_monitor_data_in_local_sqlite() {
+    let sql = Arc::new(SqlState::new());
+    sql.enable().unwrap();
+    let log_dir = std::env::temp_dir().join(format!("netmark-monitor-{}", std::process::id()));
+    std::fs::create_dir_all(&log_dir).unwrap();
+    let monitor = Arc::new(crate::monitor::MonitorState::new());
+
+    let connection = rusqlite::Connection::open(crate::core::database_path()).unwrap();
+    // The database outlives the test process, so only rows written here count.
+    let baseline: i64 = connection
+        .query_row("SELECT COALESCE(MAX(rowid), 0) FROM monitor_status", [], |row| row.get(0))
+        .unwrap();
+
+    let id = monitor.start(&log_dir, &sql).expect("monitor did not start");
+    assert!(monitor.is_running());
+    assert!(monitor.start(&log_dir, &sql).is_none(), "started twice");
+    monitor.stop(&log_dir, &sql);
+    assert!(!monitor.is_running());
+
+    let mut statement = connection
+        .prepare("SELECT status FROM monitor_status WHERE rowid > ?1 AND monitor_id = ?2 ORDER BY rowid")
+        .unwrap();
+    let recorded: Vec<String> = statement
+        .query_map(rusqlite::params![baseline, id], |row| row.get::<_, String>(0))
+        .unwrap()
+        .map(|status| status.unwrap())
+        .collect();
+    assert_eq!(recorded, vec!["started".to_string(), "stopped".to_string()]);
+    let _ = std::fs::remove_dir_all(&log_dir);
+}
+
+/// A whole SCTP run, from `start` through the traffic to the `stop` debrief, on
+/// kernels that support SCTP. Where the kernel does not, the run is skipped
+/// rather than failed, which is exactly what `sctp status` reports.
+#[test]
+fn sctp_runs_end_to_end_when_the_kernel_supports_it() {
+    let _test_lock = TIMED_TEST_LOCK.lock().unwrap();
+    if let Err(error) = crate::sctp::availability() {
+        eprintln!("skipping SCTP end-to-end test: {error}");
+        return;
+    }
+    let log_dir = std::env::temp_dir().join(format!("netmark-sctp-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&log_dir);
+    let mut profile = crate::configuration::TestProfile::default();
+    profile.server.enabled = true;
+    profile.clients[0].enabled = true;
+    profile.traffic.packet_type = "sctp".to_string();
+    profile.traffic.tcp_bytes_per_second = 4096;
+    profile.traffic.client_runtime = 3;
+    profile.traffic.server_runtime = 3;
+    profile.duration_seconds = 3;
+
+    let report = crate::sdk::TestRunner::new(profile)
+        .log_dir(log_dir.clone())
+        .run()
+        .unwrap();
+    assert!(report.passed, "{:?}", report.failure_reason);
+    assert_eq!(report.packet_type, "sctp");
+    assert!(report.sent_bytes() > 0, "no SCTP bytes were sent");
+    let debrief = report.debrief.as_ref().expect("SCTP run has no debrief");
+    assert_eq!(debrief.protocol, "sctp");
+    assert!(debrief.matched(), "{}", debrief.summary());
+    let _ = std::fs::remove_dir_all(&log_dir);
+}

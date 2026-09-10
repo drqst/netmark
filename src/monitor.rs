@@ -1,4 +1,5 @@
 use crate::core::SqlState;
+use crate::metrics::ExternalSqlMetrics;
 use reqwest::blocking::Client;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
@@ -7,7 +8,11 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// The external metrics database as the CLI holds it: it can be connected and
+/// disconnected while the monitor is running.
+pub type ExternalSql = Arc<Mutex<Option<Arc<ExternalSqlMetrics>>>>;
 
 pub struct MonitorState {
     target: Mutex<Option<String>>,
@@ -34,31 +39,35 @@ impl MonitorState {
     pub fn set_target(&self, target: String) {
         *self.target.lock().unwrap() = Some(target);
     }
-    pub fn start(&self, log_dir: &Path) -> Option<u64> {
+    /// Subcommand: monitor start. Only the start status is kept locally; the
+    /// checks themselves go to the external database.
+    pub fn start(&self, log_dir: &Path, sql: &SqlState) -> Option<u64> {
         if self.running.swap(true, Ordering::Relaxed) {
             None
         } else {
             let id = self.next_monitor_id.fetch_add(1, Ordering::Relaxed);
             self.monitor_id.store(id, Ordering::Relaxed);
+            let timestamp = crate::core::timestamp();
             append(
                 log_dir,
                 "monitor.log",
-                &format!("{} monitor-id={} Started", crate::core::timestamp(), id),
+                &format!("{timestamp} monitor-id={id} Started"),
             );
+            sql.record_monitor_status(&timestamp, id, "started");
             Some(id)
         }
     }
-    pub fn stop(&self, log_dir: &Path) {
+    /// Subcommand: monitor stop.
+    pub fn stop(&self, log_dir: &Path, sql: &SqlState) {
         if self.running.swap(false, Ordering::Relaxed) {
+            let id = self.monitor_id.load(Ordering::Relaxed);
+            let timestamp = crate::core::timestamp();
             append(
                 log_dir,
                 "monitor.log",
-                &format!(
-                    "{} monitor-id={} Stopped",
-                    crate::core::timestamp(),
-                    self.monitor_id.load(Ordering::Relaxed)
-                ),
+                &format!("{timestamp} monitor-id={id} Stopped"),
             );
+            sql.record_monitor_status(&timestamp, id, "stopped");
         }
     }
     pub fn is_running(&self) -> bool {
@@ -73,7 +82,9 @@ impl MonitorState {
             self.failures.load(Ordering::Relaxed),
         )
     }
-    pub fn spawn_worker(self: Arc<Self>, log_dir: PathBuf, sql: Arc<SqlState>) {
+    /// The checking loop. Every check, successful or not, is written to the
+    /// external database; local SQLite only holds the start/stop status.
+    pub fn spawn_worker(self: Arc<Self>, log_dir: PathBuf, external: ExternalSql) {
         thread::spawn(move || {
             let client = match Client::builder().timeout(Duration::from_secs(10)).build() {
                 Ok(client) => client,
@@ -85,11 +96,13 @@ impl MonitorState {
                 {
                         let call_id = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
                         let timestamp = crate::core::timestamp();
+                        let started = Instant::now();
                         let result = client
                             .get(&target)
                             .send()
                             .and_then(|response| response.error_for_status())
                             .and_then(|response| response.bytes().map(|_| ()));
+                        let latency_millis = started.elapsed().as_millis() as u64;
                         let (word, detail) = match result {
                             Ok(_) => {
                                 self.successes.fetch_add(1, Ordering::Relaxed);
@@ -119,7 +132,23 @@ impl MonitorState {
                                     call_id
                                 ),
                             );
-                            sql.record_alarm(&timestamp, &target, &detail);
+                        }
+                        if let Some(sink) = external.lock().unwrap().clone()
+                            && let Err(error) = sink.write_monitor(
+                                &timestamp,
+                                self.monitor_id.load(Ordering::Relaxed),
+                                call_id,
+                                &target,
+                                word,
+                                latency_millis,
+                                &detail,
+                            )
+                        {
+                            append(
+                                &log_dir,
+                                "alarm.log",
+                                &format!("{timestamp} monitor data not stored: {error}"),
+                            );
                         }
                 }
                 thread::sleep(Duration::from_secs(30));
