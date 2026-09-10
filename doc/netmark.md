@@ -644,13 +644,15 @@ alert is needed. `admin smtp status` re-runs that check on demand.
 from `/api/v1/openapi.yaml`.
 
 ```
+GET  /                        the web interface with the web CLI
 GET  /api/v1/health
 GET  /api/v1/openapi.yaml
 GET  /api/v1/profile          a default profile to use as a template
 GET  /api/v1/clients
 GET  /api/v1/runs
 GET  /api/v1/runs/{id}
-POST /api/v1/runs             body: a test profile; runs it and returns the report
+POST /api/v1/runs             body: a test profile (JSON or YAML); runs it and returns the report
+POST /api/v1/cli              body: {"command": "..."}; runs a web CLI command
 ```
 
 ```sh
@@ -662,6 +664,59 @@ It defaults to `127.0.0.1:8081`. **The API is unauthenticated and can start
 traffic runs**, so it stays on loopback unless you deliberately move it with
 `restapi enable <address>`, and it should only ever be exposed behind something
 that authenticates.
+
+---
+
+## The web interface and the web CLI
+
+`GET /` on the REST API address serves a self-contained page with a **web CLI**:
+a browser terminal over `POST /api/v1/cli` that understands `help`, `status`,
+`list`, `show <id>`, `clients` and `profile`. Runs are started by posting a
+profile — JSON or an unchanged YAML file from `profiles/` — to `/api/v1/runs`.
+
+The same commands work from bash/shell through the `netmarkctl` script in the
+repository root, so a netmark service can be controlled both from the browser
+and locally from a terminal:
+
+```sh
+./netmarkctl status
+./netmarkctl list
+./netmarkctl show 215
+./netmarkctl run profiles/udp-10kbps.yaml
+NETMARK_URL=http://other-host:8080 ./netmarkctl status   # point it elsewhere
+```
+
+For containers and services there is a headless mode that skips the interactive
+terminal and only serves the web interface and the REST API:
+
+```sh
+netmark --serve                 # the configured (loopback) REST API address
+netmark --serve 0.0.0.0:8080    # explicit address, e.g. inside a container
+```
+
+---
+
+## Running in Kubernetes
+
+`init.sh` brings up a complete local deployment. With [kind](https://kind.sigs.k8s.io)
+installed it creates a cluster from `k8s/kind-config.yaml` with three nodes:
+
+- a control plane,
+- a **database node** (label `netmark.io/role: database`) running
+  PostgreSQL with Timescale (`k8s/postgres.yaml`) on a persistent volume claim
+  for its data,
+- an **app node** (label `netmark.io/role: app`) running the netmark
+  application (`k8s/netmark.yaml`, image built from `k8s/Dockerfile.netmark`)
+  in `--serve` mode, wired to the database service.
+
+Both deployments prefer their labeled node but still schedule on single-node
+clusters such as Docker Desktop. The app node's NodePort 30080 is mapped to the
+host, so after `init.sh` finishes:
+
+- the web interface and web CLI are at <http://127.0.0.1:8080>,
+- `./netmarkctl <command>` controls the same service from the shell,
+- PostgreSQL is port-forwarded to `127.0.0.1:5433` and the connection string is
+  written into `netmark.config` for a host-side netmark.
 
 ---
 

@@ -1,0 +1,19 @@
+# Builds the netmark application image for the Kubernetes app node.
+# Build from the repository root: docker build -t netmark-app:local -f k8s/Dockerfile.netmark .
+FROM rust:1-alpine AS build
+RUN apk add --no-cache musl-dev
+WORKDIR /src
+COPY Cargo.toml Cargo.lock build.rs init.sh check.sh netmark.config ./
+COPY src ./src
+COPY doc ./doc
+COPY examples ./examples
+RUN cargo build --release
+
+FROM alpine:3.20
+WORKDIR /opt/netmark
+COPY --from=build /src/target/release/netmark ./netmark
+COPY profiles ./profiles
+# 8080: web interface and REST API; 9000/9001: traffic server ports.
+EXPOSE 8080 9000 9001
+ENTRYPOINT ["/opt/netmark/netmark"]
+CMD ["--serve", "0.0.0.0:8080"]

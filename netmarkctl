@@ -1,0 +1,54 @@
+#!/bin/sh
+# Host CLI for a netmark web service, so a netmark running in Kubernetes (or
+# anywhere else) can be controlled from bash/shell as well as from the browser.
+#
+# Usage:
+#   ./netmarkctl help                     web CLI help
+#   ./netmarkctl status                   version and whether a run is in progress
+#   ./netmarkctl list                     runs recorded in the database
+#   ./netmarkctl show <id>                summary and debriefs for one run
+#   ./netmarkctl clients                  configured clients
+#   ./netmarkctl profile                  the default test profile as JSON
+#   ./netmarkctl run <profile.yaml>       start a run from a profile file
+#   ./netmarkctl health                   raw health JSON
+#
+# NETMARK_URL selects the service; the default matches the port that init.sh
+# maps from the kind app node to the host.
+set -eu
+
+NETMARK_URL=${NETMARK_URL:-http://127.0.0.1:8080}
+
+usage() {
+  sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+  exit 1
+}
+
+command -v curl >/dev/null 2>&1 || { echo "curl is required" >&2; exit 1; }
+[ $# -ge 1 ] || usage
+
+case $1 in
+  run)
+    [ $# -eq 2 ] || usage
+    [ -f "$2" ] || { echo "no such profile: $2" >&2; exit 1; }
+    curl -sS -X POST --data-binary "@$2" "$NETMARK_URL/api/v1/runs"
+    echo
+    ;;
+  health)
+    curl -sS "$NETMARK_URL/api/v1/health"
+    echo
+    ;;
+  *)
+    # Everything else goes through the same web CLI the browser uses.
+    body=$(printf '{"command": "%s"}' "$*")
+    response=$(curl -sS -X POST -H 'Content-Type: application/json' \
+      --data "$body" "$NETMARK_URL/api/v1/cli")
+    # Print the "output" field as plain text when python3 is available,
+    # otherwise fall back to the raw JSON.
+    if command -v python3 >/dev/null 2>&1; then
+      printf '%s' "$response" | python3 -c \
+        'import json,sys; b=json.load(sys.stdin); print(b.get("output", b.get("error", "")))'
+    else
+      printf '%s\n' "$response"
+    fi
+    ;;
+esac

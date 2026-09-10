@@ -40,6 +40,17 @@ spec:
       labels:
         app: netmark-postgres
     spec:
+      affinity:
+        nodeAffinity:
+          # Prefer the dedicated database node from kind-config.yaml, but still
+          # schedule on single-node clusters such as Docker Desktop.
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: netmark.io/role
+                    operator: In
+                    values: [database]
       containers:
         - name: postgres
           image: timescale/timescaledb:latest-pg16

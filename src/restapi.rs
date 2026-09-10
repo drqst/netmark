@@ -22,6 +22,10 @@ use std::time::Duration;
 /// so the running service can never disagree with the shipped documentation.
 pub const OPENAPI: &str = include_str!("../doc/openapi.yaml");
 
+/// The web interface: a single self-contained page with a web CLI that drives
+/// [`RestApi::cli_command`]. Embedded so the binary stays self-sufficient.
+pub const WEB_UI: &str = include_str!("webcli.html");
+
 const MAX_BODY: u64 = 64 * 1024;
 const MAX_HEADERS: usize = 64;
 const MAX_LINE: u64 = 8 * 1024;
@@ -102,20 +106,25 @@ impl RestApi {
         stream.set_nonblocking(false).ok();
         stream.set_read_timeout(Some(IO_TIMEOUT)).ok();
         stream.set_write_timeout(Some(IO_TIMEOUT)).ok();
-        let (status, body) = match Request::read(&stream) {
-            Ok(request) => self.route(&request),
-            Err(error) => (400, json!({ "error": error })),
-        };
-        let payload = if status == 200 && body.is_string() {
-            // The OpenAPI document is served as YAML, not wrapped in JSON.
-            body.as_str().unwrap_or_default().to_string()
-        } else {
-            body.to_string()
-        };
-        let content_type = if status == 200 && body.is_string() {
-            "application/yaml"
-        } else {
-            "application/json"
+        let (status, content_type, payload) = match Request::read(&stream) {
+            Ok(request) => {
+                let (status, body) = self.route(&request);
+                match (request.path.as_str(), status, body.is_string()) {
+                    // The OpenAPI document is served as YAML, not wrapped in JSON.
+                    ("/api/v1/openapi.yaml", 200, true) => (
+                        status,
+                        "application/yaml",
+                        body.as_str().unwrap_or_default().to_string(),
+                    ),
+                    ("/" | "/index.html", 200, true) => (
+                        status,
+                        "text/html; charset=utf-8",
+                        body.as_str().unwrap_or_default().to_string(),
+                    ),
+                    _ => (status, "application/json", body.to_string()),
+                }
+            }
+            Err(error) => (400, "application/json", json!({ "error": error }).to_string()),
         };
         let mut writer = &stream;
         let _ = write!(
@@ -138,6 +147,8 @@ impl RestApi {
                 }),
             ),
             ("GET", "/api/v1/openapi.yaml") => (200, Value::String(OPENAPI.to_string())),
+            ("GET", "/" | "/index.html") => (200, Value::String(WEB_UI.to_string())),
+            ("POST", "/api/v1/cli") => self.cli_command(&request.body),
             ("GET", "/api/v1/clients") => (
                 200,
                 json!({
@@ -185,8 +196,92 @@ impl RestApi {
         }
     }
 
+    /// The web CLI: a small text command set over the same state the REST API
+    /// exposes, so the browser terminal and `netmarkctl` behave like the local CLI.
+    fn cli_command(&self, body: &str) -> (u16, Value) {
+        let request: Value = match serde_json::from_str(body) {
+            Ok(value) => value,
+            Err(error) => return (400, json!({ "error": format!("invalid JSON body: {error}") })),
+        };
+        let Some(command) = request.get("command").and_then(Value::as_str) else {
+            return (400, json!({ "error": "body must be {\"command\": \"...\"}" }));
+        };
+        let output = match command.split_whitespace().collect::<Vec<_>>().as_slice() {
+            [] | ["help"] => concat!(
+                "Commands:\n",
+                "  help          this text\n",
+                "  status        service version and whether a run is in progress\n",
+                "  list          runs recorded in the local database\n",
+                "  show <id>     summary and debriefs for one run\n",
+                "  clients       configured clients\n",
+                "  profile       the default test profile as JSON\n",
+                "\n",
+                "Start runs by POSTing a profile (JSON or YAML) to /api/v1/runs,\n",
+                "for example with netmarkctl: netmarkctl run profiles/udp-10kbps.yaml"
+            )
+            .to_string(),
+            ["status"] => format!(
+                "netmark {} - run in progress: {}",
+                env!("CARGO_PKG_VERSION"),
+                if self.busy.load(Ordering::Relaxed) { "yes" } else { "no" }
+            ),
+            ["list"] => match SqlState::new().run_list() {
+                Ok(runs) if runs.is_empty() => "no runs recorded".to_string(),
+                Ok(runs) => runs.join("\n"),
+                Err(error) => return (500, json!({ "error": error })),
+            },
+            ["show", id] => match id.parse::<u64>() {
+                Ok(id) => {
+                    let sql = SqlState::new();
+                    match sql.show_run(id) {
+                        Ok(Some(summary)) => {
+                            let mut lines = vec![summary];
+                            lines.extend(sql.debriefs(id).unwrap_or_default());
+                            lines.join("\n")
+                        }
+                        Ok(None) => format!("no local record for run {id}"),
+                        Err(error) => return (500, json!({ "error": error })),
+                    }
+                }
+                Err(_) => return (400, json!({ "error": "run id must be a number" })),
+            },
+            ["clients"] => {
+                let clients = self.clients.list();
+                if clients.is_empty() {
+                    "no clients configured".to_string()
+                } else {
+                    clients
+                        .iter()
+                        .map(|client| {
+                            format!(
+                                "client {} -> {} ({})",
+                                client.id,
+                                client.remote,
+                                if client.enabled { "enabled" } else { "disabled" }
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                }
+            }
+            ["profile"] => serde_json::to_string_pretty(&TestProfile::default())
+                .unwrap_or_else(|error| error.to_string()),
+            _ => {
+                return (
+                    400,
+                    json!({ "error": format!("unknown command: {command}. Type 'help'.") }),
+                );
+            }
+        };
+        (200, json!({ "output": output }))
+    }
+
     fn start_run(&self, body: &str) -> (u16, Value) {
-        let profile: TestProfile = match serde_json::from_str(body) {
+        // Accept both JSON and YAML so profile files can be posted unchanged.
+        let profile: TestProfile = match serde_json::from_str(body)
+            .map_err(|error| error.to_string())
+            .or_else(|_| serde_yaml::from_str(body).map_err(|error| error.to_string()))
+        {
             Ok(profile) => profile,
             Err(error) => {
                 return (

@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>netmark web CLI</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #101418; color: #d7e0e8; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  header { padding: 0.6rem 1rem; background: #161c23; border-bottom: 1px solid #2a333d; font-weight: bold; }
+  header span { color: #6aa84f; }
+  #terminal { padding: 1rem; height: calc(100vh - 8.5rem); overflow-y: auto; white-space: pre-wrap; word-break: break-word; }
+  .cmd { color: #6aa84f; }
+  .err { color: #e06c75; }
+  form { display: flex; gap: 0.5rem; padding: 0.75rem 1rem; background: #161c23; border-top: 1px solid #2a333d; }
+  #prompt { color: #6aa84f; align-self: center; }
+  input { flex: 1; background: #101418; color: #d7e0e8; border: 1px solid #2a333d; border-radius: 4px; padding: 0.5rem; font: inherit; }
+  input:focus { outline: 1px solid #6aa84f; }
+</style>
+</head>
+<body>
+<header>netmark <span>web CLI</span> &mdash; type <span>help</span> for commands</header>
+<div id="terminal"></div>
+<form id="form">
+  <span id="prompt">netmark&gt;</span>
+  <input id="input" autocomplete="off" autofocus spellcheck="false" placeholder="help">
+</form>
+<script>
+  const terminal = document.getElementById('terminal');
+  const input = document.getElementById('input');
+  const history = [];
+  let historyIndex = 0;
+
+  function print(text, cls) {
+    const line = document.createElement('div');
+    if (cls) line.className = cls;
+    line.textContent = text;
+    terminal.appendChild(line);
+    terminal.scrollTop = terminal.scrollHeight;
+  }
+
+  async function run(command) {
+    print('netmark> ' + command, 'cmd');
+    try {
+      const response = await fetch('/api/v1/cli', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ command })
+      });
+      const body = await response.json();
+      if (body.output !== undefined) print(body.output);
+      else print(body.error || ('HTTP ' + response.status), 'err');
+    } catch (error) {
+      print(String(error), 'err');
+    }
+  }
+
+  document.getElementById('form').addEventListener('submit', event => {
+    event.preventDefault();
+    const command = input.value.trim();
+    input.value = '';
+    if (!command) return;
+    history.push(command);
+    historyIndex = history.length;
+    run(command);
+  });
+
+  input.addEventListener('keydown', event => {
+    if (event.key === 'ArrowUp' && historyIndex > 0) {
+      historyIndex -= 1;
+      input.value = history[historyIndex];
+      event.preventDefault();
+    } else if (event.key === 'ArrowDown') {
+      historyIndex = Math.min(historyIndex + 1, history.length);
+      input.value = history[historyIndex] || '';
+      event.preventDefault();
+    }
+  });
+
+  run('help');
+</script>
+</body>
+</html>
