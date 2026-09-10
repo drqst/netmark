@@ -139,69 +139,70 @@ impl Clients {
     }
 }
 
-/// Subcommand dispatcher for `client <id> <...>`.
-pub fn client_command(clients: &Clients, id: u64, args: &[&str], log_dir: &std::path::Path) {
+/// Subcommand dispatcher for `client <id> <...>`; returns the reply text so the
+/// terminal and the web CLI print the same wording.
+pub fn client_command(clients: &Clients, id: u64, args: &[&str], log_dir: &std::path::Path) -> String {
     if clients.get(id).is_none() {
-        cli_textout::line(format!("no client {id}; use: client add"));
-        return;
+        return format!("no client {id}; use: client add");
     }
     match args {
         ["enable"] => {
             clients.update(id, |client| client.enabled = true);
-            cli_textout::line(format!("client {id} enabled"));
+            format!("client {id} enabled")
         }
         ["disable"] => {
             clients.update(id, |client| client.enabled = false);
-            cli_textout::line(format!("client {id} disabled"));
+            format!("client {id} disabled")
         }
         ["remote", host] => {
             clients.update(id, |client| client.remote = (*host).to_string());
-            cli_textout::line(format!("client {id} remote set to {host}"));
+            format!("client {id} remote set to {host}")
         }
         ["runtime", value] => match value.parse::<u64>() {
             Ok(value) => {
                 clients.update(id, |client| client.runtime = Some(value));
-                cli_textout::line(format!("client {id} runtime set to {value} seconds"));
+                format!("client {id} runtime set to {value} seconds")
             }
-            Err(_) => cli_textout::line("runtime must be a non-negative integer"),
+            Err(_) => "runtime must be a non-negative integer".to_string(),
         },
         ["jitter", value] => match value.parse::<u64>() {
             Ok(value) => {
                 clients.update(id, |client| client.jitter_millis = Some(value));
-                cli_textout::line(format!("client {id} jitter set to {value} ms"));
+                format!("client {id} jitter set to {value} ms")
             }
-            Err(_) => cli_textout::line("jitter must be milliseconds"),
+            Err(_) => "jitter must be milliseconds".to_string(),
         },
         ["webrtc", value] => match *value {
             "on" | "enable" | "true" => {
                 clients.update(id, |client| client.webrtc = Some(true));
-                cli_textout::line(format!("client {id} sends WebRTC data channels"));
+                format!("client {id} sends WebRTC data channels")
             }
             "off" | "disable" | "false" => {
                 clients.update(id, |client| client.webrtc = Some(false));
-                cli_textout::line(format!("client {id} sends plain traffic"));
+                format!("client {id} sends plain traffic")
             }
             "follow" => {
                 clients.update(id, |client| client.webrtc = None);
-                cli_textout::line(format!("client {id} follows the webrtc command"));
+                format!("client {id} follows the webrtc command")
             }
-            _ => cli_textout::line("client <id> webrtc: on | off | follow"),
+            _ => "client <id> webrtc: on | off | follow".to_string(),
         },
         ["http", "check", url] => client_http_check(log_dir, url),
-        ["status"] => {
-            cli_textout::line(clients.get(id).map(|c| c.summary()).unwrap_or_default())
-        }
-        _ => cli_textout::line(CLIENT_USAGE),
+        ["status"] => clients.get(id).map(|c| c.summary()).unwrap_or_default(),
+        _ => CLIENT_USAGE.to_string(),
     }
 }
 
 pub const CLIENT_USAGE: &str = "client: list | add | delete <id> | <id> enable | <id> disable | <id> remote <ip> | <id> runtime <seconds> | <id> jitter <ms> | <id> webrtc <on|off|follow> | <id> http check <url> | <id> status";
 
-/// Subcommand: client list
-pub fn list_clients(clients: &Clients) {
-    for client in clients.list() {
-        cli_textout::line(client.summary());
-    }
+/// Subcommand: client list — every client and its settings, one per line.
+pub fn list_clients(clients: &Clients) -> String {
+    clients
+        .list()
+        .iter()
+        .map(|client| client.summary())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 pub const WEBRTC_USAGE: &str =
@@ -238,7 +239,7 @@ pub fn webrtc_command(
 }
 
 /// Subcommand: client runtime <seconds> | server runtime <seconds>
-pub fn set_runtime(config: &Arc<Mutex<Config>>, client: bool, value: &str) {
+pub fn set_runtime(config: &Arc<Mutex<Config>>, client: bool, value: &str) -> String {
     match value.parse::<u64>() {
         Ok(value) => {
             if client {
@@ -246,9 +247,9 @@ pub fn set_runtime(config: &Arc<Mutex<Config>>, client: bool, value: &str) {
             } else {
                 config.lock().unwrap().server_runtime = value;
             }
-            cli_textout::line(format!("runtime set to {value} seconds"));
+            format!("runtime set to {value} seconds")
         }
-        Err(_) => cli_textout::line("runtime must be a non-negative integer"),
+        Err(_) => "runtime must be a non-negative integer".to_string(),
     }
 }
 
@@ -258,7 +259,7 @@ pub fn update_admin_email(
     config: &Arc<Mutex<Config>>,
     address: &str,
     add: bool,
-) {
+) -> String {
     let mut config = config.lock().unwrap();
     if add {
         if !config.admin_emails.iter().any(|email| email == address) {
@@ -271,14 +272,15 @@ pub fn update_admin_email(
     document.admin.emails = config.admin_emails.clone();
     match serde_yaml::to_string(&document) {
         Ok(contents) => match std::fs::write(path, contents) {
-            Ok(()) => cli_textout::line(if add {
+            Ok(()) => if add {
                 "administrator email added"
             } else {
                 "administrator email deleted"
-            }),
-            Err(error) => cli_textout::line(format!("config write error: {error}")),
+            }
+            .to_string(),
+            Err(error) => format!("config write error: {error}"),
         },
-        Err(error) => cli_textout::line(format!("config serialize error: {error}")),
+        Err(error) => format!("config serialize error: {error}"),
     }
 }
 
@@ -352,22 +354,22 @@ pub fn set_smtp_enabled(
     path: &std::path::Path,
     smtp: &Arc<Mutex<configuration::SmtpConfig>>,
     enabled: bool,
-) {
+) -> String {
     let server = smtp.lock().unwrap().server.clone();
+    let mut lines = Vec::new();
     if enabled {
         let Some(server) = server.filter(|server| !server.trim().is_empty()) else {
-            cli_textout::line("no SMTP server configured; use: configure smtp <host[:port]>");
-            return;
+            return "no SMTP server configured; use: configure smtp <host[:port]>".to_string();
         };
         match crate::smtp::check(&server) {
-            Ok(result) => cli_textout::line(format!(
+            Ok(result) => lines.push(format!(
                 "SMTP check succeeded: {} ({} ms, {})",
                 result.target, result.elapsed_millis, result.greeting
             )),
             Err(error) => {
-                cli_textout::line(format!("SMTP check failed: {error}"));
-                cli_textout::line("SMTP not enabled");
-                return;
+                lines.push(format!("SMTP check failed: {error}"));
+                lines.push("SMTP not enabled".to_string());
+                return lines.join("\n");
             }
         }
     }
@@ -376,20 +378,17 @@ pub fn set_smtp_enabled(
     document.smtp = smtp.lock().unwrap().clone();
     match serde_yaml::to_string(&document).map_err(|error| error.to_string()) {
         Ok(contents) => match std::fs::write(path, contents) {
-            Ok(()) => cli_textout::line(if enabled {
-                "SMTP enabled"
-            } else {
-                "SMTP disabled"
-            }),
-            Err(error) => cli_textout::line(format!("config write error: {error}")),
+            Ok(()) => lines.push(if enabled { "SMTP enabled" } else { "SMTP disabled" }.to_string()),
+            Err(error) => lines.push(format!("config write error: {error}")),
         },
-        Err(error) => cli_textout::line(format!("config serialize error: {error}")),
+        Err(error) => lines.push(format!("config serialize error: {error}")),
     }
+    lines.join("\n")
 }
 
 /// Subcommand: admin smtp status — reports the configured server, whether SMTP is
 /// enabled, and whether the server currently answers.
-pub fn smtp_status(smtp: &Arc<Mutex<configuration::SmtpConfig>>) {
+pub fn smtp_status(smtp: &Arc<Mutex<configuration::SmtpConfig>>) -> String {
     let settings = smtp.lock().unwrap().clone();
     let state = if settings.enabled {
         "enabled"
@@ -397,13 +396,13 @@ pub fn smtp_status(smtp: &Arc<Mutex<configuration::SmtpConfig>>) {
         "disabled"
     };
     match settings.server.as_deref().filter(|s| !s.trim().is_empty()) {
-        None => cli_textout::line(format!("SMTP {state}, no server configured")),
+        None => format!("SMTP {state}, no server configured"),
         Some(server) => match crate::smtp::check(server) {
-            Ok(result) => cli_textout::line(format!(
+            Ok(result) => format!(
                 "SMTP {state}, {} reachable ({} ms, {})",
                 result.target, result.elapsed_millis, result.greeting
-            )),
-            Err(error) => cli_textout::line(format!("SMTP {state}, {server} unreachable: {error}")),
+            ),
+            Err(error) => format!("SMTP {state}, {server} unreachable: {error}"),
         },
     }
 }
@@ -417,7 +416,9 @@ pub fn normalize_http_target(target: &str) -> String {
     }
 }
 
-/// Command: selftest — sends UDP traffic to localhost for 3 seconds and stops automatically.
+/// Command: selftest — sends UDP traffic to localhost for 3 seconds and stops
+/// automatically. Returns the line announcing the run; the completion line is
+/// printed asynchronously when the run ends.
 pub fn run_selftest(
     config: &Arc<Mutex<Config>>,
     stopping: &Arc<AtomicBool>,
@@ -426,10 +427,9 @@ pub fn run_selftest(
     sql: &Arc<SqlState>,
     external: &Arc<Mutex<Option<Arc<ExternalSqlMetrics>>>>,
     log_dir: &std::path::Path,
-) {
+) -> String {
     if running.swap(true, Ordering::Relaxed) {
-        cli_textout::line("already running");
-        return;
+        return "already running".to_string();
     }
     let run_id = sql.next_run_id(1);
     sql.set_role(core::ROLE_BOTH);
@@ -470,7 +470,7 @@ pub fn run_selftest(
     );
     sql.start_run(run_id);
     gate.start();
-    cli_textout::line(format!("selftest started run {run_id}"));
+    let announcement = format!("selftest started run {run_id}");
     let stop = Arc::clone(stopping);
     let state = Arc::clone(running);
     let sql_state = Arc::clone(sql);
@@ -519,10 +519,12 @@ pub fn run_selftest(
         cli_textout::raw("\r\n");
         cli_textout::line(format!("selftest completed {}", outcome.report_line(run_id)));
     });
+    announcement
 }
 
-/// Command: benchmark duration <seconds> — floods the remote server with TCP and reports bandwidth.
-pub fn run_benchmark(remote: &str, seconds: u64, sql: &SqlState, log_dir: &std::path::Path) {
+/// Command: benchmark duration <seconds> — floods the remote server with TCP and
+/// reports bandwidth. Returns the summary line.
+pub fn run_benchmark(remote: &str, seconds: u64, sql: &SqlState, log_dir: &std::path::Path) -> String {
     let run_id = sql.next_run_id(1);
     crate::write_run_event(log_dir, run_id, "Starting");
     sql.start_run(run_id);
@@ -541,8 +543,7 @@ pub fn run_benchmark(remote: &str, seconds: u64, sql: &SqlState, log_dir: &std::
                 },
             );
             crate::write_run_event(log_dir, run_id, "Completed");
-            cli_textout::line(format!("benchmark run {run_id} failed: {error}"));
-            return;
+            return format!("benchmark run {run_id} failed: {error}");
         }
     };
     let packet = [0u8; 64 * 1024];
@@ -587,7 +588,7 @@ pub fn run_benchmark(remote: &str, seconds: u64, sql: &SqlState, log_dir: &std::
         "benchmark run {run_id}: {bytes} bytes in {elapsed_ms} ms up={bytes_per_second} bytes/sec down=0 bytes/sec"
     );
     crate::write_log_line(log_dir, &line);
-    cli_textout::line(line);
+    line
 }
 
 /// Subcommand dispatcher for `configure <...>`: tcp bytes, tcp/udp jitter,
@@ -659,17 +660,14 @@ pub fn configure(config: &Arc<Mutex<Config>>, args: &[&str]) -> Result<(), Strin
 pub const CONFIGURE_USAGE: &str = "configure: metrics <connection> | save | reset | smtp <host[:port]> | type <tcp|sctp|udp|ip> | tcp bytes <bytes/sec> | tcp window <bytes> | tcp jitter <ms> | tcp maxjitter <ms> | udp_rate <packets/sec> | udp packetsize <bytes> | udp jitter <ms> | udp max jitter <ms> | bandwidth limit <bytes/sec>";
 
 /// Subcommand: client http check <url>
-pub fn client_http_check(log_dir: &std::path::Path, url: &str) {
+pub fn client_http_check(log_dir: &std::path::Path, url: &str) -> String {
     let url = normalize_http_target(url);
     let client = match reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
     {
         Ok(client) => client,
-        Err(error) => {
-            cli_textout::line(format!("HTTP client error: {error}"));
-            return;
-        }
+        Err(error) => return format!("HTTP client error: {error}"),
     };
     let started = Instant::now();
     match client
@@ -680,10 +678,6 @@ pub fn client_http_check(log_dir: &std::path::Path, url: &str) {
         Ok(response) => match response.bytes() {
             Ok(body) => {
                 let elapsed = started.elapsed().as_millis();
-                cli_textout::line(format!(
-                    "HTTP check succeeded: {url} ({elapsed} ms, {} bytes)",
-                    body.len()
-                ));
                 if let Ok(mut log) = OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -698,10 +692,14 @@ pub fn client_http_check(log_dir: &std::path::Path, url: &str) {
                         body.len()
                     );
                 }
+                format!(
+                    "HTTP check succeeded: {url} ({elapsed} ms, {} bytes)",
+                    body.len()
+                )
             }
-            Err(error) => cli_textout::line(format!("HTTP body error: {error}")),
+            Err(error) => format!("HTTP body error: {error}"),
         },
-        Err(error) => cli_textout::line(format!("HTTP check failed: {error}")),
+        Err(error) => format!("HTTP check failed: {error}"),
     }
 }
 
@@ -911,8 +909,9 @@ pub fn print_status(metrics: &Metrics, context: &StatusContext<'_>) {
     cli_textout::table(&status_rows(metrics, context), &[16, 80]);
 }
 
-/// Subcommand: monitor history
-pub fn show_monitor_history(log_dir: &std::path::Path) {
+/// Subcommand: monitor history — monitor events and alarms, newest last.
+pub fn show_monitor_history(log_dir: &std::path::Path) -> String {
+    let mut lines = Vec::new();
     for name in ["netmark.log", "alarm.log"] {
         if let Ok(contents) = std::fs::read_to_string(log_dir.join(name)) {
             for line in contents.lines() {
@@ -920,23 +919,64 @@ pub fn show_monitor_history(log_dir: &std::path::Path) {
                     || line.contains("Monitor started")
                     || line.contains("Monitor stopped")
                 {
-                    cli_textout::line(line);
+                    lines.push(line.to_string());
                 }
             }
         }
     }
+    lines.join("\n")
 }
 
-/// Command: help
+/// Command: help [<command> ...]
 pub fn print_help(
     stdout_guard: &Arc<Mutex<()>>,
     output: &Arc<Mutex<std::process::ChildStdin>>,
+    topic: &[&str],
 ) {
     let mut output = output.lock().unwrap();
     let _ = writeln!(output, "HIDE");
     let _ = output.flush();
     let _guard = stdout_guard.lock().unwrap();
-    cli_textout::table(&help_rows(), &[36, 64]);
+    match help_for(topic) {
+        Ok(rows) => cli_textout::table(&rows, &[36, 64]),
+        Err(message) => cli_textout::line(message),
+    }
+}
+
+/// `help` with no arguments lists every command; with arguments it shows the
+/// rows for that command, so `help start`, `help configure tcp` and
+/// `help client 0 remote` all answer with the same table the full list uses.
+pub fn help_for(topic: &[&str]) -> Result<Vec<Vec<String>>, String> {
+    if topic.is_empty() {
+        return Ok(help_rows());
+    }
+    // The transport has a page of its own, which is more useful than its one line.
+    if topic == ["sctp"] {
+        return Ok(sctp_help_rows());
+    }
+    let rows: Vec<Vec<String>> = help_rows()
+        .into_iter()
+        .filter(|row| row[0].split('|').any(|label| label_matches(label, topic)))
+        .collect();
+    if rows.is_empty() {
+        Err(format!(
+            "no help for \"{}\"; type 'help' for every command",
+            topic.join(" ")
+        ))
+    } else {
+        Ok(rows)
+    }
+}
+
+/// A help row answers a topic when its command words match word for word.
+/// Placeholders such as `<id>` match whatever the operator typed there.
+fn label_matches(label: &str, topic: &[&str]) -> bool {
+    let words: Vec<&str> = label.split_whitespace().collect();
+    topic.iter().enumerate().all(|(index, word)| {
+        words.get(index).is_some_and(|candidate| {
+            candidate.starts_with('<') || candidate.eq_ignore_ascii_case(word)
+        })
+    })
 }
 
 pub fn help_rows() -> Vec<Vec<String>> {

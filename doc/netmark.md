@@ -731,11 +731,18 @@ installed it creates a cluster from `k8s/kind-config.yaml` with three nodes:
 
 - a control plane,
 - a **database node** (label `netmark.io/role: database`) running
-  PostgreSQL with Timescale (`k8s/postgres.yaml`) on a persistent volume claim
-  for its data,
+  `k8s/postgres.yaml`,
 - an **app node** (label `netmark.io/role: app`) running the netmark
   application (`k8s/netmark.yaml`, image built from `k8s/Dockerfile.netmark`)
   in `--serve` mode, wired to the database service.
+
+The cluster is kept to three containers:
+
+| Container | Where | What it does |
+| --- | --- | --- |
+| `postgres` | `k8s/postgres.yaml` | PostgreSQL with Timescale; holds all run metrics and all monitor data |
+| `volume` | `k8s/postgres.yaml` | Owns the persistent volume claim, checks it is writable and reports how full it is |
+| `netmark` | `k8s/netmark.yaml` | The web server: the web CLI and the REST API on port 8080 |
 
 Both deployments prefer their labeled node but still schedule on single-node
 clusters such as Docker Desktop. The app node's NodePort 30080 is mapped to the
@@ -745,6 +752,14 @@ host, so after `init.sh` finishes:
 - `./netmarkctl <command>` controls the same service from the shell,
 - PostgreSQL is port-forwarded to `127.0.0.1:5433` and the connection string is
   written into `netmark.config` for a host-side netmark.
+
+`k8s/cluster-test.sh` checks that the cluster is up and healthy. It runs one
+case per expectation — the API is reachable, the namespace exists, the
+`postgres` and `volume` containers are deployed, both deployments have a ready
+replica, the data volume is bound, PostgreSQL accepts connections, the volume
+container owns the data volume, and the web server answers both `/api/v1/status`
+and the web CLI — printing `ok` or `FAIL` for each and exiting non-zero if any
+case fails. Set `NETMARK_NAMESPACE` or `NETMARK_WEB` to test another deployment.
 
 ---
 

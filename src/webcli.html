@@ -16,6 +16,9 @@
   #status .value { color: #d7e0e8; }
   #status.running .value#activity { color: #6aa84f; }
   #status.stale .value { color: #e06c75; }
+  #light { display: inline-block; width: 0.6rem; height: 0.6rem; border-radius: 50%; background: #4b5866; align-self: center; }
+  #status.running #light { background: #6aa84f; }
+  #status.stale #light { background: #e06c75; }
   .cmd { color: #6aa84f; }
   .err { color: #e06c75; }
   form { display: flex; gap: 0.5rem; padding: 0.75rem 1rem; background: #161c23; border-top: 1px solid #2a333d; }
@@ -25,9 +28,9 @@
 </style>
 </head>
 <body>
-<header>netmark <span>web CLI</span> &mdash; type <span>help</span> for commands</header>
+<header>netmark <span>web CLI</span> &mdash; the same commands as the shell CLI; type <span>help</span>, or <span>help start</span> for one command</header>
 <section id="status" aria-live="polite">
-  <div><span class="label">status</span><span class="value" id="activity">connecting&hellip;</span></div>
+  <div><span id="light" title="traffic activity"></span><span class="label">status</span><span class="value" id="activity">connecting&hellip;</span></div>
   <div><span class="label">transport</span><span class="value" id="transport">-</span></div>
   <div><span class="label">sctp</span><span class="value" id="sctp">-</span></div>
   <div><span class="label">run</span><span class="value" id="run">-</span></div>
@@ -57,8 +60,10 @@
     terminal.scrollTop = terminal.scrollHeight;
   }
 
+  let promptText = 'netmark>';
+
   async function run(command) {
-    print('netmark> ' + command, 'cmd');
+    print(promptText + ' ' + command, 'cmd');
     try {
       const response = await fetch('/api/v1/cli', {
         method: 'POST',
@@ -119,10 +124,21 @@
       set('server', body.server_enabled ? 'enabled' : 'disabled');
       set('clients', body.clients_enabled + ' enabled');
       set('web', body.web_address || body.web_server || '-');
+      promptText = shellPrompt(body);
+      document.getElementById('prompt').textContent = promptText;
     } catch (error) {
       status.classList.add('stale');
       set('activity', 'status unavailable: ' + error);
     }
+  }
+
+  // The prompt mirrors the shell CLI, which names the roles that are on and
+  // whether a run is going.
+  function shellPrompt(body) {
+    const parts = [];
+    if (body.clients_enabled > 0) parts.push(body.running ? 'Client Running' : 'Client');
+    if (body.server_enabled) parts.push(body.running ? 'Server Running' : 'Server');
+    return (parts.join(' | ') + ' >').trim();
   }
 
   refreshStatus();

@@ -1,3 +1,6 @@
+# The netmark cluster keeps three containers: this file holds the PostgreSQL
+# container and the volume container that owns the data volume, and
+# netmark.yaml holds the web server container.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -69,6 +72,23 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
+        # The volume container: it owns the persistent volume, prepares it for
+        # PostgreSQL before the database writes to it and then reports how full
+        # it is, so storage is inspectable without entering the database.
+        - name: volume
+          image: alpine:3.20
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - >-
+              test -w /data || echo "warning: the data volume is not writable";
+              while true; do
+              echo "netmark data volume: $(df -h /data | tail -n 1)";
+              sleep 300;
+              done
+          volumeMounts:
+            - name: data
+              mountPath: /data
       volumes:
         - name: data
           persistentVolumeClaim:

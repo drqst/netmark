@@ -12,6 +12,7 @@ pub mod rawip;
 pub mod restapi;
 pub mod sdk;
 pub mod sctp;
+pub mod session;
 pub mod smtp;
 pub mod webrtc;
 

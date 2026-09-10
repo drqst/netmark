@@ -9,6 +9,7 @@ use crate::cli::Clients;
 use crate::configuration::{RestApiConfig, TestProfile};
 use crate::core::{Metrics, PacketType, SqlState};
 use crate::sdk::TestRunner;
+use crate::session::Session;
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -39,6 +40,10 @@ pub struct RestApi {
     clients: Arc<Clients>,
     log_dir: PathBuf,
     live: Arc<LiveStatus>,
+    /// When attached, `POST /api/v1/cli` runs every command through the same
+    /// dispatcher as the interactive shell CLI. Absent for the read-only,
+    /// state-free command set the tests rely on.
+    session: Mutex<Option<Arc<Session>>>,
 }
 
 /// What this instance is doing right now. The CLI and the SDK keep it up to
@@ -141,7 +146,14 @@ impl RestApi {
             clients,
             log_dir,
             live: Arc::new(LiveStatus::default()),
+            session: Mutex::new(None),
         }
+    }
+
+    /// Attaches a [`Session`] so the web CLI runs the full shell command set;
+    /// without it, only the read-only commands are served.
+    pub fn attach_session(&self, session: Arc<Session>) {
+        *self.session.lock().unwrap() = Some(session);
     }
 
     /// The live status this instance publishes; the CLI updates it as runs start
@@ -375,8 +387,10 @@ impl RestApi {
         }
     }
 
-    /// The web CLI: a small text command set over the same state the REST API
-    /// exposes, so the browser terminal and `netmarkctl` behave like the local CLI.
+    /// The web CLI: with a [`Session`] attached it runs the full shell command
+    /// set; otherwise it serves a small read-only command set over the same
+    /// state the REST API exposes. The `clients`, `profile` and `show <id>`
+    /// helpers work either way so `netmarkctl` keeps functioning.
     fn cli_command(&self, body: &str) -> (u16, Value) {
         let request: Value = match serde_json::from_str(body) {
             Ok(value) => value,
@@ -385,7 +399,27 @@ impl RestApi {
         let Some(command) = request.get("command").and_then(Value::as_str) else {
             return (400, json!({ "error": "body must be {\"command\": \"...\"}" }));
         };
-        let output = match command.split_whitespace().collect::<Vec<_>>().as_slice() {
+        let tokens = command.split_whitespace().collect::<Vec<_>>();
+        // Compatibility helpers the local CLI has no direct equivalent for.
+        match tokens.as_slice() {
+            ["clients"] => return (200, json!({ "output": self.clients_text() })),
+            ["profile"] => {
+                return (
+                    200,
+                    json!({ "output": serde_json::to_string_pretty(&TestProfile::default())
+                        .unwrap_or_else(|error| error.to_string()) }),
+                );
+            }
+            ["show", id] => return self.web_show(id),
+            _ => {}
+        }
+        // With a session attached, every other command runs through the same
+        // dispatcher as the interactive shell CLI.
+        let session = self.session.lock().unwrap().clone();
+        if let Some(session) = session {
+            return (200, json!({ "output": session.execute(command) }));
+        }
+        let output = match tokens.as_slice() {
             [] | ["help"] => concat!(
                 "Commands:\n",
                 "  help          this text\n",
@@ -411,42 +445,6 @@ impl RestApi {
                 Ok(runs) => runs.join("\n"),
                 Err(error) => return (500, json!({ "error": error })),
             },
-            ["show", id] => match id.parse::<u64>() {
-                Ok(id) => {
-                    let sql = SqlState::new();
-                    match sql.show_run(id) {
-                        Ok(Some(summary)) => {
-                            let mut lines = vec![summary];
-                            lines.extend(sql.debriefs(id).unwrap_or_default());
-                            lines.join("\n")
-                        }
-                        Ok(None) => format!("no local record for run {id}"),
-                        Err(error) => return (500, json!({ "error": error })),
-                    }
-                }
-                Err(_) => return (400, json!({ "error": "run id must be a number" })),
-            },
-            ["clients"] => {
-                let clients = self.clients.list();
-                if clients.is_empty() {
-                    "no clients configured".to_string()
-                } else {
-                    clients
-                        .iter()
-                        .map(|client| {
-                            format!(
-                                "client {} -> {} ({})",
-                                client.id,
-                                client.remote,
-                                if client.enabled { "enabled" } else { "disabled" }
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                }
-            }
-            ["profile"] => serde_json::to_string_pretty(&TestProfile::default())
-                .unwrap_or_else(|error| error.to_string()),
             _ => {
                 return (
                     400,
@@ -455,6 +453,46 @@ impl RestApi {
             }
         };
         (200, json!({ "output": output }))
+    }
+
+    /// The configured clients as text, shared by both web CLI command sets.
+    fn clients_text(&self) -> String {
+        let clients = self.clients.list();
+        if clients.is_empty() {
+            "no clients configured".to_string()
+        } else {
+            clients
+                .iter()
+                .map(|client| {
+                    format!(
+                        "client {} -> {} ({})",
+                        client.id,
+                        client.remote,
+                        if client.enabled { "enabled" } else { "disabled" }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    }
+
+    /// The web CLI `show <id>` helper: one run's summary and debriefs.
+    fn web_show(&self, id: &str) -> (u16, Value) {
+        match id.parse::<u64>() {
+            Ok(id) => {
+                let sql = SqlState::new();
+                match sql.show_run(id) {
+                    Ok(Some(summary)) => {
+                        let mut lines = vec![summary];
+                        lines.extend(sql.debriefs(id).unwrap_or_default());
+                        (200, json!({ "output": lines.join("\n") }))
+                    }
+                    Ok(None) => (200, json!({ "output": format!("no local record for run {id}") })),
+                    Err(error) => (500, json!({ "error": error })),
+                }
+            }
+            Err(_) => (400, json!({ "error": "run id must be a number" })),
+        }
     }
 
     fn start_run(&self, body: &str) -> (u16, Value) {

@@ -1786,3 +1786,97 @@ fn sctp_runs_end_to_end_when_the_kernel_supports_it() {
     assert!(debrief.matched(), "{}", debrief.summary());
     let _ = std::fs::remove_dir_all(&log_dir);
 }
+
+/// The session dispatcher backs both the shell CLI and the web CLI, so it must
+/// answer representative commands with exactly the shell wording.
+#[test]
+fn session_executes_commands_like_the_shell_cli() {
+    let _test_lock = TIMED_TEST_LOCK.lock().unwrap();
+    let log_dir = std::env::temp_dir().join(format!("netmark-session-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&log_dir);
+    std::fs::create_dir_all(&log_dir).unwrap();
+    let config_path = log_dir.join("netmark.config");
+
+    let clients = Arc::new(Clients::new(Vec::new()));
+    let api = Arc::new(crate::restapi::RestApi::new(
+        Arc::clone(&clients),
+        log_dir.clone(),
+    ));
+    let session = crate::session::Session::from_config(
+        &crate::configuration::FileConfig::default(),
+        log_dir.clone(),
+        config_path,
+        Arc::clone(&clients),
+        Arc::clone(api.live()),
+        Arc::downgrade(&api),
+    );
+
+    assert_eq!(session.execute("server enable"), "server enabled");
+    assert_eq!(session.execute("client add"), "client 1 added");
+    assert_eq!(session.execute("configure type sctp"), "configuration updated");
+
+    let status = session.execute("status");
+    assert!(status.contains("Traffic"), "{status}");
+    assert!(status.contains("sctp"), "{status}");
+    assert!(status.contains("Server"), "{status}");
+
+    let help_start = session.execute("help start");
+    assert!(help_start.contains("start a traffic run"), "{help_start}");
+
+    let help_tcp = session.execute("help configure tcp");
+    assert!(help_tcp.contains("configure tcp"), "{help_tcp}");
+
+    assert_eq!(
+        session.execute("nonsense"),
+        "unknown command; type 'help' for commands"
+    );
+
+    let _ = std::fs::remove_dir_all(&log_dir);
+}
+
+/// A REST API with a session attached must run state-changing commands over
+/// `POST /api/v1/cli`, just like the interactive shell CLI.
+#[test]
+fn rest_api_with_a_session_runs_cli_commands() {
+    let _test_lock = TIMED_TEST_LOCK.lock().unwrap();
+    let log_dir =
+        std::env::temp_dir().join(format!("netmark-session-cli-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&log_dir);
+    std::fs::create_dir_all(&log_dir).unwrap();
+    let config_path = log_dir.join("netmark.config");
+
+    let clients = Arc::new(Clients::new(Vec::new()));
+    let api = Arc::new(crate::restapi::RestApi::new(
+        Arc::clone(&clients),
+        log_dir.clone(),
+    ));
+    let session = Arc::new(crate::session::Session::from_config(
+        &crate::configuration::FileConfig::default(),
+        log_dir.clone(),
+        config_path,
+        Arc::clone(&clients),
+        Arc::clone(api.live()),
+        Arc::downgrade(&api),
+    ));
+    api.attach_session(Arc::clone(&session));
+
+    let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = probe.local_addr().unwrap().to_string();
+    drop(probe);
+    api.enable(&address).unwrap();
+
+    let base = format!("http://{address}");
+    let http = reqwest::blocking::Client::new();
+    let reply: serde_json::Value = http
+        .post(format!("{base}/api/v1/cli"))
+        .json(&serde_json::json!({ "command": "server enable" }))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(reply["output"], "server enabled");
+    assert!(session.server_enabled());
+
+    api.disable();
+    let _ = std::fs::remove_dir_all(&log_dir);
+}
