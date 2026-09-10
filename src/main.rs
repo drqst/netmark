@@ -33,6 +33,10 @@ fn main() {
         output_process();
         return;
     }
+    if std::env::args().nth(1).as_deref() == Some("--serve") {
+        serve_mode(std::env::args().nth(2));
+        return;
+    }
     if let Some(profile_path) = std::env::args().nth(1) {
         let success = run_auto_mode(std::path::Path::new(&profile_path));
         std::process::exit(if success { 0 } else { 1 });
@@ -631,6 +635,36 @@ fn main() {
     }
     clear_input_line();
     cli_textout::raw("\r\n");
+}
+
+/// Headless server mode for containers and services: no interactive terminal,
+/// just the REST API and the web interface, blocking until the process is
+/// stopped. `netmark --serve [address]`; without an address the configured
+/// (loopback by default) REST API address is used.
+fn serve_mode(address: Option<String>) {
+    let log_dir = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("log");
+    create_dir_all(&log_dir).expect("cannot create log directory");
+    let config_path = configuration::path_near_executable()
+        .unwrap_or_else(|| std::path::PathBuf::from("netmark.config"));
+    let file_config = configuration::load(&config_path).unwrap_or_default();
+    let sql = SqlState::new();
+    sql.enable()
+        .expect("cannot initialize local SQLite database");
+    let clients = Arc::new(Clients::new(file_config.clients.clone()));
+    let restapi = Arc::new(netmark::restapi::RestApi::new(clients, log_dir));
+    let address = address.unwrap_or_else(|| file_config.restapi.address.clone());
+    if let Err(error) = restapi.enable(&address) {
+        eprintln!("cannot start server: {error}");
+        std::process::exit(1);
+    }
+    println!("netmark serving the web interface and REST API on http://{address}");
+    loop {
+        thread::sleep(Duration::from_secs(3600));
+    }
 }
 
 fn redraw_input(server: bool, client: bool, running: &AtomicBool, input: &str) {

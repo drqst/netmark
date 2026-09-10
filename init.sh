@@ -7,6 +7,7 @@ if [ ! -d "$PROJECT_ROOT/k8s" ]; then PROJECT_ROOT=$(CDPATH= cd -- "$ROOT/../.."
 NAMESPACE=${NAMESPACE:-netmark}
 CLUSTER_NAME=${CLUSTER_NAME:-netmark}
 MANIFEST="$PROJECT_ROOT/k8s/postgres.yaml"
+APP_MANIFEST="$PROJECT_ROOT/k8s/netmark.yaml"
 POSTGRES_USER=${POSTGRES_USER:-netmark}
 POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-change-me}
 POSTGRES_DB=${POSTGRES_DB:-netmark}
@@ -25,6 +26,7 @@ if ! command -v kubectl >/dev/null 2>&1; then
 fi
 
 docker build -t netmark-tools:local -f "$PROJECT_ROOT/k8s/Dockerfile" "$PROJECT_ROOT/k8s"
+docker build -t netmark-app:local -f "$PROJECT_ROOT/k8s/Dockerfile.netmark" "$PROJECT_ROOT"
 
 if ! kubectl cluster-info >/dev/null 2>&1; then
   if command -v kind >/dev/null 2>&1; then
@@ -50,6 +52,14 @@ fi
 
 kubectl apply -f "$MANIFEST"
 kubectl -n "$NAMESPACE" rollout status deployment/netmark-postgres --timeout=180s
+
+# The app image is local, so hand it to the kind nodes when kind is in use.
+if command -v kind >/dev/null 2>&1 && kind get clusters 2>/dev/null | grep -qx "$CLUSTER_NAME"; then
+  kind load docker-image netmark-app:local --name "$CLUSTER_NAME"
+fi
+kubectl apply -f "$APP_MANIFEST"
+kubectl -n "$NAMESPACE" rollout status deployment/netmark-app --timeout=180s
+
 kubectl -n "$NAMESPACE" port-forward service/netmark-postgres 5433:5432 >/tmp/netmark-postgres-port-forward.log 2>&1 &
 FORWARD_PID=$!
 trap 'kill "$FORWARD_PID" 2>/dev/null || true' EXIT
@@ -60,6 +70,8 @@ metrics:
   sql: "postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@127.0.0.1:5433/${POSTGRES_DB}"
 EOF
 echo "PostgreSQL/Timescale is ready on 127.0.0.1:5433"
+echo "netmark web interface (web CLI): http://127.0.0.1:8080"
+echo "Host CLI: $PROJECT_ROOT/netmarkctl help"
 echo "Config written to $CONFIG"
 echo "Use: metrics enable"
 wait "$FORWARD_PID"

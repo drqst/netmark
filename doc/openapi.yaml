@@ -20,12 +20,66 @@ servers:
 tags:
   - name: service
     description: Service metadata and contract
+  - name: web
+    description: The web interface and its web CLI
   - name: runs
     description: Starting and inspecting traffic runs
   - name: clients
     description: The sending clients this instance drives
 
 paths:
+  /:
+    get:
+      tags: [web]
+      summary: The web interface
+      description: |
+        A self-contained HTML page with a web CLI (a browser terminal) that
+        drives `POST /api/v1/cli`. Also served as `/index.html`.
+      operationId: getWebInterface
+      responses:
+        "200":
+          description: The web interface page
+          content:
+            text/html:
+              schema:
+                type: string
+
+  /api/v1/cli:
+    post:
+      tags: [web]
+      summary: Run a web CLI command
+      description: |
+        Executes one text command and returns its plain-text output. Used by the
+        web interface and by the `netmarkctl` host script. Commands: `help`,
+        `status`, `list`, `show <id>`, `clients`, `profile`.
+      operationId: runCliCommand
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [command]
+              properties:
+                command:
+                  type: string
+                  example: "show 215"
+      responses:
+        "200":
+          description: The command output
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [output]
+                properties:
+                  output:
+                    type: string
+        "400":
+          $ref: "#/components/responses/Error"
+        "500":
+          $ref: "#/components/responses/Error"
+
   /api/v1/health:
     get:
       tags: [service]
@@ -118,11 +172,17 @@ paths:
       description: |
         Runs the profile synchronously; the response is sent when the run and its
         debrief have completed. Only one run may be in progress at a time.
+
+        The body may be JSON or YAML: a profile file from `profiles/` can be
+        posted unchanged.
       operationId: startRun
       requestBody:
         required: true
         content:
           application/json:
+            schema:
+              $ref: "#/components/schemas/TestProfile"
+          application/yaml:
             schema:
               $ref: "#/components/schemas/TestProfile"
       responses:

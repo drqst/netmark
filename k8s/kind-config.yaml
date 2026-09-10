@@ -2,3 +2,16 @@ kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 nodes:
   - role: control-plane
+  # Dedicated node for PostgreSQL/Timescale and its data volume.
+  - role: worker
+    labels:
+      netmark.io/role: database
+  # Dedicated node for the netmark application and its web interface.
+  - role: worker
+    labels:
+      netmark.io/role: app
+    extraPortMappings:
+      # The netmark web interface / REST API NodePort, reachable from the host.
+      - containerPort: 30080
+        hostPort: 8080
+        protocol: TCP

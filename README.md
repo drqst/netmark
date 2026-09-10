@@ -14,6 +14,7 @@ each other and records the result.
 cargo build --release
 ./target/release/netmark                             # interactive; type `help`
 ./target/release/netmark profiles/udp-10kbps.yaml    # one run, exit 0 or 1
+./init.sh                                            # Kubernetes: database + app with web CLI
 ```
 
 ## What it does
@@ -28,6 +29,9 @@ cargo build --release
   database and the external one.
 - **Monitoring:** periodic HTTP checks with alarms, plus an SMTP connection check.
 - **REST API and Rust SDK** over the same code path as the CLI.
+- **Kubernetes deployment:** `init.sh` brings up a kind cluster with a database
+  node (PostgreSQL/Timescale on a persistent volume) and an app node serving a
+  **web interface with a web CLI**; `./netmarkctl` controls it from the shell.
 
 ## Defaults
 
