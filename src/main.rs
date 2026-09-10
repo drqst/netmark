@@ -89,6 +89,11 @@ fn main() {
     if let Some(error) = netmark::restapi::start_if_enabled(&restapi, &file_config.restapi) {
         eprintln!("REST API not started: {error}");
     }
+    restapi.live().attach_metrics(Arc::clone(&metrics));
+    println!(
+        "netmark web server {}",
+        web_server_status(&restapi.address(), &file_config.restapi.address)
+    );
     let monitor = Arc::new(monitor::MonitorState::new());
     monitor
         .clone()
@@ -120,6 +125,16 @@ fn main() {
     enable_raw_mode().expect("cannot enable terminal input");
     print_prompt(server_enabled, clients.any_enabled(), false);
     loop {
+        // Publishing on every poll tick keeps the web status section live while
+        // the operator is idle at the prompt.
+        restapi.live().update(
+            running.load(Ordering::Relaxed),
+            run_id,
+            config.lock().unwrap().packet_type,
+            server_enabled,
+            clients.enabled().len(),
+            run_started.map(|started| started.elapsed()),
+        );
         if !event::poll(Duration::from_millis(100)).unwrap() {
             continue;
         }
@@ -565,6 +580,10 @@ fn main() {
                                 .map(|sink| sink.status())
                                 .unwrap_or_else(|| "not connected".to_string()),
                             restapi: restapi.status(),
+                            web_server: web_server_status(
+                                &restapi.address(),
+                                &restapi_config.lock().unwrap().address,
+                            ),
                             smtp: smtp.lock().unwrap().enabled,
                         },
                     ),

@@ -143,8 +143,8 @@ Traffic           running (udp)
 Run               42 (7 s elapsed)
 Bandwidth up      10240 bytes/sec
 Bandwidth down    10240 bytes/sec
-Sent              71680 bytes  (TCP 0, UDP 71680, IP 0)
-Received          71680 bytes  (TCP 0, UDP 71680, IP 0)
+Sent              71680 bytes  (TCP/SCTP 0, UDP 71680, IP 0)
+Received          71680 bytes  (TCP/SCTP 0, UDP 71680, IP 0)
 UDP loss          0 lost, 0 out of order
 Jitter            TCP 0 ms, UDP 2 ms
 Server            enabled
@@ -154,8 +154,13 @@ WebRTC            webrtc disabled channels=1 label=netmark ordered=true
 Monitor           on id 1, 12 calls, 12 ok, 0 failed
 Metrics SQL       not connected
 REST API          disabled
+Web server        listening on http://127.0.0.1:8081 (port 8081)
+SCTP              not selected (available)
 SMTP              disabled
 ```
+
+The same web server line is printed when `./netmark` starts, so the port the web
+interface and REST API listen on is visible without opening the configuration.
 
 ---
 
@@ -673,6 +678,12 @@ that authenticates.
 a browser terminal over `POST /api/v1/cli` that understands `help`, `status`,
 `list`, `show <id>`, `clients` and `profile`. Runs are started by posting a
 profile — JSON or an unchanged YAML file from `profiles/` — to `/api/v1/runs`.
+
+Above the terminal the page shows a **status section**: what is running right
+now, the transport in use, whether the kernel supports SCTP, the current run and
+its elapsed time, bytes and bandwidth in both directions, the server and client
+state and the web server address. It polls `GET /api/v1/status` once a second,
+so it follows a run live and is never reloaded.
 
 The same commands work from bash/shell through the `netmarkctl` script in the
 repository root, so a netmark service can be controlled both from the browser

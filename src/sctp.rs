@@ -94,6 +94,12 @@ impl io::Write for SctpStream {
     fn flush(&mut self) -> io::Result<()> { Ok(()) }
 }
 
+/// Whether the host kernel can open an SCTP socket, so `status` can say why an
+/// SCTP run would fail before one is started.
+pub fn availability() -> Result<(), String> {
+    socket().map(|_| ()).map_err(|error| error.to_string())
+}
+
 fn socket() -> io::Result<OwnedFd> {
     // SAFETY: syscall arguments are constants; ownership transfers immediately.
     let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, IPPROTO_SCTP) };

@@ -718,7 +718,20 @@ pub struct StatusContext<'a> {
     pub monitor: (bool, u64, u64, u64, u64),
     pub metrics_sql: String,
     pub restapi: String,
+    /// Where the web interface is listening, from [`web_server_status`].
+    pub web_server: String,
     pub smtp: bool,
+}
+
+/// Where the web interface (and with it the REST API) is listening. Printed when
+/// netmark starts and shown by `status`, so the port never has to be guessed.
+pub fn web_server_status(address: &str, configured: &str) -> String {
+    match address.rsplit_once(':') {
+        Some((_, port)) if !address.is_empty() => {
+            format!("listening on http://{address} (port {port})")
+        }
+        _ => format!("not listening (configured {configured}; start it with: restapi enable)"),
+    }
 }
 
 /// Command: status — run-scoped totals, so the counts correlate with the final
@@ -760,14 +773,14 @@ pub fn status_rows(metrics: &Metrics, context: &StatusContext<'_>) -> Vec<Vec<St
         vec![
             "Sent".into(),
             format!(
-                "{} bytes  (TCP {}, UDP {}, IP {})",
+                "{} bytes  (TCP/SCTP {}, UDP {}, IP {})",
                 sent, values[1], values[3], values[9]
             ),
         ],
         vec![
             "Received".into(),
             format!(
-                "{} bytes  (TCP {}, UDP {}, IP {})",
+                "{} bytes  (TCP/SCTP {}, UDP {}, IP {})",
                 received, values[5], values[7], values[11]
             ),
         ],
@@ -812,6 +825,19 @@ pub fn status_rows(metrics: &Metrics, context: &StatusContext<'_>) -> Vec<Vec<St
         },
     ]);
     rows.push(vec!["REST API".into(), context.restapi.clone()]);
+    rows.push(vec!["Web server".into(), context.web_server.clone()]);
+    rows.push(vec![
+        "SCTP".into(),
+        format!(
+            "{} ({})",
+            if context.packet_type == PacketType::Sctp {
+                "selected transport"
+            } else {
+                "not selected"
+            },
+            crate::restapi::sctp_status()
+        ),
+    ]);
     rows.push(vec!["SMTP".into(), enabled_word(context.smtp).into()]);
     rows
 }

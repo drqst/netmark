@@ -1589,6 +1589,7 @@ fn status_is_reported_as_a_table() {
             monitor: (true, 1, 5, 4, 1),
             metrics_sql: "not connected".to_string(),
             restapi: "disabled".to_string(),
+            web_server: crate::cli::web_server_status("127.0.0.1:8081", "127.0.0.1:8081"),
             smtp: false,
         },
     );
@@ -1616,6 +1617,11 @@ fn status_is_reported_as_a_table() {
     assert_eq!(value("Monitor"), "on id 1, 5 calls, 4 ok, 1 failed");
     assert_eq!(value("Metrics SQL"), "not connected");
     assert_eq!(value("REST API"), "disabled");
+    assert_eq!(
+        value("Web server"),
+        "listening on http://127.0.0.1:8081 (port 8081)"
+    );
+    assert!(value("SCTP").starts_with("not selected"));
     assert_eq!(value("SMTP"), "disabled");
 }
 
