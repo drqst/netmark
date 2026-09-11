@@ -274,19 +274,19 @@ kernel support, and `configure webrtc ...` holds the data-channel settings.
 | `configure webrtc status` | Show the current settings |
 | `client <id> webrtc <on\|off\|follow>` | Override the layer for one client |
 
-**Connecting WebRTC to a particular client.** The `webrtc` command sets the
+**Connecting WebRTC to a particular client.** `configure webrtc` sets the
 layer's settings and its default on/off state. Each client has its own switch,
-which starts at `follow`, meaning it takes whatever `webrtc enable` /
-`webrtc disable` says. Setting `client <id> webrtc on` or `off` pins that one
-client regardless. That is how you run data-channel traffic and plain traffic
-side by side from the same machine:
+which starts at `follow`, meaning it takes whatever `configure webrtc enable` /
+`configure webrtc disable` says. Setting `client <id> webrtc on` or `off` pins
+that one client regardless. That is how you run data-channel traffic and plain
+traffic side by side from the same machine:
 
 ```
-> webrtc channels 4
-> webrtc disable          # plain traffic is the default
-> client 0 webrtc on      # client 0 sends data channels
-> client 1 webrtc off     # client 1 stays plain
-> client 2                # left on `follow`, so plain
+> configure webrtc channels 4
+> configure webrtc disable    # plain traffic is the default
+> client 0 webrtc on          # client 0 sends data channels
+> client 1 webrtc off         # client 1 stays plain
+> client 2                    # left on `follow`, so plain
 > start
 ```
 
@@ -313,7 +313,7 @@ clients:
 | `selftest` | Three seconds to localhost over udp, tcp, sctp and ip in turn, each start to verdict; a transport this host cannot carry is skipped with the reason |
 | `benchmark duration <seconds>` | Flood the remote with TCP and report bandwidth |
 | `status` | Current counters, bandwidth up and down, and the state of everything else, as a table |
-| `list` | Every run with its role, transport, result, bandwidth and per-protocol packet, byte, loss and jitter counters |
+| `list` | Every run with its role, transport, result, bandwidth and **all** protocol counters (TCP/SCTP, UDP and raw IP packets and bytes, plus loss and jitter) |
 | `show run <id>` | Everything stored for one run, as a table: times, role, transport, result and failure reason, totals and bandwidth, the TCP/SCTP, UDP and raw IP packet and byte counters, loss, jitter, the TCP transport figures and the WebRTC counts, followed by both sides' debriefs |
 | `clean` | Delete stored data, keeping the run id counter |
 
@@ -442,11 +442,11 @@ misleading zero.
 
 ## The WebRTC layer
 
-`webrtc enable` wraps the payload of whichever transport is selected in WebRTC
-data-channel frames: DCEP-style channel setup, a per-channel message sequence,
-and an ordered/unordered flag. Messages are spread round-robin over
-`webrtc channels` channels. The receiver decodes the frames, counts messages per
-channel and flags gaps and reordering per channel.
+`configure webrtc enable` wraps the payload of whichever transport is selected in
+WebRTC data-channel frames: DCEP-style channel setup, a per-channel message
+sequence, and an ordered/unordered flag. Messages are spread round-robin over
+`configure webrtc channels` channels. The receiver decodes the frames, counts
+messages per channel and flags gaps and reordering per channel.
 
 This is **not** a full WebRTC stack. There is no ICE, DTLS or SCTP association,
 because netmark measures a network path rather than interoperating with a
@@ -688,10 +688,18 @@ in the external database.
 **Off by default.** Nothing leaves the host until you set a connection string,
 either in netmark.config or with `configure metrics <connection>`, and then
 `metrics enable`. PostgreSQL and SQLite are both supported. Each run writes
-exactly one row to `netmark_metrics`.
+exactly one row to `netmark_metrics`, and **every row carries the `run_id`** of
+the run that produced it so graphs and queries can split series per run.
 
-`init.sh` brings up a local PostgreSQL in kind and writes the connection string
-for you, if you want one.
+```sql
+SELECT timestamp_utc, run_id, sent_bytes_per_second, received_bytes_per_second,
+       jitter_millis, lost_udp_packets
+FROM netmark_metrics
+ORDER BY timestamp_utc;
+```
+
+`init.sh` brings up a local PostgreSQL in kind, writes the connection string for
+you, and deploys Grafana pointed at that same database.
 
 ---
 
@@ -794,32 +802,39 @@ installed it creates a cluster from `k8s/kind-config.yaml` with three nodes:
   `k8s/postgres.yaml`,
 - an **app node** (label `netmark.io/role: app`) running the netmark
   application (`k8s/netmark.yaml`, image built from `k8s/Dockerfile.netmark`)
-  in `--serve` mode, wired to the database service.
+  in `--serve` mode, wired to the database service, plus Grafana
+  (`k8s/grafana.yaml`) graphing that same external metrics database.
 
-The cluster is kept to three containers:
+The cluster is four containers:
 
 | Container | Where | What it does |
 | --- | --- | --- |
 | `postgres` | `k8s/postgres.yaml` | PostgreSQL with Timescale; holds all run metrics and all monitor data |
 | `volume` | `k8s/postgres.yaml` | Owns the persistent volume claim, checks it is writable and reports how full it is |
 | `netmark` | `k8s/netmark.yaml` | The web server: the web CLI and the REST API on port 8080 |
+| `grafana` | `k8s/grafana.yaml` | Grafana reading `netmark_metrics` (with `run_id` on every point) from PostgreSQL |
 
 Both deployments prefer their labeled node but still schedule on single-node
-clusters such as Docker Desktop. The app node's NodePort 30080 is mapped to the
+clusters such as Docker Desktop. The app node's NodePorts are mapped to the
 host, so after `init.sh` finishes:
 
 - the web interface and web CLI are at <http://127.0.0.1:8080>,
+- Grafana is at <http://127.0.0.1:3000> (anonymous viewer; admin password is the
+  PostgreSQL password), with a provisioned dashboard that groups bandwidth,
+  jitter and loss by `run_id`,
 - `./netmarkctl <command>` controls the same service from the shell,
 - PostgreSQL is port-forwarded to `127.0.0.1:5433` and the connection string is
   written into `netmark.config` for a host-side netmark.
 
 `k8s/cluster-test.sh` checks that the cluster is up and healthy. It runs one
 case per expectation — the API is reachable, the namespace exists, the
-`postgres` and `volume` containers are deployed, both deployments have a ready
-replica, the data volume is bound, PostgreSQL accepts connections, the volume
-container owns the data volume, and the web server answers both `/api/v1/status`
-and the web CLI — printing `ok` or `FAIL` for each and exiting non-zero if any
-case fails. Set `NETMARK_NAMESPACE` or `NETMARK_WEB` to test another deployment.
+`postgres`, `volume` and `grafana` containers are deployed, the postgres, app
+and grafana deployments have a ready replica, the data volume is bound,
+PostgreSQL accepts connections, the volume container owns the data volume, the
+web server answers both `/api/v1/status` and the web CLI, and Grafana reports
+healthy — printing `ok` or `FAIL` for each and exiting non-zero if any case
+fails. Set `NETMARK_NAMESPACE`, `NETMARK_WEB` or `NETMARK_GRAFANA` to test
+another deployment.
 
 ---
 

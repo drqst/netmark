@@ -4,33 +4,27 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: netmark-grafana-datasource
+  name: netmark-grafana-provisioning
   namespace: netmark
 data:
-  datasource.yaml: |
+  datasource.yaml.template: |
     apiVersion: 1
     datasources:
       - name: Netmark Metrics
+        uid: netmark-metrics
         type: postgres
         access: proxy
         url: netmark-postgres:5432
-        user: ${POSTGRES_USER}
+        user: __POSTGRES_USER__
         secureJsonData:
-          password: ${POSTGRES_PASSWORD}
+          password: __POSTGRES_PASSWORD__
         jsonData:
-          database: ${POSTGRES_DB}
+          database: __POSTGRES_DB__
           sslmode: disable
           postgresVersion: 1600
           timescaledb: true
         isDefault: true
         editable: false
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: netmark-grafana-dashboard-provider
-  namespace: netmark
-data:
   dashboards.yaml: |
     apiVersion: 1
     providers:
@@ -42,6 +36,18 @@ data:
         updateIntervalSeconds: 30
         options:
           path: /var/lib/grafana/dashboards
+  entrypoint.sh: |
+    #!/bin/sh
+    set -eu
+    sed \
+      -e "s|__POSTGRES_USER__|${POSTGRES_USER}|g" \
+      -e "s|__POSTGRES_PASSWORD__|${POSTGRES_PASSWORD}|g" \
+      -e "s|__POSTGRES_DB__|${POSTGRES_DB}|g" \
+      /etc/grafana/netmark-provisioning/datasource.yaml.template \
+      > /etc/grafana/provisioning/datasources/datasource.yaml
+    cp /etc/grafana/netmark-provisioning/dashboards.yaml \
+      /etc/grafana/provisioning/dashboards/dashboards.yaml
+    exec /run.sh
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -59,7 +65,7 @@ data:
       "links": [],
       "panels": [
         {
-          "datasource": { "type": "postgres", "uid": "${DS_NETMARK}" },
+          "datasource": { "type": "postgres", "uid": "netmark-metrics" },
           "fieldConfig": {
             "defaults": {
               "custom": { "drawStyle": "line", "spanNulls": true },
@@ -71,11 +77,11 @@ data:
           "id": 1,
           "targets": [
             {
-              "datasource": { "type": "postgres", "uid": "${DS_NETMARK}" },
+              "datasource": { "type": "postgres", "uid": "netmark-metrics" },
               "editorMode": "code",
               "format": "time_series",
               "rawQuery": true,
-              "rawSql": "SELECT\n  $__timeGroupAlias(timestamp_utc::timestamptz, $__interval),\n  run_id::text AS metric,\n  AVG(sent_bytes_per_second) AS value\nFROM netmark_metrics\nWHERE $__timeFilter(timestamp_utc::timestamptz)\n  AND ($run_id = 0 OR run_id = $run_id)\nGROUP BY 1, 2\nORDER BY 1",
+              "rawSql": "SELECT $__timeGroupAlias(timestamp_utc::timestamptz, $__interval), run_id::text AS metric, AVG(sent_bytes_per_second) AS value FROM netmark_metrics WHERE $__timeFilter(timestamp_utc::timestamptz) AND ($run_id = 0 OR run_id = $run_id) GROUP BY 1, 2 ORDER BY 1",
               "refId": "A"
             }
           ],
@@ -83,7 +89,7 @@ data:
           "type": "timeseries"
         },
         {
-          "datasource": { "type": "postgres", "uid": "${DS_NETMARK}" },
+          "datasource": { "type": "postgres", "uid": "netmark-metrics" },
           "fieldConfig": {
             "defaults": {
               "custom": { "drawStyle": "line", "spanNulls": true },
@@ -95,11 +101,11 @@ data:
           "id": 2,
           "targets": [
             {
-              "datasource": { "type": "postgres", "uid": "${DS_NETMARK}" },
+              "datasource": { "type": "postgres", "uid": "netmark-metrics" },
               "editorMode": "code",
               "format": "time_series",
               "rawQuery": true,
-              "rawSql": "SELECT\n  $__timeGroupAlias(timestamp_utc::timestamptz, $__interval),\n  run_id::text AS metric,\n  AVG(received_bytes_per_second) AS value\nFROM netmark_metrics\nWHERE $__timeFilter(timestamp_utc::timestamptz)\n  AND ($run_id = 0 OR run_id = $run_id)\nGROUP BY 1, 2\nORDER BY 1",
+              "rawSql": "SELECT $__timeGroupAlias(timestamp_utc::timestamptz, $__interval), run_id::text AS metric, AVG(received_bytes_per_second) AS value FROM netmark_metrics WHERE $__timeFilter(timestamp_utc::timestamptz) AND ($run_id = 0 OR run_id = $run_id) GROUP BY 1, 2 ORDER BY 1",
               "refId": "A"
             }
           ],
@@ -107,7 +113,7 @@ data:
           "type": "timeseries"
         },
         {
-          "datasource": { "type": "postgres", "uid": "${DS_NETMARK}" },
+          "datasource": { "type": "postgres", "uid": "netmark-metrics" },
           "fieldConfig": {
             "defaults": {
               "custom": { "drawStyle": "line", "spanNulls": true },
@@ -119,11 +125,11 @@ data:
           "id": 3,
           "targets": [
             {
-              "datasource": { "type": "postgres", "uid": "${DS_NETMARK}" },
+              "datasource": { "type": "postgres", "uid": "netmark-metrics" },
               "editorMode": "code",
               "format": "time_series",
               "rawQuery": true,
-              "rawSql": "SELECT\n  $__timeGroupAlias(timestamp_utc::timestamptz, $__interval),\n  run_id::text AS metric,\n  AVG(jitter_millis) AS value\nFROM netmark_metrics\nWHERE $__timeFilter(timestamp_utc::timestamptz)\n  AND ($run_id = 0 OR run_id = $run_id)\nGROUP BY 1, 2\nORDER BY 1",
+              "rawSql": "SELECT $__timeGroupAlias(timestamp_utc::timestamptz, $__interval), run_id::text AS metric, AVG(jitter_millis) AS value FROM netmark_metrics WHERE $__timeFilter(timestamp_utc::timestamptz) AND ($run_id = 0 OR run_id = $run_id) GROUP BY 1, 2 ORDER BY 1",
               "refId": "A"
             }
           ],
@@ -131,7 +137,7 @@ data:
           "type": "timeseries"
         },
         {
-          "datasource": { "type": "postgres", "uid": "${DS_NETMARK}" },
+          "datasource": { "type": "postgres", "uid": "netmark-metrics" },
           "fieldConfig": {
             "defaults": {
               "custom": { "drawStyle": "line", "spanNulls": true },
@@ -143,11 +149,11 @@ data:
           "id": 4,
           "targets": [
             {
-              "datasource": { "type": "postgres", "uid": "${DS_NETMARK}" },
+              "datasource": { "type": "postgres", "uid": "netmark-metrics" },
               "editorMode": "code",
               "format": "time_series",
               "rawQuery": true,
-              "rawSql": "SELECT\n  $__timeGroupAlias(timestamp_utc::timestamptz, $__interval),\n  run_id::text AS metric,\n  AVG(lost_udp_packets) AS value\nFROM netmark_metrics\nWHERE $__timeFilter(timestamp_utc::timestamptz)\n  AND ($run_id = 0 OR run_id = $run_id)\nGROUP BY 1, 2\nORDER BY 1",
+              "rawSql": "SELECT $__timeGroupAlias(timestamp_utc::timestamptz, $__interval), run_id::text AS metric, AVG(lost_udp_packets) AS value FROM netmark_metrics WHERE $__timeFilter(timestamp_utc::timestamptz) AND ($run_id = 0 OR run_id = $run_id) GROUP BY 1, 2 ORDER BY 1",
               "refId": "A"
             }
           ],
@@ -155,17 +161,17 @@ data:
           "type": "timeseries"
         },
         {
-          "datasource": { "type": "postgres", "uid": "${DS_NETMARK}" },
+          "datasource": { "type": "postgres", "uid": "netmark-metrics" },
           "fieldConfig": { "defaults": {}, "overrides": [] },
           "gridPos": { "h": 8, "w": 24, "x": 0, "y": 16 },
           "id": 5,
           "targets": [
             {
-              "datasource": { "type": "postgres", "uid": "${DS_NETMARK}" },
+              "datasource": { "type": "postgres", "uid": "netmark-metrics" },
               "editorMode": "code",
               "format": "table",
               "rawQuery": true,
-              "rawSql": "SELECT\n  timestamp_utc,\n  run_id,\n  sent_tcp_bytes,\n  received_tcp_bytes,\n  sent_udp_bytes,\n  received_udp_bytes,\n  sent_ip_bytes,\n  received_ip_bytes,\n  sent_bytes_per_second,\n  received_bytes_per_second,\n  lost_udp_packets,\n  out_of_order_udp_packets,\n  jitter_millis\nFROM netmark_metrics\nWHERE $__timeFilter(timestamp_utc::timestamptz)\n  AND ($run_id = 0 OR run_id = $run_id)\nORDER BY timestamp_utc DESC\nLIMIT 200",
+              "rawSql": "SELECT timestamp_utc, run_id, sent_tcp_bytes, received_tcp_bytes, sent_udp_bytes, received_udp_bytes, sent_ip_bytes, received_ip_bytes, sent_bytes_per_second, received_bytes_per_second, lost_udp_packets, out_of_order_udp_packets, jitter_millis FROM netmark_metrics WHERE $__timeFilter(timestamp_utc::timestamptz) AND ($run_id = 0 OR run_id = $run_id) ORDER BY timestamp_utc DESC LIMIT 200",
               "refId": "A"
             }
           ],
@@ -179,7 +185,7 @@ data:
         "list": [
           {
             "current": { "selected": true, "text": "All runs", "value": "0" },
-            "datasource": { "type": "postgres", "uid": "${DS_NETMARK}" },
+            "datasource": { "type": "postgres", "uid": "netmark-metrics" },
             "definition": "SELECT 0 AS __value, 'All runs' AS __text UNION ALL SELECT DISTINCT run_id AS __value, 'run ' || run_id::text AS __text FROM netmark_metrics ORDER BY 1",
             "name": "run_id",
             "label": "Run ID",
@@ -193,7 +199,7 @@ data:
       "time": { "from": "now-6h", "to": "now" },
       "timezone": "utc",
       "title": "Netmark external metrics",
-      "uid": "netmark-metrics",
+      "uid": "netmark-metrics-dash",
       "version": 1
     }
 ---
@@ -225,6 +231,7 @@ spec:
         - name: grafana
           image: grafana/grafana:11.2.0
           imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "/etc/grafana/netmark-provisioning/entrypoint.sh"]
           ports:
             - name: http
               containerPort: 3000
@@ -242,10 +249,10 @@ spec:
               value: "true"
             - name: GF_AUTH_ANONYMOUS_ORG_ROLE
               value: Viewer
+            - name: GF_PATHS_PROVISIONING
+              value: /etc/grafana/provisioning
             - name: GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH
               value: /var/lib/grafana/dashboards/netmark-metrics.json
-            - name: GF_INSTALL_PLUGINS
-              value: ""
             - name: POSTGRES_USER
               valueFrom:
                 secretKeyRef:
@@ -265,25 +272,28 @@ spec:
             httpGet:
               path: /api/health
               port: http
-            initialDelaySeconds: 10
+            initialDelaySeconds: 15
             periodSeconds: 5
           volumeMounts:
-            - name: datasource
-              mountPath: /etc/grafana/provisioning/datasources
+            - name: provisioning
+              mountPath: /etc/grafana/netmark-provisioning
               readOnly: true
+            - name: datasources
+              mountPath: /etc/grafana/provisioning/datasources
             - name: dashboard-provider
               mountPath: /etc/grafana/provisioning/dashboards
-              readOnly: true
             - name: dashboards
               mountPath: /var/lib/grafana/dashboards
               readOnly: true
       volumes:
-        - name: datasource
+        - name: provisioning
           configMap:
-            name: netmark-grafana-datasource
+            name: netmark-grafana-provisioning
+            defaultMode: 0755
+        - name: datasources
+          emptyDir: {}
         - name: dashboard-provider
-          configMap:
-            name: netmark-grafana-dashboard-provider
+          emptyDir: {}
         - name: dashboards
           configMap:
             name: netmark-grafana-dashboards

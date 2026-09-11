@@ -15,3 +15,7 @@ nodes:
       - containerPort: 30080
         hostPort: 8080
         protocol: TCP
+      # Grafana graphs of the external metrics database.
+      - containerPort: 30300
+        hostPort: 3000
+        protocol: TCP

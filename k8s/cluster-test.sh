@@ -44,8 +44,8 @@ fi
 check "kubernetes api reachable" kubectl cluster-info
 check "namespace $namespace exists" kubectl get namespace "$namespace"
 
-# The cluster is three containers: postgres and its volume container in one pod,
-# and the netmark web server in another.
+# The cluster is four containers: postgres and its volume container in one pod,
+# the netmark web server in another, and Grafana graphing the external metrics DB.
 containers=$(kubectl -n "$namespace" get deployment netmark-postgres \
   -o jsonpath='{.spec.template.spec.containers[*].name}' 2>/dev/null)
 case " $containers " in
@@ -57,7 +57,14 @@ case " $containers " in
   *) case_fail "volume container is deployed" "containers: ${containers:-none}" ;;
 esac
 
-for deployment in netmark-postgres netmark; do
+grafana_containers=$(kubectl -n "$namespace" get deployment netmark-grafana \
+  -o jsonpath='{.spec.template.spec.containers[*].name}' 2>/dev/null)
+case " $grafana_containers " in
+  *" grafana "*) case_ok "grafana container is deployed" ;;
+  *) case_fail "grafana container is deployed" "containers: ${grafana_containers:-none}" ;;
+esac
+
+for deployment in netmark-postgres netmark-app netmark-grafana; do
   ready=$(kubectl -n "$namespace" get deployment "$deployment" \
     -o jsonpath='{.status.readyReplicas}' 2>/dev/null)
   if [ "${ready:-0}" -ge 1 ] 2>/dev/null; then
@@ -81,6 +88,8 @@ check "postgres accepts connections" kubectl -n "$namespace" exec \
 check "volume container owns the data volume" kubectl -n "$namespace" exec \
   deployment/netmark-postgres -c volume -- test -d /data
 
+grafana=${NETMARK_GRAFANA:-http://127.0.0.1:3000}
+
 if command -v curl >/dev/null 2>&1; then
   status=$(curl -fsS --max-time 5 "$web/api/v1/status" 2>&1)
   if [ $? -eq 0 ] && printf '%s' "$status" | grep -q '"running"'; then
@@ -95,6 +104,13 @@ if command -v curl >/dev/null 2>&1; then
     case_ok "web CLI answers the status command"
   else
     case_fail "web CLI answers the status command" "$(printf '%s' "$reply" | tr '\n' ' ')"
+  fi
+
+  grafana_health=$(curl -fsS --max-time 5 "$grafana/api/health" 2>&1)
+  if [ $? -eq 0 ] && printf '%s' "$grafana_health" | grep -qi 'database'; then
+    case_ok "grafana reports healthy"
+  else
+    case_fail "grafana reports healthy" "$(printf '%s' "$grafana_health" | tr '\n' ' ')"
   fi
 else
   case_fail "web server is reachable" "curl is missing"

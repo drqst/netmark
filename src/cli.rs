@@ -913,7 +913,7 @@ pub fn limits_table(limits: &crate::core::LimitSet, only: Option<PacketType>) ->
 
 pub const LIMITS_USAGE: &str = "configure limits: [<tcp|sctp|udp|ip>] status | <tcp|sctp|udp|ip> <parameter> <value> | <tcp|sctp|udp|ip> clear";
 
-pub const CONFIGURE_USAGE: &str = "configure: metrics <connection> | save | reset | smtp <host[:port]> | type <tcp|sctp|udp|ip> | tcp bytes <bytes/sec> | tcp window <bytes> | tcp jitter <ms> | tcp maxjitter <ms> | udp_rate <packets/sec> | udp packetsize <bytes> | udp jitter <ms> | udp max jitter <ms> | bandwidth limit <bytes/sec> | limits <tcp|sctp|udp|ip> <parameter> <value>";
+pub const CONFIGURE_USAGE: &str = "configure: metrics <connection> | save | reset | smtp <host[:port]> | type <tcp|sctp|udp|ip> | <tcp|sctp|udp|ip> enable|disable | protocols | webrtc <enable|disable|channels|label|ordered|status> | sctp [status] | tcp bytes <bytes/sec> | tcp window <bytes> | tcp jitter <ms> | tcp maxjitter <ms> | udp_rate <packets/sec> | udp packetsize <bytes> | udp jitter <ms> | udp max jitter <ms> | bandwidth limit <bytes/sec> | limits <tcp|sctp|udp|ip> <parameter> <value>";
 
 /// Subcommand: client http check <url>
 pub fn client_http_check(log_dir: &std::path::Path, url: &str) -> String {
@@ -1330,7 +1330,7 @@ pub fn help_rows() -> Vec<Vec<String>> {
         ],
         vec![
             "client <id> webrtc on | off | follow".into(),
-            "connect the WebRTC layer to that client alone; follow (the default) uses `webrtc enable`".into(),
+            "connect the WebRTC layer to that client alone; follow (the default) uses `configure webrtc enable`".into(),
         ],
         vec![
             "client <id> http check <url>".into(),
@@ -1443,7 +1443,7 @@ pub fn help_rows() -> Vec<Vec<String>> {
         ],
         vec![
             "  connecting WebRTC".into(),
-            "`webrtc enable` turns it on for every client whose `webrtc` is `follow`; `client <id> webrtc on|off` overrides one client, so you can run WebRTC and plain traffic side by side".into(),
+            "`configure webrtc enable` turns it on for every client whose `webrtc` is `follow`; `client <id> webrtc on|off` overrides one client, so you can run WebRTC and plain traffic side by side".into(),
         ],
         vec![
             "metrics enable".into(),
@@ -1526,7 +1526,7 @@ pub fn help_rows() -> Vec<Vec<String>> {
         ],
         vec![
             "list".into(),
-            "list all runs with role, result and bandwidth".into(),
+            "list all runs with role, protocol, result, bandwidth and every protocol's counters".into(),
         ],
         vec!["help".into(), "show this help".into()],
         vec!["quit | exit".into(), "stop workers and exit".into()],

@@ -2035,12 +2035,12 @@ fn limits_survive_a_configuration_round_trip() {
 }
 
 #[test]
-fn the_kubernetes_cluster_is_three_containers_with_a_test_script() {
+fn the_kubernetes_cluster_includes_grafana_and_a_test_script() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let postgres = std::fs::read_to_string(root.join("k8s/postgres.yaml")).unwrap();
     let netmark = std::fs::read_to_string(root.join("k8s/netmark.yaml")).unwrap();
-    // One PostgreSQL container and one volume container that owns the claim,
-    // plus the web server container in the other manifest.
+    let grafana = std::fs::read_to_string(root.join("k8s/grafana.yaml")).unwrap();
+    // PostgreSQL + volume, the web server, and Grafana reading the external metrics DB.
     assert!(postgres.contains("- name: postgres"), "no postgres container");
     assert!(postgres.contains("- name: volume"), "no volume container");
     assert!(
@@ -2049,6 +2049,25 @@ fn the_kubernetes_cluster_is_three_containers_with_a_test_script() {
     );
     assert!(netmark.contains("- name: netmark"), "no web server container");
     assert!(netmark.contains("--serve"), "the web server is not served");
+    assert!(grafana.contains("- name: grafana"), "no grafana container");
+    assert!(
+        grafana.contains("netmark-postgres:5432"),
+        "grafana is not pointed at the external metrics database"
+    );
+    assert!(
+        grafana.contains("run_id"),
+        "grafana dashboard must keep run_id on each series"
+    );
+    assert!(
+        grafana.contains("netmark_metrics"),
+        "grafana must query the CLI metrics table"
+    );
+
+    let init = std::fs::read_to_string(root.join("init.sh")).unwrap();
+    assert!(
+        init.contains("k8s/grafana.yaml") || init.contains("$GRAFANA_MANIFEST"),
+        "init.sh does not deploy grafana"
+    );
 
     let script = root.join("k8s/cluster-test.sh");
     let cases = std::fs::read_to_string(&script).unwrap();
@@ -2056,10 +2075,12 @@ fn the_kubernetes_cluster_is_three_containers_with_a_test_script() {
         "kubernetes api reachable",
         "postgres container is deployed",
         "volume container is deployed",
+        "grafana container is deployed",
         "data volume is bound",
         "postgres accepts connections",
         "web server reports live status",
         "web CLI answers the status command",
+        "grafana reports healthy",
     ] {
         assert!(cases.contains(expectation), "no cluster test for {expectation}");
     }

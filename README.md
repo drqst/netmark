@@ -30,8 +30,10 @@ cargo build --release
 - **Monitoring:** periodic HTTP checks with alarms, plus an SMTP connection check.
 - **REST API and Rust SDK** over the same code path as the CLI.
 - **Kubernetes deployment:** `init.sh` brings up a kind cluster with a database
-  node (PostgreSQL/Timescale on a persistent volume) and an app node serving a
-  **web interface with a web CLI**; `./netmarkctl` controls it from the shell.
+  node (PostgreSQL/Timescale on a persistent volume), an app node serving a
+  **web interface with a web CLI**, and **Grafana** graphing the external metrics
+  database (every point tagged with `run_id`); `./netmarkctl` controls the app
+  from the shell.
 
 ## Defaults
 

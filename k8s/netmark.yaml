@@ -1,8 +1,9 @@
 # The web server container of the netmark cluster: the netmark binary in
 # headless server mode, serving the web interface (a web CLI that takes the same
 # commands as the shell CLI, with a live stats panel above it) and the REST API
-# on port 8080. The other two containers, PostgreSQL and the volume container
-# that owns its data volume, are deployed by postgres.yaml.
+# on port 8080. PostgreSQL and its volume container are deployed by
+# postgres.yaml; Grafana, which graphs that external metrics database, is
+# deployed by grafana.yaml.
 apiVersion: apps/v1
 kind: Deployment
 metadata:

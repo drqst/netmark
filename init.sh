@@ -8,6 +8,7 @@ NAMESPACE=${NAMESPACE:-netmark}
 CLUSTER_NAME=${CLUSTER_NAME:-netmark}
 MANIFEST="$PROJECT_ROOT/k8s/postgres.yaml"
 APP_MANIFEST="$PROJECT_ROOT/k8s/netmark.yaml"
+GRAFANA_MANIFEST="$PROJECT_ROOT/k8s/grafana.yaml"
 POSTGRES_USER=${POSTGRES_USER:-netmark}
 POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-change-me}
 POSTGRES_DB=${POSTGRES_DB:-netmark}
@@ -60,6 +61,10 @@ fi
 kubectl apply -f "$APP_MANIFEST"
 kubectl -n "$NAMESPACE" rollout status deployment/netmark-app --timeout=180s
 
+# Grafana reads the same external metrics database the CLI writes to.
+kubectl apply -f "$GRAFANA_MANIFEST"
+kubectl -n "$NAMESPACE" rollout status deployment/netmark-grafana --timeout=180s
+
 kubectl -n "$NAMESPACE" port-forward service/netmark-postgres 5433:5432 >/tmp/netmark-postgres-port-forward.log 2>&1 &
 FORWARD_PID=$!
 trap 'kill "$FORWARD_PID" 2>/dev/null || true' EXIT
@@ -71,6 +76,7 @@ metrics:
 EOF
 echo "PostgreSQL/Timescale is ready on 127.0.0.1:5433"
 echo "netmark web interface (web CLI): http://127.0.0.1:8080"
+echo "Grafana (external metrics graphs): http://127.0.0.1:3000"
 echo "Host CLI: $PROJECT_ROOT/netmarkctl help"
 echo "Config written to $CONFIG"
 echo "Use: metrics enable"

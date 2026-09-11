@@ -1,6 +1,7 @@
-# The netmark cluster keeps three containers: this file holds the PostgreSQL
-# container and the volume container that owns the data volume, and
-# netmark.yaml holds the web server container.
+# The netmark cluster keeps four containers: this file holds the PostgreSQL
+# container and the volume container that owns the data volume; netmark.yaml
+# holds the web server container; grafana.yaml holds Grafana for the external
+# metrics database.
 apiVersion: v1
 kind: Namespace
 metadata:
