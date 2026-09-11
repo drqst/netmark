@@ -210,6 +210,9 @@ still works.
 | `configure limits <tcp\|sctp\|udp\|ip> status` | Show one protocol's limits |
 | `configure limits <tcp\|sctp\|udp\|ip> <parameter> <value>` | Set a limit; 0 removes it |
 | `configure limits <tcp\|sctp\|udp\|ip> clear` | Remove every limit for one protocol |
+| `configure protocols` | Every transport: enabled or disabled, which is selected, host support and WebRTC |
+| `configure <tcp\|sctp\|udp\|ip> enable` | Allow the transport to be selected, started and selftested |
+| `configure <tcp\|sctp\|udp\|ip> disable` | Turn the transport off; `start` refuses it, `selftest` skips it and selecting it is an error |
 | `configure save` | Write the current settings to netmark.config |
 | `configure reset` | Reload netmark.config, discarding session changes |
 
@@ -247,15 +250,28 @@ udp max-lost-packets                     5
 udp max-out-of-order-packets             not set
 ```
 
+#### Turning protocols on and off
+
+Every transport is enabled by default. `configure <protocol> disable` takes one
+out of use: it cannot be selected with `configure type`, `start` refuses to run
+it and `selftest` skips it with the reason. Disabling the selected transport
+moves the selection to an enabled one. The state is shown by `configure
+protocols` and in the `Protocols` row of `status`, and `configure save` writes it
+to `netmark.config` under `traffic.protocols`.
+
+SCTP and WebRTC are configured the same way, as subcommands of `configure`:
+`configure sctp` opens the detailed SCTP page, `configure sctp status` reports
+kernel support, and `configure webrtc ...` holds the data-channel settings.
+
 ### WebRTC
 
 | Command | Effect |
 | --- | --- |
-| `webrtc enable` / `webrtc disable` | Turn the data-channel layer on or off for every client that follows |
-| `webrtc channels <n>` | Spread messages over N channels |
-| `webrtc label <name>` | Data-channel label |
-| `webrtc ordered <true\|false>` | Ordered or unordered delivery |
-| `webrtc status` | Show the current settings |
+| `configure webrtc enable` / `configure webrtc disable` | Turn the data-channel layer on or off for every client that follows |
+| `configure webrtc channels <n>` | Spread messages over N channels |
+| `configure webrtc label <name>` | Data-channel label |
+| `configure webrtc ordered <true\|false>` | Ordered or unordered delivery |
+| `configure webrtc status` | Show the current settings |
 | `client <id> webrtc <on\|off\|follow>` | Override the layer for one client |
 
 **Connecting WebRTC to a particular client.** The `webrtc` command sets the
@@ -292,13 +308,13 @@ clients:
 | Command | Effect |
 | --- | --- |
 | `start` / `stop` | Start and stop a run; `stop` names the transport it stopped, ends an SCTP association and debriefs over the same transport |
-| `sctp` | Detailed SCTP help: kernel support, how to select, run and stop it |
-| `sctp status` | Whether the kernel can open an SCTP socket |
+| `configure sctp` | Detailed SCTP help: kernel support, how to select, run and stop it |
+| `configure sctp status` | Whether the kernel can open an SCTP socket |
 | `selftest` | Three seconds to localhost over udp, tcp, sctp and ip in turn, each start to verdict; a transport this host cannot carry is skipped with the reason |
 | `benchmark duration <seconds>` | Flood the remote with TCP and report bandwidth |
 | `status` | Current counters, bandwidth up and down, and the state of everything else, as a table |
-| `list` | Every run with its role, result and bandwidth |
-| `show run <id>` | One run, its bandwidth and both sides' debriefs |
+| `list` | Every run with its role, transport, result, bandwidth and per-protocol packet, byte, loss and jitter counters |
+| `show run <id>` | Everything stored for one run, as a table: times, role, transport, result and failure reason, totals and bandwidth, the TCP/SCTP, UDP and raw IP packet and byte counters, loss, jitter, the TCP transport figures and the WebRTC counts, followed by both sides' debriefs |
 | `clean` | Delete stored data, keeping the run id counter |
 
 ### Metrics, monitoring and administration

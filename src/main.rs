@@ -223,7 +223,7 @@ fn main() {
                     }
                     // The detailed SCTP page and help hide the live display while
                     // they print, then restore it, so the tables never interleave.
-                    ["sctp"] => print_sctp_help(&stdout_guard, &output),
+                    ["configure", "sctp"] => print_sctp_help(&stdout_guard, &output),
                     ["help", topic @ ..] => print_help(&stdout_guard, &output, topic),
                     ["quit"] | ["exit"] => break,
                     [] => {}

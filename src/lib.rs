@@ -71,6 +71,12 @@ pub fn config_from_traffic(traffic: &configuration::TrafficConfig) -> Config {
         max_udp_jitter_millis: traffic.max_udp_jitter_millis,
         limit_bytes_per_second: traffic.limit,
         limits: limit_set_from(&traffic.limits),
+        protocols: core::ProtocolSwitches {
+            tcp: traffic.protocols.tcp,
+            sctp: traffic.protocols.sctp,
+            udp: traffic.protocols.udp,
+            ip: traffic.protocols.ip,
+        },
         webrtc: webrtc::Settings::default(),
         admin_emails: Vec::new(),
     }
@@ -111,6 +117,12 @@ pub fn traffic_config_from(config: &Config) -> configuration::TrafficConfig {
         max_udp_jitter_millis: config.max_udp_jitter_millis,
         limit: config.limit_bytes_per_second,
         limits: limits_config_from(&config.limits),
+        protocols: configuration::ProtocolsConfig {
+            tcp: config.protocols.tcp,
+            sctp: config.protocols.sctp,
+            udp: config.protocols.udp,
+            ip: config.protocols.ip,
+        },
     }
 }
 
@@ -161,6 +173,10 @@ pub fn limits_config_from(limits: &core::LimitSet) -> configuration::LimitsConfi
 /// the configured jitter and throughput limits (millisecond-level metrics never
 /// touch local SQLite; they only go to the configured external SQL).
 pub struct RunOutcome {
+    /// The transport the run used.
+    pub protocol: &'static str,
+    /// Every counter the run collected, stored with the run.
+    pub detail: core::RunDetail,
     pub sent_bytes: u64,
     pub received_bytes: u64,
     pub sent_bytes_per_second: u64,
@@ -189,6 +205,8 @@ impl RunOutcome {
             sent_bytes_per_second: self.sent_bytes_per_second,
             received_bytes_per_second: self.received_bytes_per_second,
             failure_reason: self.failure_reason.as_deref(),
+            protocol: self.protocol,
+            detail: self.detail,
         }
     }
     /// The one line every surface prints for a finished run.
@@ -261,6 +279,8 @@ pub fn evaluate_run(metrics: &Metrics, config: &Config, elapsed: Option<Duration
         &mut reasons,
     );
     RunOutcome {
+        protocol: config.packet_type.as_str(),
+        detail: core::RunDetail::from_metrics(metrics),
         sent_bytes,
         received_bytes,
         sent_bytes_per_second,

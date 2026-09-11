@@ -32,6 +32,8 @@ fn summary(result: &str) -> crate::core::RunSummary<'_> {
         sent_bytes_per_second: 0,
         received_bytes_per_second: 0,
         failure_reason: None,
+        protocol: "tcp",
+        detail: crate::core::RunDetail::default(),
     }
 }
 
@@ -263,6 +265,7 @@ fn three_second_udp_client_server_logs_match() {
         max_udp_jitter_millis: 1000,
         limit_bytes_per_second: 0,
         limits: crate::core::LimitSet::default(),
+        protocols: crate::core::ProtocolSwitches::default(),
         webrtc: crate::webrtc::Settings::default(),
         admin_emails: Vec::new(),
     }));
@@ -925,6 +928,13 @@ fn local_sqlite_records_the_role_that_wrote_each_row() {
             sent_bytes_per_second: 3,
             received_bytes_per_second: 4,
             failure_reason: None,
+            protocol: "sctp",
+            detail: crate::core::RunDetail {
+                sent_tcp_packets: 5,
+                sent_tcp_bytes: 6,
+                jitter_millis: 7,
+                ..crate::core::RunDetail::default()
+            },
         },
     );
 
@@ -1580,6 +1590,7 @@ fn status_is_reported_as_a_table() {
     let rows = crate::cli::status_rows(
         &metrics,
         &crate::cli::StatusContext {
+            protocols: crate::core::ProtocolSwitches::default(),
             running: true,
             elapsed: Some(Duration::from_secs(2)),
             run_id: 42,
@@ -1685,8 +1696,8 @@ fn the_sctp_help_page_covers_the_transport() {
     assert!(
         crate::cli::help_rows()
             .iter()
-            .any(|row| row[0] == "sctp" && !row[1].is_empty()),
-        "help does not mention the sctp command"
+            .any(|row| row[0] == "configure sctp" && !row[1].is_empty()),
+        "help does not mention the configure sctp command"
     );
 }
 
@@ -2058,4 +2069,137 @@ fn the_kubernetes_cluster_is_three_containers_with_a_test_script() {
         let mode = std::fs::metadata(&script).unwrap().permissions().mode();
         assert!(mode & 0o111 != 0, "k8s/cluster-test.sh is not executable");
     }
+}
+
+#[test]
+fn sctp_and_webrtc_live_under_configure() {
+    // The moved commands are documented where they now live, and the old
+    // top-level words are gone from the command list and the help.
+    let labels: Vec<String> = crate::cli::help_rows()
+        .into_iter()
+        .map(|row| row[0].clone())
+        .collect();
+    for moved in [
+        "configure sctp",
+        "configure sctp status",
+        "configure webrtc enable | disable",
+        "configure webrtc channels <n>",
+        "configure webrtc status",
+    ] {
+        assert!(labels.iter().any(|label| label == moved), "no help for {moved}");
+    }
+    assert!(
+        !labels.iter().any(|label| label == "sctp" || label.starts_with("webrtc ")),
+        "a top-level sctp or webrtc row is still documented"
+    );
+    assert!(!crate::cli::COMMANDS.contains(&"webrtc"));
+    // Both are reachable through the standardized help.
+    assert_eq!(
+        crate::cli::help_for(&["configure", "sctp"]).unwrap(),
+        crate::cli::sctp_help_rows()
+    );
+    assert!(crate::cli::help_for(&["configure", "webrtc"]).is_ok());
+}
+
+#[test]
+fn protocols_are_enabled_and_disabled_under_configure() {
+    let config = Arc::new(Mutex::new(Config::default()));
+    for protocol in ["tcp", "sctp", "udp", "ip"] {
+        let line = crate::cli::set_protocol_enabled(&config, protocol, false).unwrap();
+        assert!(line.starts_with(protocol), "{line}");
+        assert!(!config.lock().unwrap().protocols.enabled(
+            PacketType::parse(protocol).unwrap()
+        ));
+        crate::cli::set_protocol_enabled(&config, protocol, true).unwrap();
+        assert!(
+            config
+                .lock()
+                .unwrap()
+                .protocols
+                .enabled(PacketType::parse(protocol).unwrap())
+        );
+    }
+    assert!(crate::cli::set_protocol_enabled(&config, "nonsense", true).is_err());
+
+    // Disabling the selected transport moves the selection to an enabled one.
+    crate::cli::configure(&config, &["type", "sctp"]).unwrap();
+    let line = crate::cli::set_protocol_enabled(&config, "sctp", false).unwrap();
+    assert!(line.contains("transport is now"), "{line}");
+    assert_ne!(config.lock().unwrap().packet_type, PacketType::Sctp);
+    // A disabled transport cannot be selected again until it is enabled.
+    let error = crate::cli::configure(&config, &["type", "sctp"]).unwrap_err();
+    assert!(error.contains("configure sctp enable"), "{error}");
+    crate::cli::set_protocol_enabled(&config, "sctp", true).unwrap();
+    crate::cli::configure(&config, &["type", "sctp"]).unwrap();
+
+    let table = crate::cli::protocols_table(&config, &crate::webrtc::Settings::default());
+    for protocol in ["tcp", "sctp", "udp", "ip", "webrtc"] {
+        assert!(table.contains(protocol), "{table} is missing {protocol}");
+    }
+    assert!(table.contains("selected"), "{table}");
+}
+
+#[test]
+fn protocol_switches_survive_a_configuration_round_trip() {
+    let mut config = Config::default();
+    config.protocols.set(PacketType::Ip, false);
+    let restored = crate::config_from_traffic(&crate::traffic_config_from(&config));
+    assert_eq!(restored.protocols, config.protocols);
+    assert!(!restored.protocols.enabled(PacketType::Ip));
+}
+
+#[test]
+fn show_run_reports_everything_collected() {
+    let sql = SqlState::new();
+    sql.enable().unwrap();
+    let id = sql.next_run_id(1);
+    sql.start_run(id);
+    sql.complete_run(
+        id,
+        &crate::core::RunSummary {
+            result: "ok",
+            sent_bytes: 4096,
+            received_bytes: 2048,
+            sent_bytes_per_second: 512,
+            received_bytes_per_second: 256,
+            failure_reason: None,
+            protocol: "sctp",
+            detail: crate::core::RunDetail {
+                sent_tcp_packets: 40,
+                sent_tcp_bytes: 4096,
+                received_tcp_packets: 20,
+                received_tcp_bytes: 2048,
+                lost_packets: 1,
+                out_of_order_packets: 2,
+                jitter_millis: 7,
+                tcp_jitter_millis: 7,
+                tcp_mss: 1460,
+                tcp_mtu: 1500,
+                tcp_window_size: 65535,
+                webrtc_sent_messages: 3,
+                ..crate::core::RunDetail::default()
+            },
+        },
+    );
+
+    let rows = sql.run_detail_rows(id).unwrap().expect("the run was stored");
+    let rendered = crate::cli_textout::table_lines(&rows, &[16, 80]).join("\n");
+    for expected in [
+        "Protocol", "sctp", "TCP/SCTP", "UDP", "IP", "UDP loss", "Jitter", "TCP transport",
+        "WebRTC", "1460", "65535", "4096",
+    ] {
+        assert!(rendered.contains(expected), "show run is missing {expected}:\n{rendered}");
+    }
+    assert!(sql.run_detail_rows(id + 90_000).unwrap().is_none());
+
+    // The same detail shows up per run in the list.
+    let listed = sql.run_list().unwrap();
+    let line = listed
+        .iter()
+        .find(|line| line.contains(&format!("run {id} ")))
+        .expect("the run is listed");
+    assert!(line.contains("protocol=sctp"), "{line}");
+    assert!(line.contains("lost=1"), "{line}");
+    assert!(line.contains("out_of_order=2"), "{line}");
+    assert!(line.contains("jitter=7 ms"), "{line}");
 }

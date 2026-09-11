@@ -63,6 +63,29 @@ pub struct TrafficConfig {
     pub limit: u64,
     /// Per-transport failure limits, set with `configure limits`.
     pub limits: LimitsConfig,
+    /// Which transports may be used, set with `configure <protocol> enable|disable`.
+    pub protocols: ProtocolsConfig,
+}
+
+/// Every transport is usable until it is turned off.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ProtocolsConfig {
+    pub tcp: bool,
+    pub sctp: bool,
+    pub udp: bool,
+    pub ip: bool,
+}
+
+impl Default for ProtocolsConfig {
+    fn default() -> Self {
+        Self {
+            tcp: true,
+            sctp: true,
+            udp: true,
+            ip: true,
+        }
+    }
 }
 
 /// One set of limits per transport; every value is 0 (not checked) by default.
@@ -105,6 +128,7 @@ impl Default for TrafficConfig {
             max_udp_jitter_millis: 1000,
             limit: 0,
             limits: LimitsConfig::default(),
+            protocols: ProtocolsConfig::default(),
         }
     }
 }

@@ -205,8 +205,7 @@ pub fn list_clients(clients: &Clients) -> String {
         .join("\n")
 }
 
-pub const WEBRTC_USAGE: &str =
-    "webrtc: enable | disable | channels <n> | label <name> | ordered <true|false> | status";
+pub const WEBRTC_USAGE: &str = "configure webrtc: enable | disable | channels <n> | label <name> | ordered <true|false> | status";
 
 /// Subcommand dispatcher for `webrtc <...>`; returns the resulting settings line.
 pub fn webrtc_command(
@@ -451,7 +450,12 @@ pub fn run_selftest(
     }
     let mut planned = Vec::new();
     let mut skipped = Vec::new();
+    let switches = config.lock().unwrap().protocols;
     for packet_type in SELFTEST_PROTOCOLS {
+        if !switches.enabled(packet_type) {
+            skipped.push(format!("{} (disabled)", packet_type.as_str()));
+            continue;
+        }
         match selftest_availability(packet_type) {
             Ok(()) => planned.push(packet_type),
             Err(error) => skipped.push(format!("{} ({error})", packet_type.as_str())),
@@ -622,6 +626,8 @@ pub fn run_benchmark(remote: &str, seconds: u64, sql: &SqlState, log_dir: &std::
                     sent_bytes_per_second: 0,
                     received_bytes_per_second: 0,
                     failure_reason: Some(&error.to_string()),
+                    protocol: PacketType::Tcp.as_str(),
+                    detail: core::RunDetail::default(),
                 },
             );
             crate::write_run_event(log_dir, run_id, "Completed");
@@ -663,6 +669,11 @@ pub fn run_benchmark(remote: &str, seconds: u64, sql: &SqlState, log_dir: &std::
             sent_bytes_per_second: bytes_per_second,
             received_bytes_per_second: 0,
             failure_reason: if bytes > 0 { None } else { Some("no bytes sent") },
+            protocol: PacketType::Tcp.as_str(),
+            detail: core::RunDetail {
+                sent_tcp_bytes: bytes,
+                ..core::RunDetail::default()
+            },
         },
     );
     crate::write_run_event(log_dir, run_id, "Completed");
@@ -726,7 +737,13 @@ pub fn configure(config: &Arc<Mutex<Config>>, args: &[&str]) -> Result<(), Strin
     }
     if let ["type", value] = args {
         let packet_type = PacketType::parse(value).ok_or("type must be tcp, sctp, udp or ip")?;
-        config.lock().unwrap().packet_type = packet_type;
+        let mut config = config.lock().unwrap();
+        if !config.protocols.enabled(packet_type) {
+            return Err(format!(
+                "{value} is disabled; turn it on with: configure {value} enable"
+            ));
+        }
+        config.packet_type = packet_type;
         return Ok(());
     }
     if let ["bandwidth", "limit", value] = args {
@@ -737,6 +754,73 @@ pub fn configure(config: &Arc<Mutex<Config>>, args: &[&str]) -> Result<(), Strin
         return Ok(());
     }
     Err(CONFIGURE_USAGE.into())
+}
+
+/// Subcommand: configure <tcp|sctp|udp|ip> enable | disable — a disabled
+/// transport cannot be selected, started or selftested. Returns the line to print.
+pub fn set_protocol_enabled(
+    config: &Arc<Mutex<Config>>,
+    protocol: &str,
+    enabled: bool,
+) -> Result<String, String> {
+    let packet_type = PacketType::parse(protocol)
+        .ok_or_else(|| "protocols are tcp, sctp, udp, ip and webrtc".to_string())?;
+    let mut config = config.lock().unwrap();
+    config.protocols.set(packet_type, enabled);
+    let state = if enabled { "enabled" } else { "disabled" };
+    let mut line = format!("{} {state}", packet_type.as_str());
+    // The selected transport cannot stay selected once it is turned off.
+    if !enabled && config.packet_type == packet_type {
+        if let Some(fallback) = [
+            PacketType::Tcp,
+            PacketType::Udp,
+            PacketType::Sctp,
+            PacketType::Ip,
+        ]
+        .into_iter()
+        .find(|candidate| config.protocols.enabled(*candidate))
+        {
+            config.packet_type = fallback;
+            line.push_str(&format!("; transport is now {}", fallback.as_str()));
+        } else {
+            line.push_str("; no transport is enabled, so runs cannot start");
+        }
+    }
+    Ok(line)
+}
+
+/// The table `configure protocols` prints: every transport, whether it is
+/// enabled, whether this host can carry it and its live counters.
+pub fn protocols_table(config: &Arc<Mutex<Config>>, webrtc: &crate::webrtc::Settings) -> String {
+    let config = config.lock().unwrap();
+    let mut rows = Vec::new();
+    for packet_type in [
+        PacketType::Tcp,
+        PacketType::Sctp,
+        PacketType::Udp,
+        PacketType::Ip,
+    ] {
+        let state = if config.protocols.enabled(packet_type) {
+            "enabled"
+        } else {
+            "disabled"
+        };
+        let selected = if config.packet_type == packet_type {
+            ", selected"
+        } else {
+            ""
+        };
+        let host = match selftest_availability(packet_type) {
+            Ok(()) => "available on this host".to_string(),
+            Err(error) => format!("unavailable: {error}"),
+        };
+        rows.push(vec![
+            packet_type.as_str().to_string(),
+            format!("{state}{selected}, {host}"),
+        ]);
+    }
+    rows.push(vec!["webrtc".to_string(), webrtc.summary()]);
+    cli_textout::table_lines(&rows, &[16, 80]).join("\n")
 }
 
 /// Subcommand: configure limits — per-protocol thresholds that fail a run.
@@ -891,6 +975,8 @@ pub struct StatusContext<'a> {
     /// Where the web interface is listening, from [`web_server_status`].
     pub web_server: String,
     pub smtp: bool,
+    /// Which transports `configure <protocol> enable|disable` allows.
+    pub protocols: crate::core::ProtocolSwitches,
 }
 
 /// Where the web interface (and with it the REST API) is listening. Printed when
@@ -1008,6 +1094,29 @@ pub fn status_rows(metrics: &Metrics, context: &StatusContext<'_>) -> Vec<Vec<St
             crate::restapi::sctp_status()
         ),
     ]);
+    rows.push(vec![
+        "Protocols".into(),
+        [
+            PacketType::Tcp,
+            PacketType::Sctp,
+            PacketType::Udp,
+            PacketType::Ip,
+        ]
+        .into_iter()
+        .map(|packet_type| {
+            format!(
+                "{} {}",
+                packet_type.as_str(),
+                if context.protocols.enabled(packet_type) {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", "),
+    ]);
     rows.push(vec!["SMTP".into(), enabled_word(context.smtp).into()]);
     rows
 }
@@ -1034,6 +1143,10 @@ pub fn sctp_help_rows() -> Vec<Vec<String>> {
         vec![
             "select it".into(),
             "configure type sctp (or packet_type: sctp in a test profile)".into(),
+        ],
+        vec![
+            "turn it on or off".into(),
+            "configure sctp enable | configure sctp disable; a disabled transport cannot be selected, started or selftested".into(),
         ],
         vec![
             "run it".into(),
@@ -1123,11 +1236,11 @@ pub fn help_for(topic: &[&str]) -> Result<Vec<Vec<String>>, String> {
         return Ok(help_rows());
     }
     // The transport has a page of its own, which is more useful than its one line.
-    if topic == ["sctp"] {
+    if topic == ["sctp"] || topic == ["configure", "sctp"] {
         return Ok(sctp_help_rows());
     }
     // "help configure limits <protocol>" lists the parameters that protocol has.
-    if let ["configure", "limits", protocol] = topic
+    if let ["limits", protocol] | ["configure", "limits", protocol] = topic
         && let Some(packet_type) = PacketType::parse(protocol)
     {
         return Ok(limit_parameter_help_rows(packet_type));
@@ -1240,8 +1353,24 @@ pub fn help_rows() -> Vec<Vec<String>> {
             "pick the transport; SCTP needs kernel support and raw IP needs CAP_NET_RAW".into(),
         ],
         vec![
-            "sctp".into(),
+            "configure sctp".into(),
             "detailed SCTP help: kernel support, how to select, run and stop it".into(),
+        ],
+        vec![
+            "configure sctp status".into(),
+            "whether this kernel can open an SCTP socket".into(),
+        ],
+        vec![
+            "configure protocols".into(),
+            "every transport: enabled or disabled, selected, host support and WebRTC".into(),
+        ],
+        vec![
+            "configure <tcp|sctp|udp|ip> enable".into(),
+            "allow the transport to be selected, started and selftested".into(),
+        ],
+        vec![
+            "configure <tcp|sctp|udp|ip> disable".into(),
+            "turn the transport off; a disabled transport cannot run".into(),
         ],
         vec![
             "configure tcp bytes <bytes/sec>".into(),
@@ -1296,20 +1425,20 @@ pub fn help_rows() -> Vec<Vec<String>> {
             "remove every limit for one protocol".into(),
         ],
         vec![
-            "webrtc enable | disable".into(),
+            "configure webrtc enable | disable".into(),
             "wrap traffic in WebRTC data-channel frames for every client that follows".into(),
         ],
         vec![
-            "webrtc channels <n>".into(),
+            "configure webrtc channels <n>".into(),
             "number of data channels to spread messages over".into(),
         ],
-        vec!["webrtc label <name>".into(), "data-channel label".into()],
+        vec!["configure webrtc label <name>".into(), "data-channel label".into()],
         vec![
-            "webrtc ordered <true|false>".into(),
+            "configure webrtc ordered <true|false>".into(),
             "ordered or unordered delivery".into(),
         ],
         vec![
-            "webrtc status".into(),
+            "configure webrtc status".into(),
             "show the current WebRTC settings".into(),
         ],
         vec![
@@ -1412,7 +1541,6 @@ pub const COMMANDS: &[&str] = &[
     "selftest",
     "benchmark",
     "configure",
-    "webrtc",
     "metrics",
     "monitor",
     "admin",

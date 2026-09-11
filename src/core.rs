@@ -71,6 +71,46 @@ impl PacketType {
     }
 }
 
+/// Which transports may be used. `configure <protocol> disable` turns one off,
+/// and a disabled transport cannot be selected, started or selftested.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProtocolSwitches {
+    pub tcp: bool,
+    pub sctp: bool,
+    pub udp: bool,
+    pub ip: bool,
+}
+
+impl Default for ProtocolSwitches {
+    fn default() -> Self {
+        Self {
+            tcp: true,
+            sctp: true,
+            udp: true,
+            ip: true,
+        }
+    }
+}
+
+impl ProtocolSwitches {
+    pub fn enabled(&self, packet_type: PacketType) -> bool {
+        match packet_type {
+            PacketType::Tcp => self.tcp,
+            PacketType::Sctp => self.sctp,
+            PacketType::Udp => self.udp,
+            PacketType::Ip => self.ip,
+        }
+    }
+    pub fn set(&mut self, packet_type: PacketType, enabled: bool) {
+        match packet_type {
+            PacketType::Tcp => self.tcp = enabled,
+            PacketType::Sctp => self.sctp = enabled,
+            PacketType::Udp => self.udp = enabled,
+            PacketType::Ip => self.ip = enabled,
+        }
+    }
+}
+
 /// Limits that decide whether a run fails, kept per transport because each one
 /// is measured differently. A zero value means the limit is not checked.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -181,6 +221,8 @@ pub struct Config {
     pub limit_bytes_per_second: u64,
     /// Per-transport limits set with `configure limits`; a failed limit fails the run.
     pub limits: LimitSet,
+    /// Which transports `configure <protocol> enable|disable` allows.
+    pub protocols: ProtocolSwitches,
     pub webrtc: crate::webrtc::Settings,
     pub admin_emails: Vec<String>,
 }
@@ -201,6 +243,7 @@ impl Default for Config {
             max_udp_jitter_millis: 1000,
             limit_bytes_per_second: 0,
             limits: LimitSet::default(),
+            protocols: ProtocolSwitches::default(),
             webrtc: crate::webrtc::Settings::default(),
             admin_emails: Vec::new(),
         }
@@ -611,6 +654,74 @@ pub struct RunSummary<'a> {
     pub sent_bytes_per_second: u64,
     pub received_bytes_per_second: u64,
     pub failure_reason: Option<&'a str>,
+    /// The transport the run used, so `list` and `show run` can name it.
+    pub protocol: &'a str,
+    /// Everything else the run collected, stored so `show run` can show it all.
+    pub detail: RunDetail,
+}
+
+/// Every per-protocol counter a run collected, kept with the run so `show run`
+/// can report the whole picture instead of just the totals.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RunDetail {
+    pub sent_tcp_packets: u64,
+    pub sent_tcp_bytes: u64,
+    pub received_tcp_packets: u64,
+    pub received_tcp_bytes: u64,
+    pub sent_udp_packets: u64,
+    pub sent_udp_bytes: u64,
+    pub received_udp_packets: u64,
+    pub received_udp_bytes: u64,
+    pub sent_ip_packets: u64,
+    pub sent_ip_bytes: u64,
+    pub received_ip_packets: u64,
+    pub received_ip_bytes: u64,
+    pub lost_packets: u64,
+    pub out_of_order_packets: u64,
+    pub jitter_millis: u64,
+    pub tcp_jitter_millis: u64,
+    pub udp_jitter_millis: u64,
+    pub tcp_mss: u64,
+    pub tcp_mtu: u64,
+    pub tcp_window_size: u64,
+    pub webrtc_sent_messages: u64,
+    pub webrtc_received_messages: u64,
+    pub webrtc_invalid_frames: u64,
+}
+
+impl RunDetail {
+    /// Snapshots the run-scoped counters of a finished run.
+    pub fn from_metrics(metrics: &Metrics) -> Self {
+        let totals = metrics.run_totals();
+        let (lost, out_of_order) = metrics.udp_status();
+        let (mss, mtu, window) = metrics.tcp_transport();
+        let (webrtc_sent, webrtc_received, webrtc_invalid) = metrics.webrtc_counts();
+        Self {
+            sent_tcp_packets: totals[0],
+            sent_tcp_bytes: totals[1],
+            sent_udp_packets: totals[2],
+            sent_udp_bytes: totals[3],
+            received_tcp_packets: totals[4],
+            received_tcp_bytes: totals[5],
+            received_udp_packets: totals[6],
+            received_udp_bytes: totals[7],
+            sent_ip_packets: totals[8],
+            sent_ip_bytes: totals[9],
+            received_ip_packets: totals[10],
+            received_ip_bytes: totals[11],
+            lost_packets: lost,
+            out_of_order_packets: out_of_order,
+            jitter_millis: metrics.jitter_millis(),
+            tcp_jitter_millis: metrics.tcp_jitter_millis(),
+            udp_jitter_millis: metrics.udp_jitter_millis(),
+            tcp_mss: mss,
+            tcp_mtu: mtu,
+            tcp_window_size: window,
+            webrtc_sent_messages: webrtc_sent,
+            webrtc_received_messages: webrtc_received,
+            webrtc_invalid_frames: webrtc_invalid,
+        }
+    }
 }
 
 /// Bytes per second over `elapsed`, floored at one second so a very short run
@@ -658,6 +769,17 @@ impl SqlState {
             [],
         );
         let _ = connection.execute("ALTER TABLE runs ADD COLUMN failure_reason TEXT", []);
+        // Everything a run collected, so `show run` can report the whole picture.
+        let _ = connection.execute(
+            "ALTER TABLE runs ADD COLUMN protocol TEXT NOT NULL DEFAULT 'unknown'",
+            [],
+        );
+        for column in RUN_DETAIL_COLUMNS {
+            let _ = connection.execute(
+                &format!("ALTER TABLE runs ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"),
+                [],
+            );
+        }
         let _ = connection.execute(
             "ALTER TABLE runs ADD COLUMN role TEXT NOT NULL DEFAULT 'unknown'",
             [],
@@ -700,18 +822,34 @@ impl SqlState {
             return;
         }
         if let Some(c) = self.connection.lock().unwrap().as_ref() {
+            let assignments = RUN_DETAIL_COLUMNS
+                .iter()
+                .enumerate()
+                .map(|(index, column)| format!("{column} = ?{}", index + 9))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut values: Vec<Box<dyn rusqlite::ToSql>> = vec![
+                Box::new(timestamp()),
+                Box::new(summary.result.to_string()),
+                Box::new(summary.sent_bytes),
+                Box::new(summary.received_bytes),
+                Box::new(summary.sent_bytes_per_second),
+                Box::new(summary.received_bytes_per_second),
+                Box::new(summary.failure_reason.map(str::to_string)),
+                Box::new(summary.protocol.to_string()),
+            ];
+            values.extend(
+                run_detail_values(&summary.detail)
+                    .into_iter()
+                    .map(|value| Box::new(value) as Box<dyn rusqlite::ToSql>),
+            );
+            values.push(Box::new(id));
+            let last = values.len();
             let _ = c.execute(
-                "UPDATE runs SET completed_utc = ?1, result = ?2, sent_bytes = ?3, received_bytes = ?4, sent_bytes_per_second = ?5, received_bytes_per_second = ?6, failure_reason = ?7 WHERE id = ?8 AND result = 'running'",
-                params![
-                    timestamp(),
-                    summary.result,
-                    summary.sent_bytes,
-                    summary.received_bytes,
-                    summary.sent_bytes_per_second,
-                    summary.received_bytes_per_second,
-                    summary.failure_reason,
-                    id
-                ],
+                &format!(
+                    "UPDATE runs SET completed_utc = ?1, result = ?2, sent_bytes = ?3, received_bytes = ?4, sent_bytes_per_second = ?5, received_bytes_per_second = ?6, failure_reason = ?7, protocol = ?8, {assignments} WHERE id = ?{last} AND result = 'running'"
+                ),
+                rusqlite::params_from_iter(values.iter().map(|value| value.as_ref())),
             );
         }
     }
@@ -794,20 +932,37 @@ impl SqlState {
     pub fn run_list(&self) -> Result<Vec<String>, String> {
         let c = Connection::open(database_path()).map_err(|e| e.to_string())?;
         let mut q = c
-            .prepare("SELECT started_utc, id, role, result, sent_bytes, received_bytes, sent_bytes_per_second, received_bytes_per_second, failure_reason FROM runs ORDER BY id")
+            .prepare("SELECT started_utc, id, role, result, sent_bytes, received_bytes, sent_bytes_per_second, received_bytes_per_second, failure_reason, protocol, sent_tcp_packets, sent_tcp_bytes, received_tcp_packets, received_tcp_bytes, sent_udp_packets, sent_udp_bytes, received_udp_packets, received_udp_bytes, sent_ip_packets, sent_ip_bytes, received_ip_packets, received_ip_bytes, lost_packets, out_of_order_packets, jitter_millis FROM runs ORDER BY id")
             .map_err(|e| e.to_string())?;
         let rows = q
             .query_map([], |row| {
                 Ok(format!(
-                    "{} run {} role={} {} sent_bytes={} received_bytes={} up={} bytes/sec down={} bytes/sec{}",
+                    "{} run {} role={} protocol={} {} sent_bytes={} received_bytes={} up={} bytes/sec down={} bytes/sec tcp/sctp={}p/{}B sent {}p/{}B received udp={}p/{}B sent {}p/{}B received ip={}p/{}B sent {}p/{}B received lost={} out_of_order={} jitter={} ms{}",
                     row.get::<_, String>(0)?,
                     row.get::<_, u64>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(9)?
+                        .unwrap_or_else(|| "unknown".to_string()),
                     row.get::<_, String>(3)?,
                     row.get::<_, Option<u64>>(4)?.unwrap_or(0),
                     row.get::<_, Option<u64>>(5)?.unwrap_or(0),
                     row.get::<_, Option<u64>>(6)?.unwrap_or(0),
                     row.get::<_, Option<u64>>(7)?.unwrap_or(0),
+                    row.get::<_, Option<u64>>(10)?.unwrap_or(0),
+                    row.get::<_, Option<u64>>(11)?.unwrap_or(0),
+                    row.get::<_, Option<u64>>(12)?.unwrap_or(0),
+                    row.get::<_, Option<u64>>(13)?.unwrap_or(0),
+                    row.get::<_, Option<u64>>(14)?.unwrap_or(0),
+                    row.get::<_, Option<u64>>(15)?.unwrap_or(0),
+                    row.get::<_, Option<u64>>(16)?.unwrap_or(0),
+                    row.get::<_, Option<u64>>(17)?.unwrap_or(0),
+                    row.get::<_, Option<u64>>(18)?.unwrap_or(0),
+                    row.get::<_, Option<u64>>(19)?.unwrap_or(0),
+                    row.get::<_, Option<u64>>(20)?.unwrap_or(0),
+                    row.get::<_, Option<u64>>(21)?.unwrap_or(0),
+                    row.get::<_, Option<u64>>(22)?.unwrap_or(0),
+                    row.get::<_, Option<u64>>(23)?.unwrap_or(0),
+                    row.get::<_, Option<u64>>(24)?.unwrap_or(0),
                     row.get::<_, Option<String>>(8)?
                         .map(|reason| format!(" ({reason})"))
                         .unwrap_or_default()
@@ -845,6 +1000,130 @@ impl SqlState {
             .optional()
             .map_err(|e| e.to_string())
     }
+    /// Everything stored for one run, as label/value rows: when it ran, its
+    /// role, transport and result, the totals, the per-protocol packet and byte
+    /// counters, loss, jitter, the TCP transport figures and the WebRTC counts.
+    pub fn run_detail_rows(&self, id: u64) -> Result<Option<Vec<Vec<String>>>, String> {
+        let connection = Connection::open(database_path()).map_err(|e| e.to_string())?;
+        let columns = RUN_DETAIL_COLUMNS.join(", ");
+        connection
+            .query_row(
+                &format!(
+                    "SELECT started_utc, completed_utc, role, protocol, result, failure_reason, sent_bytes, received_bytes, sent_bytes_per_second, received_bytes_per_second, {columns} FROM runs WHERE id = ?1"
+                ),
+                params![id],
+                |row| {
+                    let text = |index: usize| -> rusqlite::Result<String> {
+                        Ok(row
+                            .get::<_, Option<String>>(index)?
+                            .unwrap_or_else(|| "n/a".to_string()))
+                    };
+                    let number =
+                        |index: usize| -> rusqlite::Result<u64> {
+                            Ok(row.get::<_, Option<u64>>(index)?.unwrap_or(0))
+                        };
+                    // The detail columns start after the ten named ones.
+                    let detail = |name: &str| -> rusqlite::Result<u64> {
+                        let index = RUN_DETAIL_COLUMNS
+                            .iter()
+                            .position(|column| *column == name)
+                            .expect("every detail column is listed");
+                        number(10 + index)
+                    };
+                    let mut rows = vec![
+                        vec!["Run".to_string(), id.to_string()],
+                        vec!["Started".to_string(), text(0)?],
+                        vec!["Completed".to_string(), text(1)?],
+                        vec!["Role".to_string(), text(2)?],
+                        vec!["Protocol".to_string(), text(3)?],
+                        vec!["Result".to_string(), text(4)?],
+                        vec!["Failure reason".to_string(), text(5)?],
+                        vec!["Sent".to_string(), format!("{} bytes", number(6)?)],
+                        vec!["Received".to_string(), format!("{} bytes", number(7)?)],
+                        vec![
+                            "Bandwidth up".to_string(),
+                            format!("{} bytes/sec", number(8)?),
+                        ],
+                        vec![
+                            "Bandwidth down".to_string(),
+                            format!("{} bytes/sec", number(9)?),
+                        ],
+                    ];
+                    for (label, sent_packets, sent_bytes, received_packets, received_bytes) in [
+                        (
+                            "TCP/SCTP",
+                            "sent_tcp_packets",
+                            "sent_tcp_bytes",
+                            "received_tcp_packets",
+                            "received_tcp_bytes",
+                        ),
+                        (
+                            "UDP",
+                            "sent_udp_packets",
+                            "sent_udp_bytes",
+                            "received_udp_packets",
+                            "received_udp_bytes",
+                        ),
+                        (
+                            "IP",
+                            "sent_ip_packets",
+                            "sent_ip_bytes",
+                            "received_ip_packets",
+                            "received_ip_bytes",
+                        ),
+                    ] {
+                        rows.push(vec![
+                            label.to_string(),
+                            format!(
+                                "sent {} packets / {} bytes, received {} packets / {} bytes",
+                                detail(sent_packets)?,
+                                detail(sent_bytes)?,
+                                detail(received_packets)?,
+                                detail(received_bytes)?
+                            ),
+                        ]);
+                    }
+                    rows.push(vec![
+                        "UDP loss".to_string(),
+                        format!(
+                            "{} lost, {} out of order",
+                            detail("lost_packets")?,
+                            detail("out_of_order_packets")?
+                        ),
+                    ]);
+                    rows.push(vec![
+                        "Jitter".to_string(),
+                        format!(
+                            "peak {} ms (TCP/SCTP {} ms, UDP {} ms)",
+                            detail("jitter_millis")?,
+                            detail("tcp_jitter_millis")?,
+                            detail("udp_jitter_millis")?
+                        ),
+                    ]);
+                    rows.push(vec![
+                        "TCP transport".to_string(),
+                        format!(
+                            "mss {}, mtu {}, window {}",
+                            detail("tcp_mss")?,
+                            detail("tcp_mtu")?,
+                            detail("tcp_window_size")?
+                        ),
+                    ]);
+                    rows.push(vec![
+                        "WebRTC".to_string(),
+                        format!(
+                            "{} messages sent, {} received, {} invalid frames",
+                            detail("webrtc_sent_messages")?,
+                            detail("webrtc_received_messages")?,
+                            detail("webrtc_invalid_frames")?
+                        ),
+                    ]);
+                    Ok(rows)
+                },
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+    }
     /// Local SQLite keeps only that the monitor was started or stopped; every
     /// check it performs is written to the external (PostgreSQL) database.
     pub fn record_monitor_status(&self, timestamp_utc: &str, monitor_id: u64, status: &str) {
@@ -866,6 +1145,61 @@ impl SqlState {
             );
         }
     }
+}
+
+/// The detail columns of the `runs` table, in the order `RunDetail` reports them.
+pub const RUN_DETAIL_COLUMNS: [&str; 23] = [
+    "sent_tcp_packets",
+    "sent_tcp_bytes",
+    "received_tcp_packets",
+    "received_tcp_bytes",
+    "sent_udp_packets",
+    "sent_udp_bytes",
+    "received_udp_packets",
+    "received_udp_bytes",
+    "sent_ip_packets",
+    "sent_ip_bytes",
+    "received_ip_packets",
+    "received_ip_bytes",
+    "lost_packets",
+    "out_of_order_packets",
+    "jitter_millis",
+    "tcp_jitter_millis",
+    "udp_jitter_millis",
+    "tcp_mss",
+    "tcp_mtu",
+    "tcp_window_size",
+    "webrtc_sent_messages",
+    "webrtc_received_messages",
+    "webrtc_invalid_frames",
+];
+
+fn run_detail_values(detail: &RunDetail) -> [u64; 23] {
+    [
+        detail.sent_tcp_packets,
+        detail.sent_tcp_bytes,
+        detail.received_tcp_packets,
+        detail.received_tcp_bytes,
+        detail.sent_udp_packets,
+        detail.sent_udp_bytes,
+        detail.received_udp_packets,
+        detail.received_udp_bytes,
+        detail.sent_ip_packets,
+        detail.sent_ip_bytes,
+        detail.received_ip_packets,
+        detail.received_ip_bytes,
+        detail.lost_packets,
+        detail.out_of_order_packets,
+        detail.jitter_millis,
+        detail.tcp_jitter_millis,
+        detail.udp_jitter_millis,
+        detail.tcp_mss,
+        detail.tcp_mtu,
+        detail.tcp_window_size,
+        detail.webrtc_sent_messages,
+        detail.webrtc_received_messages,
+        detail.webrtc_invalid_frames,
+    ]
 }
 
 const MONITOR_STATUS_TABLE: &str = "CREATE TABLE IF NOT EXISTS monitor_status (timestamp_utc TEXT NOT NULL, monitor_id INTEGER NOT NULL, status TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'unknown')";

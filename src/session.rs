@@ -196,11 +196,9 @@ impl Session {
                 None => "disabled".to_string(),
             },
             ["restapi", ..] => "restapi: enable [<address>] | disable | status".to_string(),
-            // Command: webrtc
-            ["webrtc", rest @ ..] => match webrtc_command(&self.webrtc, rest) {
-                Ok(summary) => summary,
-                Err(error) => error,
-            },
+            // Command: webrtc and sctp moved under configure; point the way.
+            ["webrtc", ..] => "webrtc moved: use configure webrtc ...".to_string(),
+            ["sctp", ..] => "sctp moved: use configure sctp ...".to_string(),
             // Command: admin
             ["admin"] => ADMIN_USAGE.to_string(),
             ["admin", "add", "email", address] => {
@@ -280,6 +278,32 @@ impl Session {
                 }
                 Err(_) => "UDP max jitter must be milliseconds".to_string(),
             },
+            // Subcommand: configure webrtc — the data-channel layer.
+            ["configure", "webrtc", rest @ ..] => match webrtc_command(&self.webrtc, rest) {
+                Ok(summary) => summary,
+                Err(error) => error,
+            },
+            // Subcommand: configure sctp — the detailed page and kernel state.
+            ["configure", "sctp"] => {
+                cli_textout::table_lines(&sctp_help_rows(), &[16, 84]).join("\n")
+            }
+            ["configure", "sctp", "status"] => {
+                format!("SCTP: {}", crate::restapi::sctp_status())
+            }
+            // Subcommand: configure <protocol> enable | disable
+            ["configure", protocol, "enable"] => {
+                match cli::set_protocol_enabled(&self.config, protocol, true) {
+                    Ok(line) | Err(line) => line,
+                }
+            }
+            ["configure", protocol, "disable"] => {
+                match cli::set_protocol_enabled(&self.config, protocol, false) {
+                    Ok(line) | Err(line) => line,
+                }
+            }
+            ["configure", "protocols"] | ["configure", "protocols", "status"] => {
+                cli::protocols_table(&self.config, &self.webrtc.lock().unwrap())
+            }
             ["configure", "limits", rest @ ..] => {
                 match cli::configure_limits(&self.config, rest) {
                     Ok(output) | Err(output) => output,
@@ -371,9 +395,9 @@ impl Session {
             ["status"] => self.status_text(),
             // Command: show run <id>
             ["show", "run", value] => match value.parse::<u64>() {
-                Ok(id) => match self.sql.show_run(id) {
-                    Ok(Some(row)) => {
-                        let mut lines = vec![format!("Run {id}:"), row];
+                Ok(id) => match self.sql.run_detail_rows(id) {
+                    Ok(Some(rows)) => {
+                        let mut lines = cli_textout::table_lines(&rows, &[16, 80]);
                         lines.extend(self.sql.debriefs(id).unwrap_or_default());
                         lines.join("\n")
                     }
@@ -387,10 +411,6 @@ impl Session {
                 Ok(rows) => rows.join("\n"),
                 Err(error) => format!("sql error: {error}"),
             },
-            // Command: sctp
-            ["sctp"] => cli_textout::table_lines(&sctp_help_rows(), &[16, 84]).join("\n"),
-            ["sctp", "status"] => format!("SCTP: {}", crate::restapi::sctp_status()),
-            ["sctp", ..] => "sctp: (no argument for the help page) | status".to_string(),
             // Command: help — help alone lists everything; help <command...> shows
             // that command's rows through the shared help_for.
             ["help", topic @ ..] => match help_for(topic) {
@@ -427,6 +447,16 @@ impl Session {
     fn start_run(&self) -> String {
         if self.is_running() {
             return "a run is already active; stop it before starting another".to_string();
+        }
+        // A transport turned off with `configure <protocol> disable` cannot run.
+        {
+            let config = self.config.lock().unwrap();
+            if !config.protocols.enabled(config.packet_type) {
+                let protocol = config.packet_type.as_str();
+                return format!(
+                    "{protocol} is disabled; turn it on with: configure {protocol} enable"
+                );
+            }
         }
         let enabled = self.clients.enabled();
         let run_id = self.sql.next_run_id(self.run_id() + 1);
@@ -550,6 +580,12 @@ impl Session {
                 cli::web_server_status("", &self.restapi_config.lock().unwrap().address),
             ),
         };
+        // One lock for both fields: two `lock()` calls in the same statement
+        // would keep the first guard alive and deadlock.
+        let (packet_type, protocols) = {
+            let config = self.config.lock().unwrap();
+            (config.packet_type, config.protocols)
+        };
         let context = StatusContext {
             running: self.is_running(),
             elapsed: self.run_started().map(|started| started.elapsed()),
@@ -557,7 +593,8 @@ impl Session {
             server_enabled: self.server_enabled(),
             clients: &self.clients,
             webrtc: &self.webrtc.lock().unwrap(),
-            packet_type: self.config.lock().unwrap().packet_type,
+            packet_type,
+            protocols,
             monitor: self.monitor.status(),
             metrics_sql: self
                 .external
