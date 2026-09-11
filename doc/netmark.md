@@ -799,19 +799,21 @@ installed it creates a cluster from `k8s/kind-config.yaml` with three nodes:
 
 - a control plane,
 - a **database node** (label `netmark.io/role: database`) running
-  `k8s/postgres.yaml`,
-- an **app node** (label `netmark.io/role: app`) running the netmark
-  application (`k8s/netmark.yaml`, image built from `k8s/Dockerfile.netmark`)
-  in `--serve` mode, wired to the database service, plus Grafana
+  `k8s/postgres.yaml`, which also runs the netmark application (image built
+  from `k8s/Dockerfile.netmark`) in `--serve` mode as a third container in the
+  same pod, wired to PostgreSQL over `localhost`-equivalent pod networking, so
+  its always-on local `log/netmark.sqlite` lives on the same pod/data volume as
+  the external PostgreSQL it complements,
+- an **app node** (label `netmark.io/role: app`) running Grafana
   (`k8s/grafana.yaml`) graphing that same external metrics database.
 
-The cluster is four containers:
+The cluster is four containers, three of them sharing one pod:
 
 | Container | Where | What it does |
 | --- | --- | --- |
 | `postgres` | `k8s/postgres.yaml` | PostgreSQL with Timescale; holds all run metrics and all monitor data |
 | `volume` | `k8s/postgres.yaml` | Owns the persistent volume claim, checks it is writable and reports how full it is |
-| `netmark` | `k8s/netmark.yaml` | The web server: the web CLI and the REST API on port 8080 |
+| `netmark` | `k8s/postgres.yaml` (Service in `k8s/netmark.yaml`) | The web server: the web CLI and the REST API on port 8080; its local sqlite database lives on the same pod/volume as `postgres` |
 | `grafana` | `k8s/grafana.yaml` | Grafana reading `netmark_metrics` (with `run_id` on every point) from PostgreSQL |
 
 Both deployments prefer their labeled node but still schedule on single-node
@@ -824,17 +826,19 @@ host, so after `init.sh` finishes:
   jitter and loss by `run_id`,
 - `./netmarkctl <command>` controls the same service from the shell,
 - PostgreSQL is port-forwarded to `127.0.0.1:5433` and the connection string is
-  written into `netmark.config` for a host-side netmark.
+  written into `netmark.config` for a host-side netmark, so both the local
+  sqlite log and the external PostgreSQL/Timescale database are active by
+  default.
 
 `k8s/cluster-test.sh` checks that the cluster is up and healthy. It runs one
 case per expectation — the API is reachable, the namespace exists, the
-`postgres`, `volume` and `grafana` containers are deployed, the postgres, app
-and grafana deployments have a ready replica, the data volume is bound,
-PostgreSQL accepts connections, the volume container owns the data volume, the
-web server answers both `/api/v1/status` and the web CLI, and Grafana reports
-healthy — printing `ok` or `FAIL` for each and exiting non-zero if any case
-fails. Set `NETMARK_NAMESPACE`, `NETMARK_WEB` or `NETMARK_GRAFANA` to test
-another deployment.
+`postgres`, `volume`, `netmark` and `grafana` containers are deployed, the
+postgres and grafana deployments have a ready replica, the data volume is
+bound, PostgreSQL accepts connections, the volume container owns the data
+volume, the web server answers both `/api/v1/status` and the web CLI, and
+Grafana reports healthy — printing `ok` or `FAIL` for each and exiting
+non-zero if any case fails. Set `NETMARK_NAMESPACE`, `NETMARK_WEB` or
+`NETMARK_GRAFANA` to test another deployment.
 
 ---
 

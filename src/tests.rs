@@ -2040,15 +2040,21 @@ fn the_kubernetes_cluster_includes_grafana_and_a_test_script() {
     let postgres = std::fs::read_to_string(root.join("k8s/postgres.yaml")).unwrap();
     let netmark = std::fs::read_to_string(root.join("k8s/netmark.yaml")).unwrap();
     let grafana = std::fs::read_to_string(root.join("k8s/grafana.yaml")).unwrap();
-    // PostgreSQL + volume, the web server, and Grafana reading the external metrics DB.
+    // PostgreSQL + volume + the web server share one pod, and Grafana reads the
+    // external metrics DB. The web server lives in the same pod as PostgreSQL
+    // so its always-on local sqlite database sits on the same data volume.
     assert!(postgres.contains("- name: postgres"), "no postgres container");
     assert!(postgres.contains("- name: volume"), "no volume container");
     assert!(
         postgres.contains("claimName: netmark-postgres-data"),
         "the pod does not mount the data volume"
     );
-    assert!(netmark.contains("- name: netmark"), "no web server container");
-    assert!(netmark.contains("--serve"), "the web server is not served");
+    assert!(postgres.contains("- name: netmark"), "no web server container");
+    assert!(postgres.contains("--serve"), "the web server is not served");
+    assert!(
+        netmark.contains("app: netmark-postgres"),
+        "the web server Service must select the postgres pod"
+    );
     assert!(grafana.contains("- name: grafana"), "no grafana container");
     assert!(
         grafana.contains("netmark-postgres:5432"),
@@ -2075,6 +2081,7 @@ fn the_kubernetes_cluster_includes_grafana_and_a_test_script() {
         "kubernetes api reachable",
         "postgres container is deployed",
         "volume container is deployed",
+        "netmark container shares the postgres pod",
         "grafana container is deployed",
         "data volume is bound",
         "postgres accepts connections",

@@ -1,7 +1,10 @@
 # The netmark cluster keeps four containers: this file holds the PostgreSQL
-# container and the volume container that owns the data volume; netmark.yaml
-# holds the web server container; grafana.yaml holds Grafana for the external
-# metrics database.
+# container, the volume container that owns the data volume, and the netmark
+# web server container itself, all in one pod so the always-on local
+# log/netmark.sqlite sits on the same pod (and the same data volume) as the
+# external PostgreSQL it complements; netmark.yaml holds only the Service that
+# exposes the web server; grafana.yaml holds Grafana for the external metrics
+# database.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -90,6 +93,45 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+        # The netmark web server itself. It runs in this same pod (rather than a
+        # pod of its own) so its always-on local log/netmark.sqlite lands on the
+        # same data volume as the external PostgreSQL, instead of being stranded
+        # on a separate node with nothing to back it up.
+        - name: netmark
+          image: netmark-app:local
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          # Write netmark.config next to the binary so the app picks up the
+          # external metrics database, then start the headless server.
+          args:
+            - >-
+              printf 'metrics:\n  sql: "******netmark-postgres:5432/%s"\n'
+              "$POSTGRES_USER" "$POSTGRES_PASSWORD" "$POSTGRES_DB"
+              > /opt/netmark/netmark.config
+              && exec /opt/netmark/netmark --serve 0.0.0.0:8080
+          envFrom:
+            - secretRef:
+                name: netmark-postgres
+          ports:
+            - name: web
+              containerPort: 8080
+            - name: traffic-tcp
+              containerPort: 9000
+            - name: traffic-udp
+              containerPort: 9001
+              protocol: UDP
+          readinessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: web
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          volumeMounts:
+            # subPath keeps the sqlite log directory out of PostgreSQL's own
+            # data directory while still living on the same volume/pod.
+            - name: data
+              mountPath: /opt/netmark/log
+              subPath: netmark-log
       volumes:
         - name: data
           persistentVolumeClaim:

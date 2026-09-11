@@ -51,15 +51,21 @@ if [ -n "${POSTGRES_USER:-}" ] && [ -n "${POSTGRES_PASSWORD:-}" ] && [ -n "${POS
     --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 fi
 
-kubectl apply -f "$MANIFEST"
-kubectl -n "$NAMESPACE" rollout status deployment/netmark-postgres --timeout=180s
-
-# The app image is local, so hand it to the kind nodes when kind is in use.
+# The app image is local, so hand it to the kind nodes when kind is in use. The
+# netmark app container now runs in the same pod as PostgreSQL (postgres.yaml),
+# so the image has to be loaded before that manifest is applied.
 if command -v kind >/dev/null 2>&1 && kind get clusters 2>/dev/null | grep -qx "$CLUSTER_NAME"; then
   kind load docker-image netmark-app:local --name "$CLUSTER_NAME"
 fi
+
+kubectl apply -f "$MANIFEST"
+kubectl -n "$NAMESPACE" rollout status deployment/netmark-postgres --timeout=180s
+
+# Only the Service is left to apply for the web interface: the netmark
+# container itself is already up as part of the netmark-postgres pod above, so
+# its always-on local log/netmark.sqlite lives on the same pod/volume as the
+# external PostgreSQL it complements.
 kubectl apply -f "$APP_MANIFEST"
-kubectl -n "$NAMESPACE" rollout status deployment/netmark-app --timeout=180s
 
 # Grafana reads the same external metrics database the CLI writes to.
 kubectl apply -f "$GRAFANA_MANIFEST"
