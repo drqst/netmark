@@ -44,8 +44,9 @@ fi
 check "kubernetes api reachable" kubectl cluster-info
 check "namespace $namespace exists" kubectl get namespace "$namespace"
 
-# The cluster is four containers: postgres and its volume container in one pod,
-# the netmark web server in another, and Grafana graphing the external metrics DB.
+# The cluster is four containers: postgres, its volume container and the
+# netmark web server all in one pod (so log/netmark.sqlite lives with the
+# external PostgreSQL), plus Grafana graphing the external metrics DB.
 containers=$(kubectl -n "$namespace" get deployment netmark-postgres \
   -o jsonpath='{.spec.template.spec.containers[*].name}' 2>/dev/null)
 case " $containers " in
@@ -56,6 +57,10 @@ case " $containers " in
   *" volume "*) case_ok "volume container is deployed" ;;
   *) case_fail "volume container is deployed" "containers: ${containers:-none}" ;;
 esac
+case " $containers " in
+  *" netmark "*) case_ok "netmark container shares the postgres pod" ;;
+  *) case_fail "netmark container shares the postgres pod" "containers: ${containers:-none}" ;;
+esac
 
 grafana_containers=$(kubectl -n "$namespace" get deployment netmark-grafana \
   -o jsonpath='{.spec.template.spec.containers[*].name}' 2>/dev/null)
@@ -64,7 +69,7 @@ case " $grafana_containers " in
   *) case_fail "grafana container is deployed" "containers: ${grafana_containers:-none}" ;;
 esac
 
-for deployment in netmark-postgres netmark-app netmark-grafana; do
+for deployment in netmark-postgres netmark-grafana; do
   ready=$(kubectl -n "$namespace" get deployment "$deployment" \
     -o jsonpath='{.status.readyReplicas}' 2>/dev/null)
   if [ "${ready:-0}" -ge 1 ] 2>/dev/null; then

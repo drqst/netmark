@@ -1,66 +1,9 @@
-# The web server container of the netmark cluster: the netmark binary in
-# headless server mode, serving the web interface (a web CLI that takes the same
-# commands as the shell CLI, with a live stats panel above it) and the REST API
-# on port 8080. PostgreSQL and its volume container are deployed by
-# postgres.yaml; Grafana, which graphs that external metrics database, is
-# deployed by grafana.yaml.
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: netmark-app
-  namespace: netmark
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: netmark-app
-  template:
-    metadata:
-      labels:
-        app: netmark-app
-    spec:
-      affinity:
-        nodeAffinity:
-          # Prefer the dedicated app node from kind-config.yaml, but still
-          # schedule on single-node clusters such as Docker Desktop.
-          preferredDuringSchedulingIgnoredDuringExecution:
-            - weight: 100
-              preference:
-                matchExpressions:
-                  - key: netmark.io/role
-                    operator: In
-                    values: [app]
-      containers:
-        - name: netmark
-          image: netmark-app:local
-          imagePullPolicy: IfNotPresent
-          command: ["/bin/sh", "-c"]
-          # Write netmark.config next to the binary so the app picks up the
-          # external metrics database, then start the headless server.
-          args:
-            - >-
-              printf 'metrics:\n  sql: "postgresql://%s:%s@netmark-postgres:5432/%s"\n'
-              "$POSTGRES_USER" "$POSTGRES_PASSWORD" "$POSTGRES_DB"
-              > /opt/netmark/netmark.config
-              && exec /opt/netmark/netmark --serve 0.0.0.0:8080
-          envFrom:
-            - secretRef:
-                name: netmark-postgres
-          ports:
-            - name: web
-              containerPort: 8080
-            - name: traffic-tcp
-              containerPort: 9000
-            - name: traffic-udp
-              containerPort: 9001
-              protocol: UDP
-          readinessProbe:
-            httpGet:
-              path: /api/v1/health
-              port: web
-            initialDelaySeconds: 5
-            periodSeconds: 5
----
+# The web interface (a web CLI that takes the same commands as the shell CLI,
+# with a live stats panel above it) and REST API on port 8080 are served by the
+# "netmark" container, which now runs inside the same pod as PostgreSQL (see
+# postgres.yaml) so its always-on local log/netmark.sqlite lives on that pod's
+# data volume. This file only holds the Service that exposes it; Grafana, which
+# graphs the external metrics database, is deployed by grafana.yaml.
 apiVersion: v1
 kind: Service
 metadata:
@@ -69,7 +12,7 @@ metadata:
 spec:
   type: NodePort
   selector:
-    app: netmark-app
+    app: netmark-postgres
   ports:
     - name: web
       port: 8080
