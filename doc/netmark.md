@@ -73,8 +73,8 @@ Build it:
 cargo build --release
 ```
 
-Check that it works on one machine — this sends UDP to localhost for three
-seconds and reports the result:
+Check that it works on one machine — this sends traffic to localhost over every
+protocol in turn, three seconds each, and reports the result of each one:
 
 ```sh
 ./target/release/netmark
@@ -122,7 +122,10 @@ Run `netmark` with no arguments. The prompt shows which roles are active:
 Client | Server >
 ```
 
-- **`help`** lists every command.
+- **`help`** lists every command. `help <command>` narrows it to one command and
+  its subcommands, in the same words the command itself uses: `help start`,
+  `help configure tcp`, `help client 0 remote`, `help configure limits udp`.
+  `help sctp` opens the detailed SCTP page.
 - **Up and down arrows** walk the command history. Position 0 is the line you are
   typing; pressing up moves back through earlier commands and pressing down comes
   forward again, returning your unfinished line when you reach position 0.
@@ -143,8 +146,8 @@ Traffic           running (udp)
 Run               42 (7 s elapsed)
 Bandwidth up      10240 bytes/sec
 Bandwidth down    10240 bytes/sec
-Sent              71680 bytes  (TCP 0, UDP 71680, IP 0)
-Received          71680 bytes  (TCP 0, UDP 71680, IP 0)
+Sent              71680 bytes  (TCP/SCTP 0, UDP 71680, IP 0)
+Received          71680 bytes  (TCP/SCTP 0, UDP 71680, IP 0)
 UDP loss          0 lost, 0 out of order
 Jitter            TCP 0 ms, UDP 2 ms
 Server            enabled
@@ -154,14 +157,20 @@ WebRTC            webrtc disabled channels=1 label=netmark ordered=true
 Monitor           on id 1, 12 calls, 12 ok, 0 failed
 Metrics SQL       not connected
 REST API          disabled
+Web server        listening on http://127.0.0.1:8081 (port 8081)
+SCTP              not selected (available)
 SMTP              disabled
 ```
+
+The same web server line is printed when `./netmark` starts, so the port the web
+interface and REST API listen on is visible without opening the configuration.
 
 ---
 
 ## Command reference
 
-Everything the prompt accepts. `help` prints the same list.
+Everything the prompt accepts. `help` prints the same list, and `help <command>`
+prints just the rows for that command.
 
 ### Roles
 
@@ -197,18 +206,72 @@ still works.
 | `configure udp jitter <ms>` | Deliberate jitter added to UDP sends |
 | `configure udp max jitter <ms>` | Fail the run above this measured UDP jitter |
 | `configure bandwidth limit <bytes/sec>` | Minimum acceptable throughput; 0 disables |
+| `configure limits` | Show every per-protocol limit that can fail a run |
+| `configure limits <tcp\|sctp\|udp\|ip> status` | Show one protocol's limits |
+| `configure limits <tcp\|sctp\|udp\|ip> <parameter> <value>` | Set a limit; 0 removes it |
+| `configure limits <tcp\|sctp\|udp\|ip> clear` | Remove every limit for one protocol |
+| `configure protocols` | Every transport: enabled or disabled, which is selected, host support and WebRTC |
+| `configure <tcp\|sctp\|udp\|ip> enable` | Allow the transport to be selected, started and selftested |
+| `configure <tcp\|sctp\|udp\|ip> disable` | Turn the transport off; `start` refuses it, `selftest` skips it and selecting it is an error |
 | `configure save` | Write the current settings to netmark.config |
 | `configure reset` | Reload netmark.config, discarding session changes |
+
+#### Per-protocol limits
+
+`configure limits` decides when a run fails, per transport, so the same limit
+never has to mean two things. `help configure limits tcp` lists the parameters
+one protocol accepts:
+
+| Parameter | Protocols | Fails the run when |
+| --- | --- | --- |
+| `min-sent-bytes` | all | fewer bytes were sent in the run |
+| `min-received-bytes` | all | fewer bytes were received in the run |
+| `min-sent-bytes-per-second` | all | the sending throughput was lower |
+| `min-received-bytes-per-second` | all | the receiving throughput was lower |
+| `max-jitter-millis` | tcp, sctp, udp | the measured jitter was higher |
+| `max-lost-packets` | udp | more packets were lost |
+| `max-out-of-order-packets` | udp | more packets arrived out of order |
+
+A value of 0 means the limit is not checked, which is the default for all of
+them. Only the limits of the transport a run used are applied, and every limit
+that was missed is named in the run's failure reason. `configure save` writes
+them to `netmark.config` under `traffic.limits`.
+
+```
+> configure limits udp max-lost-packets 5
+udp max-lost-packets limit set to 5
+> configure limits udp status
+udp min-sent-bytes                       not set
+udp min-received-bytes                   not set
+udp min-sent-bytes-per-second            not set
+udp min-received-bytes-per-second        not set
+udp max-jitter-millis                    not set
+udp max-lost-packets                     5
+udp max-out-of-order-packets             not set
+```
+
+#### Turning protocols on and off
+
+Every transport is enabled by default. `configure <protocol> disable` takes one
+out of use: it cannot be selected with `configure type`, `start` refuses to run
+it and `selftest` skips it with the reason. Disabling the selected transport
+moves the selection to an enabled one. The state is shown by `configure
+protocols` and in the `Protocols` row of `status`, and `configure save` writes it
+to `netmark.config` under `traffic.protocols`.
+
+SCTP and WebRTC are configured the same way, as subcommands of `configure`:
+`configure sctp` opens the detailed SCTP page, `configure sctp status` reports
+kernel support, and `configure webrtc ...` holds the data-channel settings.
 
 ### WebRTC
 
 | Command | Effect |
 | --- | --- |
-| `webrtc enable` / `webrtc disable` | Turn the data-channel layer on or off for every client that follows |
-| `webrtc channels <n>` | Spread messages over N channels |
-| `webrtc label <name>` | Data-channel label |
-| `webrtc ordered <true\|false>` | Ordered or unordered delivery |
-| `webrtc status` | Show the current settings |
+| `configure webrtc enable` / `configure webrtc disable` | Turn the data-channel layer on or off for every client that follows |
+| `configure webrtc channels <n>` | Spread messages over N channels |
+| `configure webrtc label <name>` | Data-channel label |
+| `configure webrtc ordered <true\|false>` | Ordered or unordered delivery |
+| `configure webrtc status` | Show the current settings |
 | `client <id> webrtc <on\|off\|follow>` | Override the layer for one client |
 
 **Connecting WebRTC to a particular client.** The `webrtc` command sets the
@@ -244,12 +307,14 @@ clients:
 
 | Command | Effect |
 | --- | --- |
-| `start` / `stop` | Start and stop a run |
-| `selftest` | Three seconds of UDP to localhost, start to verdict |
+| `start` / `stop` | Start and stop a run; `stop` names the transport it stopped, ends an SCTP association and debriefs over the same transport |
+| `configure sctp` | Detailed SCTP help: kernel support, how to select, run and stop it |
+| `configure sctp status` | Whether the kernel can open an SCTP socket |
+| `selftest` | Three seconds to localhost over udp, tcp, sctp and ip in turn, each start to verdict; a transport this host cannot carry is skipped with the reason |
 | `benchmark duration <seconds>` | Flood the remote with TCP and report bandwidth |
 | `status` | Current counters, bandwidth up and down, and the state of everything else, as a table |
-| `list` | Every run with its role, result and bandwidth |
-| `show run <id>` | One run, its bandwidth and both sides' debriefs |
+| `list` | Every run with its role, transport, result, bandwidth and per-protocol packet, byte, loss and jitter counters |
+| `show run <id>` | Everything stored for one run, as a table: times, role, transport, result and failure reason, totals and bandwidth, the TCP/SCTP, UDP and raw IP packet and byte counters, loss, jitter, the TCP transport figures and the WebRTC counts, followed by both sides' debriefs |
 | `clean` | Delete stored data, keeping the run id counter |
 
 ### Metrics, monitoring and administration
@@ -339,7 +404,10 @@ two counts line up exactly.
 A reliable, message-oriented SCTP association paced by `tcp_bytes_per_second`.
 The host kernel must support SCTP; netmark reports the socket error if it does
 not. SCTP shares the stream framing and TCP jitter budget, while TCP-only MSS,
-MTU and window values remain zero for SCTP runs.
+MTU and window values remain zero for SCTP runs. `stop` ends the association so
+the receiving side sees the end of the run at once. The `sctp` command prints a
+detailed help page covering all of that, including whether this kernel supports
+SCTP; it is available in the web CLI too.
 
 ### UDP
 
@@ -600,8 +668,8 @@ In `log/` next to the binary:
 
 ### Local SQLite
 
-`log/netmark.sqlite`, always on. Three tables — `runs`, `debriefs` and `alarms` —
-and **every one of them has a `role` column** saying which side wrote the row:
+`log/netmark.sqlite`, always on. Four tables — `runs`, `debriefs`, `alarms` and
+`monitor_status` — and **every one of them has a `role` column** saying which side wrote the row:
 `client`, `server`, `client+server` or `none`. A database copied off any host
 therefore says plainly what that host was doing.
 
@@ -611,6 +679,9 @@ SELECT run_id, role, matched, mismatch_reason FROM debriefs;
 ```
 
 Millisecond-level metrics are never stored here; they only go to external SQL.
+The same is true of monitoring: SQLite keeps only `monitor_status`, one row for
+each time the monitor was started or stopped, while every check itself is stored
+in the external database.
 
 ### External SQL
 
@@ -627,8 +698,17 @@ for you, if you want one.
 ## Monitoring and alerts
 
 `monitor IP <url>` and `monitor start` fetch a URL every 30 seconds, counting
-successes and failures and logging every failure to `alarm.log` and the `alarms`
-table.
+successes and failures and logging every failure to `alarm.log`.
+
+**All monitor data is stored in the external (PostgreSQL) database**, one row per
+check in `netmark_monitor` with the timestamp, monitor id, call id, target,
+result, latency in milliseconds and the failure detail. The local SQLite database
+holds only the start and stop status, in `monitor_status`. Checks made while no
+external database is connected are logged but not stored.
+
+```sql
+SELECT timestamp_utc, target, result, latency_millis FROM netmark_monitor ORDER BY timestamp_utc;
+```
 
 SMTP is configured with `configure smtp <host[:port]>` and turned on with
 `admin smtp enabled`, which first opens a connection and completes an EHLO
@@ -670,9 +750,17 @@ that authenticates.
 ## The web interface and the web CLI
 
 `GET /` on the REST API address serves a self-contained page with a **web CLI**:
-a browser terminal over `POST /api/v1/cli` that understands `help`, `status`,
-`list`, `show <id>`, `clients` and `profile`. Runs are started by posting a
-profile — JSON or an unchanged YAML file from `profiles/` — to `/api/v1/runs`.
+a browser terminal over `POST /api/v1/cli`. It runs the same command core as the
+shell CLI (`src/session.rs`), so every command in the reference above behaves the
+same way and prints byte-identical output in both places, and its prompt shows
+the same roles. Runs can also be started by posting a profile — JSON or an
+unchanged YAML file from `profiles/` — to `/api/v1/runs`.
+
+Above the terminal the page shows a **status section**: what is running right
+now, the transport in use, whether the kernel supports SCTP, the current run and
+its elapsed time, bytes and bandwidth in both directions, the server and client
+state and the web server address. It polls `GET /api/v1/status` once a second,
+so it follows a run live and is never reloaded.
 
 The same commands work from bash/shell through the `netmarkctl` script in the
 repository root, so a netmark service can be controlled both from the browser
@@ -703,11 +791,18 @@ installed it creates a cluster from `k8s/kind-config.yaml` with three nodes:
 
 - a control plane,
 - a **database node** (label `netmark.io/role: database`) running
-  PostgreSQL with Timescale (`k8s/postgres.yaml`) on a persistent volume claim
-  for its data,
+  `k8s/postgres.yaml`,
 - an **app node** (label `netmark.io/role: app`) running the netmark
   application (`k8s/netmark.yaml`, image built from `k8s/Dockerfile.netmark`)
   in `--serve` mode, wired to the database service.
+
+The cluster is kept to three containers:
+
+| Container | Where | What it does |
+| --- | --- | --- |
+| `postgres` | `k8s/postgres.yaml` | PostgreSQL with Timescale; holds all run metrics and all monitor data |
+| `volume` | `k8s/postgres.yaml` | Owns the persistent volume claim, checks it is writable and reports how full it is |
+| `netmark` | `k8s/netmark.yaml` | The web server: the web CLI and the REST API on port 8080 |
 
 Both deployments prefer their labeled node but still schedule on single-node
 clusters such as Docker Desktop. The app node's NodePort 30080 is mapped to the
@@ -717,6 +812,14 @@ host, so after `init.sh` finishes:
 - `./netmarkctl <command>` controls the same service from the shell,
 - PostgreSQL is port-forwarded to `127.0.0.1:5433` and the connection string is
   written into `netmark.config` for a host-side netmark.
+
+`k8s/cluster-test.sh` checks that the cluster is up and healthy. It runs one
+case per expectation — the API is reachable, the namespace exists, the
+`postgres` and `volume` containers are deployed, both deployments have a ready
+replica, the data volume is bound, PostgreSQL accepts connections, the volume
+container owns the data volume, and the web server answers both `/api/v1/status`
+and the web CLI — printing `ok` or `FAIL` for each and exiting non-zero if any
+case fails. Set `NETMARK_NAMESPACE` or `NETMARK_WEB` to test another deployment.
 
 ---
 

@@ -74,6 +74,17 @@ impl SctpStream {
     pub fn set_nonblocking(&self, enabled: bool) -> io::Result<()> {
         set_nonblocking(self.0.as_raw_fd(), enabled)
     }
+
+    /// Ends the association in both directions, so `stop` closes the run down
+    /// cleanly instead of leaving the peer waiting for more data.
+    pub fn shutdown(&self) -> io::Result<()> {
+        // SAFETY: fd is a valid connected SCTP socket.
+        if unsafe { libc::shutdown(self.0.as_raw_fd(), libc::SHUT_RDWR) } < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl io::Read for SctpStream {
@@ -92,6 +103,12 @@ impl io::Write for SctpStream {
     }
 
     fn flush(&mut self) -> io::Result<()> { Ok(()) }
+}
+
+/// Whether the host kernel can open an SCTP socket, so `status` can say why an
+/// SCTP run would fail before one is started.
+pub fn availability() -> Result<(), String> {
+    socket().map(|_| ()).map_err(|error| error.to_string())
 }
 
 fn socket() -> io::Result<OwnedFd> {

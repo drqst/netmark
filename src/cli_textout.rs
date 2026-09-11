@@ -22,21 +22,30 @@ pub fn raw(text: impl AsRef<str>) {
     let _ = stdout.flush();
 }
 
+/// Formats `rows` into aligned text lines using `widths`, shared by the terminal
+/// table printer and every surface that returns table output as text (status,
+/// help and the SCTP page in the web CLI).
+pub fn table_lines(rows: &[Vec<String>], widths: &[usize]) -> Vec<String> {
+    rows.iter()
+        .map(|row| {
+            let mut line = String::new();
+            for (index, value) in row.iter().enumerate() {
+                if index > 0 {
+                    line.push_str("  ");
+                }
+                let width = widths.get(index).copied().unwrap_or(value.len());
+                line.push_str(&format!("{value:<width$}"));
+            }
+            line
+        })
+        .collect()
+}
+
 pub fn table(rows: &[Vec<String>], widths: &[usize]) {
     let _guard = stdout_lock().lock().unwrap();
     let mut stdout = io::stdout().lock();
-    for row in rows {
-        for (index, value) in row.iter().enumerate() {
-            if index > 0 {
-                let _ = write!(stdout, "  ");
-            }
-            let _ = write!(
-                stdout,
-                "{value:<width$}",
-                width = widths.get(index).copied().unwrap_or(value.len())
-            );
-        }
-        let _ = write!(stdout, "\r\n");
+    for line in table_lines(rows, widths) {
+        let _ = write!(stdout, "{line}\r\n");
     }
     let _ = stdout.flush();
 }

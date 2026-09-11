@@ -7,8 +7,9 @@
 
 use crate::cli::Clients;
 use crate::configuration::{RestApiConfig, TestProfile};
-use crate::core::SqlState;
+use crate::core::{Metrics, PacketType, SqlState};
 use crate::sdk::TestRunner;
+use crate::session::Session;
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -38,6 +39,102 @@ pub struct RestApi {
     busy: Arc<AtomicBool>,
     clients: Arc<Clients>,
     log_dir: PathBuf,
+    live: Arc<LiveStatus>,
+    /// When attached, `POST /api/v1/cli` runs every command through the same
+    /// dispatcher as the interactive shell CLI. Absent for the read-only,
+    /// state-free command set the tests rely on.
+    session: Mutex<Option<Arc<Session>>>,
+}
+
+/// What this instance is doing right now. The CLI and the SDK keep it up to
+/// date, and the web interface polls it so the status section on the page
+/// follows the run without a reload.
+#[derive(Default)]
+pub struct LiveStatus {
+    inner: Mutex<LiveStatusInner>,
+}
+
+#[derive(Default)]
+struct LiveStatusInner {
+    running: bool,
+    run_id: u64,
+    packet_type: String,
+    server_enabled: bool,
+    enabled_clients: usize,
+    elapsed: Duration,
+    metrics: Option<Arc<Metrics>>,
+}
+
+impl LiveStatus {
+    /// Hands the live counters to the status page; they are read at request time
+    /// so the numbers are current without any extra bookkeeping.
+    pub fn attach_metrics(&self, metrics: Arc<Metrics>) {
+        self.inner.lock().unwrap().metrics = Some(metrics);
+    }
+
+    pub fn update(
+        &self,
+        running: bool,
+        run_id: u64,
+        packet_type: PacketType,
+        server_enabled: bool,
+        enabled_clients: usize,
+        elapsed: Option<Duration>,
+    ) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.running = running;
+        inner.run_id = run_id;
+        inner.packet_type = packet_type.as_str().to_string();
+        inner.server_enabled = server_enabled;
+        inner.enabled_clients = enabled_clients;
+        inner.elapsed = elapsed.unwrap_or_default();
+    }
+
+    /// One sentence describing the current activity, shared by the web page, the
+    /// web CLI and `netmarkctl`.
+    pub fn activity(&self) -> String {
+        let inner = self.inner.lock().unwrap();
+        if !inner.running {
+            return "idle - no run in progress".to_string();
+        }
+        let transport = if inner.packet_type.is_empty() {
+            "tcp".to_string()
+        } else {
+            inner.packet_type.to_uppercase()
+        };
+        format!(
+            "running {transport} run {} for {} s with {} client(s), server {}",
+            inner.run_id,
+            inner.elapsed.as_secs(),
+            inner.enabled_clients,
+            if inner.server_enabled {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        )
+    }
+
+    fn json(&self) -> Value {
+        let inner = self.inner.lock().unwrap();
+        let (sent, received) = inner
+            .metrics
+            .as_ref()
+            .map(|metrics| (metrics.run_sent_total(), metrics.run_received_total()))
+            .unwrap_or((0, 0));
+        json!({
+            "running": inner.running,
+            "run_id": inner.run_id,
+            "elapsed_seconds": inner.elapsed.as_secs(),
+            "packet_type": if inner.packet_type.is_empty() { "tcp" } else { inner.packet_type.as_str() },
+            "server_enabled": inner.server_enabled,
+            "clients_enabled": inner.enabled_clients,
+            "sent_bytes": sent,
+            "received_bytes": received,
+            "sent_bytes_per_second": crate::core::bandwidth(sent, inner.elapsed),
+            "received_bytes_per_second": crate::core::bandwidth(received, inner.elapsed),
+        })
+    }
 }
 
 impl RestApi {
@@ -48,11 +145,34 @@ impl RestApi {
             busy: Arc::new(AtomicBool::new(false)),
             clients,
             log_dir,
+            live: Arc::new(LiveStatus::default()),
+            session: Mutex::new(None),
         }
+    }
+
+    /// Attaches a [`Session`] so the web CLI runs the full shell command set;
+    /// without it, only the read-only commands are served.
+    pub fn attach_session(&self, session: Arc<Session>) {
+        *self.session.lock().unwrap() = Some(session);
+    }
+
+    /// The live status this instance publishes; the CLI updates it as runs start
+    /// and stop.
+    pub fn live(&self) -> &Arc<LiveStatus> {
+        &self.live
     }
 
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::Relaxed)
+    }
+
+    /// The address the web server is listening on, empty when it is not running.
+    pub fn address(&self) -> String {
+        if self.is_running() {
+            self.address.lock().unwrap().clone()
+        } else {
+            String::new()
+        }
     }
 
     pub fn status(&self) -> String {
@@ -147,6 +267,7 @@ impl RestApi {
                 }),
             ),
             ("GET", "/api/v1/openapi.yaml") => (200, Value::String(OPENAPI.to_string())),
+            ("GET", "/api/v1/status") => (200, self.status_json()),
             ("GET", "/" | "/index.html") => (200, Value::String(WEB_UI.to_string())),
             ("POST", "/api/v1/cli") => self.cli_command(&request.body),
             ("GET", "/api/v1/clients") => (
@@ -180,6 +301,76 @@ impl RestApi {
         }
     }
 
+    /// The live status the web page polls, and the source of the `status` text
+    /// in the web CLI, so the browser and the terminal never disagree.
+    fn status_json(&self) -> Value {
+        let mut status = self.live.json();
+        let busy = self.busy.load(Ordering::Relaxed);
+        if busy && let Some(object) = status.as_object_mut() {
+            object.insert("running".to_string(), Value::Bool(true));
+        }
+        if let Some(object) = status.as_object_mut() {
+            object.insert(
+                "version".to_string(),
+                Value::String(env!("CARGO_PKG_VERSION").to_string()),
+            );
+            object.insert("web_server".to_string(), Value::String(self.status()));
+            object.insert(
+                "web_address".to_string(),
+                Value::String(self.address.lock().unwrap().clone()),
+            );
+            object.insert("sctp".to_string(), Value::String(sctp_status()));
+            object.insert("activity".to_string(), Value::String(self.activity()));
+        }
+        status
+    }
+
+    fn activity(&self) -> String {
+        if self.busy.load(Ordering::Relaxed) {
+            "running a test profile posted to /api/v1/runs".to_string()
+        } else {
+            self.live.activity()
+        }
+    }
+
+    fn status_text(&self) -> String {
+        let status = self.status_json();
+        let field = |name: &str| status.get(name).cloned().unwrap_or(Value::Null);
+        format!(
+            concat!(
+                "netmark {}\n",
+                "activity:   {}\n",
+                "transport:  {}\n",
+                "sctp:       {}\n",
+                "run:        {}\n",
+                "traffic:    {} bytes sent, {} bytes received\n",
+                "bandwidth:  {} bytes/sec up, {} bytes/sec down\n",
+                "server:     {}\n",
+                "clients:    {} enabled\n",
+                "web server: {}"
+            ),
+            env!("CARGO_PKG_VERSION"),
+            field("activity").as_str().unwrap_or_default(),
+            field("packet_type").as_str().unwrap_or_default(),
+            field("sctp").as_str().unwrap_or_default(),
+            match field("run_id").as_u64().unwrap_or(0) {
+                0 => "none yet".to_string(),
+                id => format!("{id} ({} s elapsed)", field("elapsed_seconds").as_u64().unwrap_or(0)),
+            },
+            field("sent_bytes").as_u64().unwrap_or(0),
+            field("received_bytes").as_u64().unwrap_or(0),
+            field("sent_bytes_per_second").as_u64().unwrap_or(0),
+            field("received_bytes_per_second").as_u64().unwrap_or(0),
+            if field("server_enabled").as_bool().unwrap_or(false) {
+                "enabled"
+            } else {
+                "disabled"
+            },
+            field("clients_enabled").as_u64().unwrap_or(0),
+            field("web_server").as_str().unwrap_or_default(),
+        )
+    }
+
     fn show_run(&self, id: u64) -> (u16, Value) {
         let sql = SqlState::new();
         match sql.show_run(id) {
@@ -188,6 +379,15 @@ impl RestApi {
                 json!({
                     "run_id": id,
                     "summary": summary,
+                    // Everything else the run collected, as label/value pairs.
+                    "detail": sql
+                        .run_detail_rows(id)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|row| json!({ "label": row[0], "value": row[1] }))
+                        .collect::<Vec<_>>(),
                     "debriefs": sql.debriefs(id).unwrap_or_default(),
                 }),
             ),
@@ -196,8 +396,10 @@ impl RestApi {
         }
     }
 
-    /// The web CLI: a small text command set over the same state the REST API
-    /// exposes, so the browser terminal and `netmarkctl` behave like the local CLI.
+    /// The web CLI: with a [`Session`] attached it runs the full shell command
+    /// set; otherwise it serves a small read-only command set over the same
+    /// state the REST API exposes. The `clients`, `profile` and `show <id>`
+    /// helpers work either way so `netmarkctl` keeps functioning.
     fn cli_command(&self, body: &str) -> (u16, Value) {
         let request: Value = match serde_json::from_str(body) {
             Ok(value) => value,
@@ -206,66 +408,52 @@ impl RestApi {
         let Some(command) = request.get("command").and_then(Value::as_str) else {
             return (400, json!({ "error": "body must be {\"command\": \"...\"}" }));
         };
-        let output = match command.split_whitespace().collect::<Vec<_>>().as_slice() {
+        let tokens = command.split_whitespace().collect::<Vec<_>>();
+        // Compatibility helpers the local CLI has no direct equivalent for.
+        match tokens.as_slice() {
+            ["clients"] => return (200, json!({ "output": self.clients_text() })),
+            ["profile"] => {
+                return (
+                    200,
+                    json!({ "output": serde_json::to_string_pretty(&TestProfile::default())
+                        .unwrap_or_else(|error| error.to_string()) }),
+                );
+            }
+            ["show", id] => return self.web_show(id),
+            _ => {}
+        }
+        // With a session attached, every other command runs through the same
+        // dispatcher as the interactive shell CLI.
+        let session = self.session.lock().unwrap().clone();
+        if let Some(session) = session {
+            return (200, json!({ "output": session.execute(command) }));
+        }
+        let output = match tokens.as_slice() {
             [] | ["help"] => concat!(
                 "Commands:\n",
                 "  help          this text\n",
-                "  status        service version and whether a run is in progress\n",
+                "  status        service version, web server port and what is running now\n",
                 "  list          runs recorded in the local database\n",
                 "  show <id>     summary and debriefs for one run\n",
                 "  clients       configured clients\n",
+                "  configure sctp  detailed SCTP help and kernel support\n",
                 "  profile       the default test profile as JSON\n",
                 "\n",
                 "Start runs by POSTing a profile (JSON or YAML) to /api/v1/runs,\n",
                 "for example with netmarkctl: netmarkctl run profiles/udp-10kbps.yaml"
             )
             .to_string(),
-            ["status"] => format!(
-                "netmark {} - run in progress: {}",
-                env!("CARGO_PKG_VERSION"),
-                if self.busy.load(Ordering::Relaxed) { "yes" } else { "no" }
-            ),
+            ["status"] => self.status_text(),
+            ["configure", "sctp"] => crate::cli::sctp_help_rows()
+                .iter()
+                .map(|row| format!("{:<16}{}", row[0], row[1]))
+                .collect::<Vec<_>>()
+                .join("\n"),
             ["list"] => match SqlState::new().run_list() {
                 Ok(runs) if runs.is_empty() => "no runs recorded".to_string(),
                 Ok(runs) => runs.join("\n"),
                 Err(error) => return (500, json!({ "error": error })),
             },
-            ["show", id] => match id.parse::<u64>() {
-                Ok(id) => {
-                    let sql = SqlState::new();
-                    match sql.show_run(id) {
-                        Ok(Some(summary)) => {
-                            let mut lines = vec![summary];
-                            lines.extend(sql.debriefs(id).unwrap_or_default());
-                            lines.join("\n")
-                        }
-                        Ok(None) => format!("no local record for run {id}"),
-                        Err(error) => return (500, json!({ "error": error })),
-                    }
-                }
-                Err(_) => return (400, json!({ "error": "run id must be a number" })),
-            },
-            ["clients"] => {
-                let clients = self.clients.list();
-                if clients.is_empty() {
-                    "no clients configured".to_string()
-                } else {
-                    clients
-                        .iter()
-                        .map(|client| {
-                            format!(
-                                "client {} -> {} ({})",
-                                client.id,
-                                client.remote,
-                                if client.enabled { "enabled" } else { "disabled" }
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                }
-            }
-            ["profile"] => serde_json::to_string_pretty(&TestProfile::default())
-                .unwrap_or_else(|error| error.to_string()),
             _ => {
                 return (
                     400,
@@ -274,6 +462,46 @@ impl RestApi {
             }
         };
         (200, json!({ "output": output }))
+    }
+
+    /// The configured clients as text, shared by both web CLI command sets.
+    fn clients_text(&self) -> String {
+        let clients = self.clients.list();
+        if clients.is_empty() {
+            "no clients configured".to_string()
+        } else {
+            clients
+                .iter()
+                .map(|client| {
+                    format!(
+                        "client {} -> {} ({})",
+                        client.id,
+                        client.remote,
+                        if client.enabled { "enabled" } else { "disabled" }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    }
+
+    /// The web CLI `show <id>` helper: one run's summary and debriefs.
+    fn web_show(&self, id: &str) -> (u16, Value) {
+        match id.parse::<u64>() {
+            Ok(id) => {
+                let sql = SqlState::new();
+                match sql.show_run(id) {
+                    Ok(Some(summary)) => {
+                        let mut lines = vec![summary];
+                        lines.extend(sql.debriefs(id).unwrap_or_default());
+                        (200, json!({ "output": lines.join("\n") }))
+                    }
+                    Ok(None) => (200, json!({ "output": format!("no local record for run {id}") })),
+                    Err(error) => (500, json!({ "error": error })),
+                }
+            }
+            Err(_) => (400, json!({ "error": "run id must be a number" })),
+        }
     }
 
     fn start_run(&self, body: &str) -> (u16, Value) {
@@ -293,14 +521,43 @@ impl RestApi {
         if self.busy.swap(true, Ordering::SeqCst) {
             return (409, json!({ "error": "a run is already in progress" }));
         }
+        let packet_type =
+            PacketType::parse(&profile.traffic.packet_type).unwrap_or(PacketType::Tcp);
+        self.live.update(
+            true,
+            0,
+            packet_type,
+            profile.server.enabled,
+            profile.enabled_clients().count(),
+            None,
+        );
+        let started = std::time::Instant::now();
         let result = TestRunner::new(profile)
             .log_dir(self.log_dir.clone())
             .run();
         self.busy.store(false, Ordering::SeqCst);
+        let run_id = result.as_ref().map(|report| report.run_id).unwrap_or(0);
+        self.live.update(
+            false,
+            run_id,
+            packet_type,
+            false,
+            0,
+            Some(started.elapsed()),
+        );
         match result {
             Ok(report) => (200, report_json(&report)),
             Err(error) => (400, json!({ "error": error })),
         }
+    }
+}
+
+/// SCTP needs kernel support, so the status surfaces whether a socket can be
+/// opened at all rather than waiting for a run to fail.
+pub fn sctp_status() -> String {
+    match crate::sctp::availability() {
+        Ok(()) => "available".to_string(),
+        Err(error) => format!("unavailable: {error}"),
     }
 }
 

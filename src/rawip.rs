@@ -130,3 +130,9 @@ pub fn resolve(remote: &str) -> Result<Ipv4Addr, String> {
     host.parse::<Ipv4Addr>()
         .map_err(|_| format!("raw IP needs an IPv4 address, got \"{remote}\""))
 }
+
+/// Whether this host lets netmark open a raw IP socket, so `selftest` can skip
+/// the transport with a reason instead of failing the whole sequence.
+pub fn availability() -> Result<(), String> {
+    RawIpSocket::open().map(|_| ()).map_err(|error| error.to_string())
+}

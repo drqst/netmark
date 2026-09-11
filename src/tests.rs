@@ -32,6 +32,8 @@ fn summary(result: &str) -> crate::core::RunSummary<'_> {
         sent_bytes_per_second: 0,
         received_bytes_per_second: 0,
         failure_reason: None,
+        protocol: "tcp",
+        detail: crate::core::RunDetail::default(),
     }
 }
 
@@ -262,6 +264,8 @@ fn three_second_udp_client_server_logs_match() {
         max_tcp_jitter_millis: 1000,
         max_udp_jitter_millis: 1000,
         limit_bytes_per_second: 0,
+        limits: crate::core::LimitSet::default(),
+        protocols: crate::core::ProtocolSwitches::default(),
         webrtc: crate::webrtc::Settings::default(),
         admin_emails: Vec::new(),
     }));
@@ -924,6 +928,13 @@ fn local_sqlite_records_the_role_that_wrote_each_row() {
             sent_bytes_per_second: 3,
             received_bytes_per_second: 4,
             failure_reason: None,
+            protocol: "sctp",
+            detail: crate::core::RunDetail {
+                sent_tcp_packets: 5,
+                sent_tcp_bytes: 6,
+                jitter_millis: 7,
+                ..crate::core::RunDetail::default()
+            },
         },
     );
 
@@ -1579,6 +1590,7 @@ fn status_is_reported_as_a_table() {
     let rows = crate::cli::status_rows(
         &metrics,
         &crate::cli::StatusContext {
+            protocols: crate::core::ProtocolSwitches::default(),
             running: true,
             elapsed: Some(Duration::from_secs(2)),
             run_id: 42,
@@ -1589,6 +1601,7 @@ fn status_is_reported_as_a_table() {
             monitor: (true, 1, 5, 4, 1),
             metrics_sql: "not connected".to_string(),
             restapi: "disabled".to_string(),
+            web_server: crate::cli::web_server_status("127.0.0.1:8081", "127.0.0.1:8081"),
             smtp: false,
         },
     );
@@ -1616,6 +1629,11 @@ fn status_is_reported_as_a_table() {
     assert_eq!(value("Monitor"), "on id 1, 5 calls, 4 ok, 1 failed");
     assert_eq!(value("Metrics SQL"), "not connected");
     assert_eq!(value("REST API"), "disabled");
+    assert_eq!(
+        value("Web server"),
+        "listening on http://127.0.0.1:8081 (port 8081)"
+    );
+    assert!(value("SCTP").starts_with("not selected"));
     assert_eq!(value("SMTP"), "disabled");
 }
 
@@ -1640,4 +1658,548 @@ fn start_at_blocks_until_the_agreed_instant() {
 
     let error = crate::wait_until(Some("tuesday")).unwrap_err();
     assert!(error.contains("RFC 3339"), "{error}");
+}
+
+/// The web server address is reported the same way at start-up and in `status`,
+/// including the port, and says so plainly when nothing is listening.
+#[test]
+fn the_web_server_port_is_reported() {
+    assert_eq!(
+        crate::cli::web_server_status("0.0.0.0:8080", "127.0.0.1:8081"),
+        "listening on http://0.0.0.0:8080 (port 8080)"
+    );
+    let stopped = crate::cli::web_server_status("", "127.0.0.1:8081");
+    assert!(stopped.starts_with("not listening"), "{stopped}");
+    assert!(stopped.contains("127.0.0.1:8081"), "{stopped}");
+}
+
+/// The `sctp` help page documents the whole life cycle of an SCTP run, so the
+/// CLI and the web CLI can both explain the transport without the manual.
+#[test]
+fn the_sctp_help_page_covers_the_transport() {
+    let rows = crate::cli::sctp_help_rows();
+    assert!(
+        rows.iter().all(|row| row.len() == 2),
+        "every help row must be a label and a value"
+    );
+    let labels: Vec<&str> = rows.iter().map(|row| row[0].as_str()).collect();
+    for label in [
+        "what it is",
+        "kernel support",
+        "select it",
+        "run it",
+        "stop it",
+        "counters",
+    ] {
+        assert!(labels.contains(&label), "sctp help has no {label} row");
+    }
+    assert!(
+        crate::cli::help_rows()
+            .iter()
+            .any(|row| row[0] == "configure sctp" && !row[1].is_empty()),
+        "help does not mention the configure sctp command"
+    );
+}
+
+/// The status the web page polls has to describe what is happening right now,
+/// including the transport, SCTP support and the byte counters of a live run.
+#[test]
+fn live_status_follows_a_run() {
+    let api = Arc::new(crate::restapi::RestApi::new(
+        Arc::new(Clients::new(Vec::new())),
+        std::env::temp_dir(),
+    ));
+    let metrics = Arc::new(Metrics::new());
+    api.live().attach_metrics(Arc::clone(&metrics));
+
+    assert!(api.live().activity().starts_with("idle"));
+
+    metrics.add_test_bytes(true, PacketType::Sctp, 4096);
+    api.live().update(
+        true,
+        7,
+        PacketType::Sctp,
+        true,
+        1,
+        Some(Duration::from_secs(2)),
+    );
+    let activity = api.live().activity();
+    assert!(activity.contains("SCTP"), "{activity}");
+    assert!(activity.contains("run 7"), "{activity}");
+
+    api.live().update(false, 7, PacketType::Sctp, true, 1, None);
+    assert!(api.live().activity().starts_with("idle"));
+}
+
+/// Monitor checks belong in the external database; the local SQLite database
+/// only records that the monitor was started and stopped.
+#[test]
+fn monitor_status_is_the_only_monitor_data_in_local_sqlite() {
+    let sql = Arc::new(SqlState::new());
+    sql.enable().unwrap();
+    let log_dir = std::env::temp_dir().join(format!("netmark-monitor-{}", std::process::id()));
+    std::fs::create_dir_all(&log_dir).unwrap();
+    let monitor = Arc::new(crate::monitor::MonitorState::new());
+
+    let connection = rusqlite::Connection::open(crate::core::database_path()).unwrap();
+    // The database outlives the test process, so only rows written here count.
+    let baseline: i64 = connection
+        .query_row("SELECT COALESCE(MAX(rowid), 0) FROM monitor_status", [], |row| row.get(0))
+        .unwrap();
+
+    let id = monitor.start(&log_dir, &sql).expect("monitor did not start");
+    assert!(monitor.is_running());
+    assert!(monitor.start(&log_dir, &sql).is_none(), "started twice");
+    monitor.stop(&log_dir, &sql);
+    assert!(!monitor.is_running());
+
+    let mut statement = connection
+        .prepare("SELECT status FROM monitor_status WHERE rowid > ?1 AND monitor_id = ?2 ORDER BY rowid")
+        .unwrap();
+    let recorded: Vec<String> = statement
+        .query_map(rusqlite::params![baseline, id], |row| row.get::<_, String>(0))
+        .unwrap()
+        .map(|status| status.unwrap())
+        .collect();
+    assert_eq!(recorded, vec!["started".to_string(), "stopped".to_string()]);
+    let _ = std::fs::remove_dir_all(&log_dir);
+}
+
+/// A whole SCTP run, from `start` through the traffic to the `stop` debrief, on
+/// kernels that support SCTP. Where the kernel does not, the run is skipped
+/// rather than failed, which is exactly what `sctp status` reports.
+#[test]
+fn sctp_runs_end_to_end_when_the_kernel_supports_it() {
+    let _test_lock = TIMED_TEST_LOCK.lock().unwrap();
+    if let Err(error) = crate::sctp::availability() {
+        eprintln!("skipping SCTP end-to-end test: {error}");
+        return;
+    }
+    let log_dir = std::env::temp_dir().join(format!("netmark-sctp-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&log_dir);
+    let mut profile = crate::configuration::TestProfile::default();
+    profile.server.enabled = true;
+    profile.clients[0].enabled = true;
+    profile.traffic.packet_type = "sctp".to_string();
+    profile.traffic.tcp_bytes_per_second = 4096;
+    profile.traffic.client_runtime = 3;
+    profile.traffic.server_runtime = 3;
+    profile.duration_seconds = 3;
+
+    let report = crate::sdk::TestRunner::new(profile)
+        .log_dir(log_dir.clone())
+        .run()
+        .unwrap();
+    assert!(report.passed, "{:?}", report.failure_reason);
+    assert_eq!(report.packet_type, "sctp");
+    assert!(report.sent_bytes() > 0, "no SCTP bytes were sent");
+    let debrief = report.debrief.as_ref().expect("SCTP run has no debrief");
+    assert_eq!(debrief.protocol, "sctp");
+    assert!(debrief.matched(), "{}", debrief.summary());
+    let _ = std::fs::remove_dir_all(&log_dir);
+}
+
+/// The session dispatcher backs both the shell CLI and the web CLI, so it must
+/// answer representative commands with exactly the shell wording.
+#[test]
+fn session_executes_commands_like_the_shell_cli() {
+    let _test_lock = TIMED_TEST_LOCK.lock().unwrap();
+    let log_dir = std::env::temp_dir().join(format!("netmark-session-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&log_dir);
+    std::fs::create_dir_all(&log_dir).unwrap();
+    let config_path = log_dir.join("netmark.config");
+
+    let clients = Arc::new(Clients::new(Vec::new()));
+    let api = Arc::new(crate::restapi::RestApi::new(
+        Arc::clone(&clients),
+        log_dir.clone(),
+    ));
+    let session = crate::session::Session::from_config(
+        &crate::configuration::FileConfig::default(),
+        log_dir.clone(),
+        config_path,
+        Arc::clone(&clients),
+        Arc::clone(api.live()),
+        Arc::downgrade(&api),
+    );
+
+    assert_eq!(session.execute("server enable"), "server enabled");
+    assert_eq!(session.execute("client add"), "client 1 added");
+    assert_eq!(session.execute("configure type sctp"), "configuration updated");
+
+    let status = session.execute("status");
+    assert!(status.contains("Traffic"), "{status}");
+    assert!(status.contains("sctp"), "{status}");
+    assert!(status.contains("Server"), "{status}");
+
+    let help_start = session.execute("help start");
+    assert!(help_start.contains("start a traffic run"), "{help_start}");
+
+    let help_tcp = session.execute("help configure tcp");
+    assert!(help_tcp.contains("configure tcp"), "{help_tcp}");
+
+    assert_eq!(
+        session.execute("nonsense"),
+        "unknown command; type 'help' for commands"
+    );
+
+    let _ = std::fs::remove_dir_all(&log_dir);
+}
+
+/// A REST API with a session attached must run state-changing commands over
+/// `POST /api/v1/cli`, just like the interactive shell CLI.
+#[test]
+fn rest_api_with_a_session_runs_cli_commands() {
+    let _test_lock = TIMED_TEST_LOCK.lock().unwrap();
+    let log_dir =
+        std::env::temp_dir().join(format!("netmark-session-cli-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&log_dir);
+    std::fs::create_dir_all(&log_dir).unwrap();
+    let config_path = log_dir.join("netmark.config");
+
+    let clients = Arc::new(Clients::new(Vec::new()));
+    let api = Arc::new(crate::restapi::RestApi::new(
+        Arc::clone(&clients),
+        log_dir.clone(),
+    ));
+    let session = Arc::new(crate::session::Session::from_config(
+        &crate::configuration::FileConfig::default(),
+        log_dir.clone(),
+        config_path,
+        Arc::clone(&clients),
+        Arc::clone(api.live()),
+        Arc::downgrade(&api),
+    ));
+    api.attach_session(Arc::clone(&session));
+
+    let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = probe.local_addr().unwrap().to_string();
+    drop(probe);
+    api.enable(&address).unwrap();
+
+    let base = format!("http://{address}");
+    let http = reqwest::blocking::Client::new();
+    let reply: serde_json::Value = http
+        .post(format!("{base}/api/v1/cli"))
+        .json(&serde_json::json!({ "command": "server enable" }))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(reply["output"], "server enabled");
+    assert!(session.server_enabled());
+
+    api.disable();
+    let _ = std::fs::remove_dir_all(&log_dir);
+}
+
+#[test]
+fn help_answers_a_topic_for_every_command() {
+    for topic in [
+        vec!["start"],
+        vec!["stop"],
+        vec!["status"],
+        vec!["configure", "type"],
+        vec!["client", "0", "remote"],
+        vec!["configure", "limits"],
+    ] {
+        let rows = crate::cli::help_for(&topic).unwrap_or_else(|error| {
+            panic!("help {} answered nothing: {error}", topic.join(" "));
+        });
+        assert!(
+            !rows.is_empty(),
+            "help {} answered an empty page",
+            topic.join(" ")
+        );
+    }
+    // Every top-level command in the completion list is documented.
+    for command in crate::cli::COMMANDS {
+        if matches!(*command, "quit" | "exit") {
+            continue;
+        }
+        let topic: Vec<&str> = command.split_whitespace().collect();
+        assert!(
+            crate::cli::help_for(&topic).is_ok(),
+            "help {command} answered nothing"
+        );
+    }
+    assert!(crate::cli::help_for(&["nonsense"]).is_err());
+    // "help sctp" is the detailed page, not the one-line summary.
+    assert_eq!(
+        crate::cli::help_for(&["sctp"]).unwrap(),
+        crate::cli::sctp_help_rows()
+    );
+}
+
+#[test]
+fn selftest_covers_every_protocol() {
+    let protocols: Vec<&str> = crate::cli::SELFTEST_PROTOCOLS
+        .iter()
+        .map(|packet_type| packet_type.as_str())
+        .collect();
+    for protocol in ["tcp", "sctp", "udp", "ip"] {
+        assert!(
+            protocols.contains(&protocol),
+            "selftest does not cover {protocol}"
+        );
+    }
+    // TCP and UDP always work; the other two report why they cannot run instead
+    // of failing the whole sequence.
+    assert!(crate::cli::selftest_availability(PacketType::Tcp).is_ok());
+    assert!(crate::cli::selftest_availability(PacketType::Udp).is_ok());
+    for packet_type in [PacketType::Sctp, PacketType::Ip] {
+        if let Err(reason) = crate::cli::selftest_availability(packet_type) {
+            assert!(!reason.is_empty(), "a skipped transport needs a reason");
+        }
+    }
+}
+
+#[test]
+fn limits_are_configured_per_protocol() {
+    let config = Arc::new(Mutex::new(Config::default()));
+    assert_eq!(
+        crate::cli::configure_limits(&config, &["udp", "max-lost-packets", "5"]),
+        Ok("udp max-lost-packets limit set to 5".to_string())
+    );
+    assert_eq!(config.lock().unwrap().limits.udp.max_lost_packets, 5);
+    // Only the protocol that was named is changed.
+    assert_eq!(config.lock().unwrap().limits.tcp.max_lost_packets, 0);
+
+    for protocol in ["tcp", "sctp", "ip"] {
+        crate::cli::configure_limits(&config, &[protocol, "min-sent-bytes", "1024"])
+            .unwrap_or_else(|error| panic!("{protocol} limit was refused: {error}"));
+    }
+    assert_eq!(config.lock().unwrap().limits.sctp.min_sent_bytes, 1024);
+
+    // Lost packets are a UDP measurement, so the other transports refuse them
+    // and say which parameters they do accept.
+    let error = crate::cli::configure_limits(&config, &["tcp", "max-lost-packets", "5"])
+        .expect_err("TCP has no lost-packet counter");
+    assert!(error.contains("min-sent-bytes"), "{error}");
+    assert!(crate::cli::configure_limits(&config, &["tcp", "nonsense", "5"]).is_err());
+    assert!(crate::cli::configure_limits(&config, &["tcp", "min-sent-bytes", "x"]).is_err());
+    assert!(crate::cli::configure_limits(&config, &["nonsense", "min-sent-bytes", "5"]).is_err());
+
+    let table = crate::cli::configure_limits(&config, &["udp", "status"]).unwrap();
+    assert!(table.contains("udp max-lost-packets"), "{table}");
+    assert!(table.contains('5'), "{table}");
+    let all = crate::cli::configure_limits(&config, &[]).unwrap();
+    for protocol in ["tcp", "sctp", "udp", "ip"] {
+        assert!(all.contains(protocol), "{all} is missing {protocol}");
+    }
+
+    crate::cli::configure_limits(&config, &["udp", "clear"]).unwrap();
+    assert_eq!(config.lock().unwrap().limits.udp, crate::core::Limits::default());
+    // Zero removes a single limit.
+    crate::cli::configure_limits(&config, &["tcp", "min-sent-bytes", "0"]).unwrap();
+    assert_eq!(config.lock().unwrap().limits.tcp.min_sent_bytes, 0);
+}
+
+#[test]
+fn a_missed_limit_fails_the_run() {
+    let metrics = Metrics::new();
+    metrics.add_test_bytes(true, PacketType::Tcp, 1024);
+    metrics.add_test_bytes(false, PacketType::Tcp, 1024);
+    let mut config = Config {
+        packet_type: PacketType::Tcp,
+        ..Config::default()
+    };
+    let elapsed = Some(Duration::from_secs(1));
+
+    let outcome = crate::evaluate_run(&metrics, &config, elapsed);
+    assert_eq!(outcome.result, "ok", "{:?}", outcome.failure_reason);
+
+    config.limits.tcp.min_sent_bytes_per_second = 100_000;
+    let outcome = crate::evaluate_run(&metrics, &config, elapsed);
+    assert_eq!(outcome.result, "fail");
+    let reason = outcome.failure_reason.unwrap();
+    assert!(reason.contains("tcp sent bytes/sec"), "{reason}");
+
+    // A limit set for another transport is not applied to this run.
+    let mut other = Config {
+        packet_type: PacketType::Udp,
+        ..Config::default()
+    };
+    other.limits.tcp.min_sent_bytes_per_second = 100_000;
+    assert_eq!(crate::evaluate_run(&metrics, &other, elapsed).result, "ok");
+}
+
+#[test]
+fn limits_survive_a_configuration_round_trip() {
+    let mut config = Config::default();
+    config.limits.udp.max_out_of_order_packets = 7;
+    config.limits.sctp.min_received_bytes = 2048;
+    let traffic = crate::traffic_config_from(&config);
+    let restored = crate::config_from_traffic(&traffic);
+    assert_eq!(restored.limits, config.limits);
+}
+
+#[test]
+fn the_kubernetes_cluster_is_three_containers_with_a_test_script() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let postgres = std::fs::read_to_string(root.join("k8s/postgres.yaml")).unwrap();
+    let netmark = std::fs::read_to_string(root.join("k8s/netmark.yaml")).unwrap();
+    // One PostgreSQL container and one volume container that owns the claim,
+    // plus the web server container in the other manifest.
+    assert!(postgres.contains("- name: postgres"), "no postgres container");
+    assert!(postgres.contains("- name: volume"), "no volume container");
+    assert!(
+        postgres.contains("claimName: netmark-postgres-data"),
+        "the pod does not mount the data volume"
+    );
+    assert!(netmark.contains("- name: netmark"), "no web server container");
+    assert!(netmark.contains("--serve"), "the web server is not served");
+
+    let script = root.join("k8s/cluster-test.sh");
+    let cases = std::fs::read_to_string(&script).unwrap();
+    for expectation in [
+        "kubernetes api reachable",
+        "postgres container is deployed",
+        "volume container is deployed",
+        "data volume is bound",
+        "postgres accepts connections",
+        "web server reports live status",
+        "web CLI answers the status command",
+    ] {
+        assert!(cases.contains(expectation), "no cluster test for {expectation}");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&script).unwrap().permissions().mode();
+        assert!(mode & 0o111 != 0, "k8s/cluster-test.sh is not executable");
+    }
+}
+
+#[test]
+fn sctp_and_webrtc_live_under_configure() {
+    // The moved commands are documented where they now live, and the old
+    // top-level words are gone from the command list and the help.
+    let labels: Vec<String> = crate::cli::help_rows()
+        .into_iter()
+        .map(|row| row[0].clone())
+        .collect();
+    for moved in [
+        "configure sctp",
+        "configure sctp status",
+        "configure webrtc enable | disable",
+        "configure webrtc channels <n>",
+        "configure webrtc status",
+    ] {
+        assert!(labels.iter().any(|label| label == moved), "no help for {moved}");
+    }
+    assert!(
+        !labels.iter().any(|label| label == "sctp" || label.starts_with("webrtc ")),
+        "a top-level sctp or webrtc row is still documented"
+    );
+    assert!(!crate::cli::COMMANDS.contains(&"webrtc"));
+    // Both are reachable through the standardized help.
+    assert_eq!(
+        crate::cli::help_for(&["configure", "sctp"]).unwrap(),
+        crate::cli::sctp_help_rows()
+    );
+    assert!(crate::cli::help_for(&["configure", "webrtc"]).is_ok());
+}
+
+#[test]
+fn protocols_are_enabled_and_disabled_under_configure() {
+    let config = Arc::new(Mutex::new(Config::default()));
+    for protocol in ["tcp", "sctp", "udp", "ip"] {
+        let line = crate::cli::set_protocol_enabled(&config, protocol, false).unwrap();
+        assert!(line.starts_with(protocol), "{line}");
+        assert!(!config.lock().unwrap().protocols.enabled(
+            PacketType::parse(protocol).unwrap()
+        ));
+        crate::cli::set_protocol_enabled(&config, protocol, true).unwrap();
+        assert!(
+            config
+                .lock()
+                .unwrap()
+                .protocols
+                .enabled(PacketType::parse(protocol).unwrap())
+        );
+    }
+    assert!(crate::cli::set_protocol_enabled(&config, "nonsense", true).is_err());
+
+    // Disabling the selected transport moves the selection to an enabled one.
+    crate::cli::configure(&config, &["type", "sctp"]).unwrap();
+    let line = crate::cli::set_protocol_enabled(&config, "sctp", false).unwrap();
+    assert!(line.contains("transport is now"), "{line}");
+    assert_ne!(config.lock().unwrap().packet_type, PacketType::Sctp);
+    // A disabled transport cannot be selected again until it is enabled.
+    let error = crate::cli::configure(&config, &["type", "sctp"]).unwrap_err();
+    assert!(error.contains("configure sctp enable"), "{error}");
+    crate::cli::set_protocol_enabled(&config, "sctp", true).unwrap();
+    crate::cli::configure(&config, &["type", "sctp"]).unwrap();
+
+    let table = crate::cli::protocols_table(&config, &crate::webrtc::Settings::default());
+    for protocol in ["tcp", "sctp", "udp", "ip", "webrtc"] {
+        assert!(table.contains(protocol), "{table} is missing {protocol}");
+    }
+    assert!(table.contains("selected"), "{table}");
+}
+
+#[test]
+fn protocol_switches_survive_a_configuration_round_trip() {
+    let mut config = Config::default();
+    config.protocols.set(PacketType::Ip, false);
+    let restored = crate::config_from_traffic(&crate::traffic_config_from(&config));
+    assert_eq!(restored.protocols, config.protocols);
+    assert!(!restored.protocols.enabled(PacketType::Ip));
+}
+
+#[test]
+fn show_run_reports_everything_collected() {
+    let sql = SqlState::new();
+    sql.enable().unwrap();
+    let id = sql.next_run_id(1);
+    sql.start_run(id);
+    sql.complete_run(
+        id,
+        &crate::core::RunSummary {
+            result: "ok",
+            sent_bytes: 4096,
+            received_bytes: 2048,
+            sent_bytes_per_second: 512,
+            received_bytes_per_second: 256,
+            failure_reason: None,
+            protocol: "sctp",
+            detail: crate::core::RunDetail {
+                sent_tcp_packets: 40,
+                sent_tcp_bytes: 4096,
+                received_tcp_packets: 20,
+                received_tcp_bytes: 2048,
+                lost_packets: 1,
+                out_of_order_packets: 2,
+                jitter_millis: 7,
+                tcp_jitter_millis: 7,
+                tcp_mss: 1460,
+                tcp_mtu: 1500,
+                tcp_window_size: 65535,
+                webrtc_sent_messages: 3,
+                ..crate::core::RunDetail::default()
+            },
+        },
+    );
+
+    let rows = sql.run_detail_rows(id).unwrap().expect("the run was stored");
+    let rendered = crate::cli_textout::table_lines(&rows, &[16, 80]).join("\n");
+    for expected in [
+        "Protocol", "sctp", "TCP/SCTP", "UDP", "IP", "UDP loss", "Jitter", "TCP transport",
+        "WebRTC", "1460", "65535", "4096",
+    ] {
+        assert!(rendered.contains(expected), "show run is missing {expected}:\n{rendered}");
+    }
+    assert!(sql.run_detail_rows(id + 90_000).unwrap().is_none());
+
+    // The same detail shows up per run in the list.
+    let listed = sql.run_list().unwrap();
+    let line = listed
+        .iter()
+        .find(|line| line.contains(&format!("run {id} ")))
+        .expect("the run is listed");
+    assert!(line.contains("protocol=sctp"), "{line}");
+    assert!(line.contains("lost=1"), "{line}");
+    assert!(line.contains("out_of_order=2"), "{line}");
+    assert!(line.contains("jitter=7 ms"), "{line}");
 }
