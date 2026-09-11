@@ -1,0 +1,304 @@
+# Grafana graphs the external CLI metrics database (PostgreSQL/Timescale).
+# Every netmark_metrics row carries run_id; the provisioned dashboard filters and
+# groups on it so each run is a separate series.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: netmark-grafana-datasource
+  namespace: netmark
+data:
+  datasource.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Netmark Metrics
+        type: postgres
+        access: proxy
+        url: netmark-postgres:5432
+        user: ${POSTGRES_USER}
+        secureJsonData:
+          password: ${POSTGRES_PASSWORD}
+        jsonData:
+          database: ${POSTGRES_DB}
+          sslmode: disable
+          postgresVersion: 1600
+          timescaledb: true
+        isDefault: true
+        editable: false
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: netmark-grafana-dashboard-provider
+  namespace: netmark
+data:
+  dashboards.yaml: |
+    apiVersion: 1
+    providers:
+      - name: netmark
+        orgId: 1
+        folder: Netmark
+        type: file
+        disableDeletion: false
+        updateIntervalSeconds: 30
+        options:
+          path: /var/lib/grafana/dashboards
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: netmark-grafana-dashboards
+  namespace: netmark
+data:
+  netmark-metrics.json: |
+    {
+      "annotations": { "list": [] },
+      "editable": true,
+      "fiscalYearStartMonth": 0,
+      "graphTooltip": 1,
+      "id": null,
+      "links": [],
+      "panels": [
+        {
+          "datasource": { "type": "postgres", "uid": "${DS_NETMARK}" },
+          "fieldConfig": {
+            "defaults": {
+              "custom": { "drawStyle": "line", "spanNulls": true },
+              "unit": "Bps"
+            },
+            "overrides": []
+          },
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+          "id": 1,
+          "targets": [
+            {
+              "datasource": { "type": "postgres", "uid": "${DS_NETMARK}" },
+              "editorMode": "code",
+              "format": "time_series",
+              "rawQuery": true,
+              "rawSql": "SELECT\n  $__timeGroupAlias(timestamp_utc::timestamptz, $__interval),\n  run_id::text AS metric,\n  AVG(sent_bytes_per_second) AS value\nFROM netmark_metrics\nWHERE $__timeFilter(timestamp_utc::timestamptz)\n  AND ($run_id = 0 OR run_id = $run_id)\nGROUP BY 1, 2\nORDER BY 1",
+              "refId": "A"
+            }
+          ],
+          "title": "Upload bandwidth by run_id",
+          "type": "timeseries"
+        },
+        {
+          "datasource": { "type": "postgres", "uid": "${DS_NETMARK}" },
+          "fieldConfig": {
+            "defaults": {
+              "custom": { "drawStyle": "line", "spanNulls": true },
+              "unit": "Bps"
+            },
+            "overrides": []
+          },
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+          "id": 2,
+          "targets": [
+            {
+              "datasource": { "type": "postgres", "uid": "${DS_NETMARK}" },
+              "editorMode": "code",
+              "format": "time_series",
+              "rawQuery": true,
+              "rawSql": "SELECT\n  $__timeGroupAlias(timestamp_utc::timestamptz, $__interval),\n  run_id::text AS metric,\n  AVG(received_bytes_per_second) AS value\nFROM netmark_metrics\nWHERE $__timeFilter(timestamp_utc::timestamptz)\n  AND ($run_id = 0 OR run_id = $run_id)\nGROUP BY 1, 2\nORDER BY 1",
+              "refId": "A"
+            }
+          ],
+          "title": "Download bandwidth by run_id",
+          "type": "timeseries"
+        },
+        {
+          "datasource": { "type": "postgres", "uid": "${DS_NETMARK}" },
+          "fieldConfig": {
+            "defaults": {
+              "custom": { "drawStyle": "line", "spanNulls": true },
+              "unit": "ms"
+            },
+            "overrides": []
+          },
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+          "id": 3,
+          "targets": [
+            {
+              "datasource": { "type": "postgres", "uid": "${DS_NETMARK}" },
+              "editorMode": "code",
+              "format": "time_series",
+              "rawQuery": true,
+              "rawSql": "SELECT\n  $__timeGroupAlias(timestamp_utc::timestamptz, $__interval),\n  run_id::text AS metric,\n  AVG(jitter_millis) AS value\nFROM netmark_metrics\nWHERE $__timeFilter(timestamp_utc::timestamptz)\n  AND ($run_id = 0 OR run_id = $run_id)\nGROUP BY 1, 2\nORDER BY 1",
+              "refId": "A"
+            }
+          ],
+          "title": "Jitter by run_id",
+          "type": "timeseries"
+        },
+        {
+          "datasource": { "type": "postgres", "uid": "${DS_NETMARK}" },
+          "fieldConfig": {
+            "defaults": {
+              "custom": { "drawStyle": "line", "spanNulls": true },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+          "id": 4,
+          "targets": [
+            {
+              "datasource": { "type": "postgres", "uid": "${DS_NETMARK}" },
+              "editorMode": "code",
+              "format": "time_series",
+              "rawQuery": true,
+              "rawSql": "SELECT\n  $__timeGroupAlias(timestamp_utc::timestamptz, $__interval),\n  run_id::text AS metric,\n  AVG(lost_udp_packets) AS value\nFROM netmark_metrics\nWHERE $__timeFilter(timestamp_utc::timestamptz)\n  AND ($run_id = 0 OR run_id = $run_id)\nGROUP BY 1, 2\nORDER BY 1",
+              "refId": "A"
+            }
+          ],
+          "title": "Lost UDP packets by run_id",
+          "type": "timeseries"
+        },
+        {
+          "datasource": { "type": "postgres", "uid": "${DS_NETMARK}" },
+          "fieldConfig": { "defaults": {}, "overrides": [] },
+          "gridPos": { "h": 8, "w": 24, "x": 0, "y": 16 },
+          "id": 5,
+          "targets": [
+            {
+              "datasource": { "type": "postgres", "uid": "${DS_NETMARK}" },
+              "editorMode": "code",
+              "format": "table",
+              "rawQuery": true,
+              "rawSql": "SELECT\n  timestamp_utc,\n  run_id,\n  sent_tcp_bytes,\n  received_tcp_bytes,\n  sent_udp_bytes,\n  received_udp_bytes,\n  sent_ip_bytes,\n  received_ip_bytes,\n  sent_bytes_per_second,\n  received_bytes_per_second,\n  lost_udp_packets,\n  out_of_order_udp_packets,\n  jitter_millis\nFROM netmark_metrics\nWHERE $__timeFilter(timestamp_utc::timestamptz)\n  AND ($run_id = 0 OR run_id = $run_id)\nORDER BY timestamp_utc DESC\nLIMIT 200",
+              "refId": "A"
+            }
+          ],
+          "title": "Metrics rows (run_id on every entry)",
+          "type": "table"
+        }
+      ],
+      "schemaVersion": 39,
+      "tags": ["netmark", "metrics"],
+      "templating": {
+        "list": [
+          {
+            "current": { "selected": true, "text": "All runs", "value": "0" },
+            "datasource": { "type": "postgres", "uid": "${DS_NETMARK}" },
+            "definition": "SELECT 0 AS __value, 'All runs' AS __text UNION ALL SELECT DISTINCT run_id AS __value, 'run ' || run_id::text AS __text FROM netmark_metrics ORDER BY 1",
+            "name": "run_id",
+            "label": "Run ID",
+            "query": "SELECT 0 AS __value, 'All runs' AS __text UNION ALL SELECT DISTINCT run_id AS __value, 'run ' || run_id::text AS __text FROM netmark_metrics ORDER BY 1",
+            "refresh": 2,
+            "type": "query",
+            "includeAll": false
+          }
+        ]
+      },
+      "time": { "from": "now-6h", "to": "now" },
+      "timezone": "utc",
+      "title": "Netmark external metrics",
+      "uid": "netmark-metrics",
+      "version": 1
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: netmark-grafana
+  namespace: netmark
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: netmark-grafana
+  template:
+    metadata:
+      labels:
+        app: netmark-grafana
+    spec:
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: netmark.io/role
+                    operator: In
+                    values: [app]
+      containers:
+        - name: grafana
+          image: grafana/grafana:11.2.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 3000
+          env:
+            - name: GF_SECURITY_ADMIN_USER
+              value: admin
+            - name: GF_SECURITY_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: netmark-postgres
+                  key: POSTGRES_PASSWORD
+            - name: GF_USERS_ALLOW_SIGN_UP
+              value: "false"
+            - name: GF_AUTH_ANONYMOUS_ENABLED
+              value: "true"
+            - name: GF_AUTH_ANONYMOUS_ORG_ROLE
+              value: Viewer
+            - name: GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH
+              value: /var/lib/grafana/dashboards/netmark-metrics.json
+            - name: GF_INSTALL_PLUGINS
+              value: ""
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: netmark-postgres
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: netmark-postgres
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: netmark-postgres
+                  key: POSTGRES_DB
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          volumeMounts:
+            - name: datasource
+              mountPath: /etc/grafana/provisioning/datasources
+              readOnly: true
+            - name: dashboard-provider
+              mountPath: /etc/grafana/provisioning/dashboards
+              readOnly: true
+            - name: dashboards
+              mountPath: /var/lib/grafana/dashboards
+              readOnly: true
+      volumes:
+        - name: datasource
+          configMap:
+            name: netmark-grafana-datasource
+        - name: dashboard-provider
+          configMap:
+            name: netmark-grafana-dashboard-provider
+        - name: dashboards
+          configMap:
+            name: netmark-grafana-dashboards
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: netmark-grafana
+  namespace: netmark
+spec:
+  type: NodePort
+  selector:
+    app: netmark-grafana
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
+      nodePort: 30300
