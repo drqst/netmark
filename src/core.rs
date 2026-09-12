@@ -85,9 +85,9 @@ impl Default for ProtocolSwitches {
     fn default() -> Self {
         Self {
             tcp: true,
-            sctp: true,
+            sctp: false,
             udp: true,
-            ip: true,
+            ip: false,
         }
     }
 }
@@ -931,38 +931,62 @@ impl SqlState {
     /// the bandwidth measured in each direction.
     pub fn run_list(&self) -> Result<Vec<String>, String> {
         let c = Connection::open(database_path()).map_err(|e| e.to_string())?;
+        let columns = RUN_DETAIL_COLUMNS.join(", ");
         let mut q = c
-            .prepare("SELECT started_utc, id, role, result, sent_bytes, received_bytes, sent_bytes_per_second, received_bytes_per_second, failure_reason, protocol, sent_tcp_packets, sent_tcp_bytes, received_tcp_packets, received_tcp_bytes, sent_udp_packets, sent_udp_bytes, received_udp_packets, received_udp_bytes, sent_ip_packets, sent_ip_bytes, received_ip_packets, received_ip_bytes, lost_packets, out_of_order_packets, jitter_millis FROM runs ORDER BY id")
+            .prepare(&format!("SELECT started_utc, id, role, result, sent_bytes, received_bytes, sent_bytes_per_second, received_bytes_per_second, failure_reason, protocol, {columns} FROM runs ORDER BY id"))
             .map_err(|e| e.to_string())?;
         let rows = q
             .query_map([], |row| {
+                let text = |index: usize| -> rusqlite::Result<String> {
+                    Ok(row
+                        .get::<_, Option<String>>(index)?
+                        .unwrap_or_else(|| "n/a".to_string()))
+                };
+                let number =
+                    |index: usize| -> rusqlite::Result<u64> {
+                        Ok(row.get::<_, Option<u64>>(index)?.unwrap_or(0))
+                    };
+                let detail = |name: &str| -> u64 {
+                    let index = RUN_DETAIL_COLUMNS
+                        .iter()
+                        .position(|column| *column == name)
+                        .expect("every detail column is listed");
+                    number(10 + index).unwrap_or(0)
+                };
                 Ok(format!(
-                    "{} run {} role={} protocol={} {} sent_bytes={} received_bytes={} up={} bytes/sec down={} bytes/sec tcp/sctp={}p/{}B sent {}p/{}B received udp={}p/{}B sent {}p/{}B received ip={}p/{}B sent {}p/{}B received lost={} out_of_order={} jitter={} ms{}",
-                    row.get::<_, String>(0)?,
-                    row.get::<_, u64>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(9)?
-                        .unwrap_or_else(|| "unknown".to_string()),
-                    row.get::<_, String>(3)?,
-                    row.get::<_, Option<u64>>(4)?.unwrap_or(0),
-                    row.get::<_, Option<u64>>(5)?.unwrap_or(0),
-                    row.get::<_, Option<u64>>(6)?.unwrap_or(0),
-                    row.get::<_, Option<u64>>(7)?.unwrap_or(0),
-                    row.get::<_, Option<u64>>(10)?.unwrap_or(0),
-                    row.get::<_, Option<u64>>(11)?.unwrap_or(0),
-                    row.get::<_, Option<u64>>(12)?.unwrap_or(0),
-                    row.get::<_, Option<u64>>(13)?.unwrap_or(0),
-                    row.get::<_, Option<u64>>(14)?.unwrap_or(0),
-                    row.get::<_, Option<u64>>(15)?.unwrap_or(0),
-                    row.get::<_, Option<u64>>(16)?.unwrap_or(0),
-                    row.get::<_, Option<u64>>(17)?.unwrap_or(0),
-                    row.get::<_, Option<u64>>(18)?.unwrap_or(0),
-                    row.get::<_, Option<u64>>(19)?.unwrap_or(0),
-                    row.get::<_, Option<u64>>(20)?.unwrap_or(0),
-                    row.get::<_, Option<u64>>(21)?.unwrap_or(0),
-                    row.get::<_, Option<u64>>(22)?.unwrap_or(0),
-                    row.get::<_, Option<u64>>(23)?.unwrap_or(0),
-                    row.get::<_, Option<u64>>(24)?.unwrap_or(0),
+                    "{} run {} role={} protocol={} {} sent_bytes={} received_bytes={} up={} bytes/sec down={} bytes/sec tcp/sctp={}p/{}B sent {}p/{}B received udp={}p/{}B sent {}p/{}B received ip={}p/{}B sent {}p/{}B received lost={} out_of_order={} jitter={} ms tcp_jitter={} ms udp_jitter={} ms mss={} mtu={} window={} webrtc={}/{}/{}{}",
+                    text(0)?,
+                    number(1)?,
+                    text(2)?,
+                    text(9)?,
+                    text(3)?,
+                    number(4)?,
+                    number(5)?,
+                    number(6)?,
+                    number(7)?,
+                    detail("sent_tcp_packets"),
+                    detail("sent_tcp_bytes"),
+                    detail("received_tcp_packets"),
+                    detail("received_tcp_bytes"),
+                    detail("sent_udp_packets"),
+                    detail("sent_udp_bytes"),
+                    detail("received_udp_packets"),
+                    detail("received_udp_bytes"),
+                    detail("sent_ip_packets"),
+                    detail("sent_ip_bytes"),
+                    detail("received_ip_packets"),
+                    detail("received_ip_bytes"),
+                    detail("lost_packets"),
+                    detail("out_of_order_packets"),
+                    detail("jitter_millis"),
+                    detail("tcp_jitter_millis"),
+                    detail("udp_jitter_millis"),
+                    detail("tcp_mss"),
+                    detail("tcp_mtu"),
+                    detail("tcp_window_size"),
+                    detail("webrtc_sent_messages"),
+                    detail("webrtc_received_messages"),
+                    detail("webrtc_invalid_frames"),
                     row.get::<_, Option<String>>(8)?
                         .map(|reason| format!(" ({reason})"))
                         .unwrap_or_default()

@@ -12,18 +12,26 @@
 #   ./netmarkctl run <profile.yaml>       start a run from a profile file
 #   ./netmarkctl health                   raw health JSON
 #
-# NETMARK_URL selects the service; the default matches the port that init.sh
-# maps from the kind app node to the host.
+# NETMARK_URL selects the service. The default first tries the local Kubernetes
+# port-forward that init.sh creates (http://127.0.0.1:8080); if no pods are
+# running, it falls back to a locally-running netmark on the same port. Either
+# way, netmarkctl can operate without requiring Kubernetes pods.
 set -eu
 
-NETMARK_URL=${NETMARK_URL:-http://127.0.0.1:8080}
+command -v curl >/dev/null 2>&1 || { echo "curl is required" >&2; exit 1; }
+
+NAMESPACE=${NAMESPACE:-netmark}
+WEB_PORT=${NETMARK_WEB_PORT:-8080}
+
+# Prefer a Kubernetes port-forward when pods exist; otherwise talk to a local
+# netmark instance directly.
+NETMARK_URL=${NETMARK_URL:-http://127.0.0.1:${WEB_PORT}}
 
 usage() {
   sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
   exit 1
 }
 
-command -v curl >/dev/null 2>&1 || { echo "curl is required" >&2; exit 1; }
 [ $# -ge 1 ] || usage
 
 case $1 in

@@ -71,6 +71,9 @@ kubectl apply -f "$APP_MANIFEST"
 kubectl apply -f "$GRAFANA_MANIFEST"
 kubectl -n "$NAMESPACE" rollout status deployment/netmark-grafana --timeout=180s
 
+# Port-forward PostgreSQL to the host. The netmark web interface is exposed by
+# the kind/app node extraPortMapping (host 8080 -> node 30080) when kind is in
+# use, and netmarkctl works against that port whether or not pods are running.
 kubectl -n "$NAMESPACE" port-forward service/netmark-postgres 5433:5432 >/tmp/netmark-postgres-port-forward.log 2>&1 &
 FORWARD_PID=$!
 trap 'kill "$FORWARD_PID" 2>/dev/null || true' EXIT
@@ -81,7 +84,7 @@ metrics:
   sql: "postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@127.0.0.1:5433/${POSTGRES_DB}"
 EOF
 echo "PostgreSQL/Timescale is ready on 127.0.0.1:5433"
-echo "netmark web interface (web CLI): http://127.0.0.1:8080"
+echo "netmark web interface (web CLI): http://127.0.0.1:${NETMARK_WEB_PORT:-8080}"
 echo "Grafana (external metrics graphs): http://127.0.0.1:3000"
 echo "Host CLI: $PROJECT_ROOT/netmarkctl help"
 echo "Config written to $CONFIG"

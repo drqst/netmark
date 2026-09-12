@@ -183,7 +183,7 @@ pub fn client_command(clients: &Clients, id: u64, args: &[&str], log_dir: &std::
             }
             "follow" => {
                 clients.update(id, |client| client.webrtc = None);
-                format!("client {id} follows the webrtc command")
+                format!("client {id} follows the configure webrtc setting")
             }
             _ => "client <id> webrtc: on | off | follow".to_string(),
         },

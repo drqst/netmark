@@ -67,7 +67,9 @@ pub struct TrafficConfig {
     pub protocols: ProtocolsConfig,
 }
 
-/// Every transport is usable until it is turned off.
+/// Protocol switches. By default only TCP and UDP are enabled; SCTP and raw IP
+/// must be turned on explicitly after the operator confirms the host supports
+/// them.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct ProtocolsConfig {
@@ -81,9 +83,9 @@ impl Default for ProtocolsConfig {
     fn default() -> Self {
         Self {
             tcp: true,
-            sctp: true,
+            sctp: false,
             udp: true,
-            ip: true,
+            ip: false,
         }
     }
 }
