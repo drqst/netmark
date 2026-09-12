@@ -1825,6 +1825,7 @@ fn session_executes_commands_like_the_shell_cli() {
 
     assert_eq!(session.execute("server enable"), "server enabled");
     assert_eq!(session.execute("client add"), "client 1 added");
+    assert_eq!(session.execute("configure sctp enable"), "sctp enabled");
     assert_eq!(session.execute("configure type sctp"), "configuration updated");
 
     let status = session.execute("status");
