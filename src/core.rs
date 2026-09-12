@@ -85,9 +85,9 @@ impl Default for ProtocolSwitches {
     fn default() -> Self {
         Self {
             tcp: true,
-            sctp: true,
+            sctp: false,
             udp: true,
-            ip: true,
+            ip: false,
         }
     }
 }
