@@ -156,12 +156,14 @@ if command -v kubectl >/dev/null 2>&1 && kubectl cluster-info >/dev/null 2>&1; t
         case_fail "data volume netmark-postgres-data is Bound" "phase: ${pvc:-missing}"
       fi
 
-      settings=$(kubectl -n "$namespace" exec deployment/netmark-postgres -c postgres -- \
+      # Credentials expand inside the postgres container, not in the host shell.
+      # shellcheck disable=SC2016
+      if settings=$(kubectl -n "$namespace" exec deployment/netmark-postgres -c postgres -- \
         sh -ec 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc "
           SELECT setting FROM pg_settings
           WHERE name IN ('\''data_directory'\'', '\''config_file'\'',
-                         '\''hba_file'\'', '\''ident_file'\'') ORDER BY name;"' 2>&1)
-      if [ $? -eq 0 ] && [ "$(printf '%s\n' "$settings" \
+                         '\''hba_file'\'', '\''ident_file'\'') ORDER BY name;"' 2>&1) \
+        && [ "$(printf '%s\n' "$settings" \
         | grep -c '^/var/lib/postgresql/data\(/\|$\)')" -eq 4 ]; then
         case_ok "postgres data and settings are on the persistent volume"
       else

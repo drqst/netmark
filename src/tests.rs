@@ -2223,11 +2223,19 @@ esac
             String::from_utf8_lossy(&output.stderr)
         );
         let calls = std::fs::read_to_string(log).unwrap();
-        for forbidden in ["delete pvc", "delete namespace", "delete -f", "delete secret"] {
+        for forbidden in [
+            "delete pvc",
+            "delete namespace",
+            "delete -f",
+            "delete secret",
+        ] {
             assert!(!calls.contains(forbidden), "{scenario}: {calls}");
         }
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert_eq!(stdout.contains("All netmark pods stopped."), scenario == "stopped");
+        assert_eq!(
+            stdout.contains("All netmark pods stopped."),
+            scenario == "stopped"
+        );
         if scenario == "stopped" {
             assert!(calls.contains("delete pod --all"));
             assert!(stdout.contains("phase: Bound"));
