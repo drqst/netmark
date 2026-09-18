@@ -840,6 +840,21 @@ Grafana reports healthy — printing `ok` or `FAIL` for each and exiting
 non-zero if any case fails. Set `NETMARK_NAMESPACE`, `NETMARK_WEB` or
 `NETMARK_GRAFANA` to test another deployment.
 
+`stop.sh` stops the deployment: it deletes the deployments, Services and
+Grafana configmaps — removing every pod — and ends the PostgreSQL
+port-forward, but it never touches the `netmark-postgres-data` persistent
+volume claim, the namespace or the postgres secret, so the PostgreSQL data
+persists and the next `init.sh` run starts with the same database.
+
+`test.sh` tests the whole lifecycle. It always runs static cases — `init.sh`
+creates the cluster, waits for every node and every pod, and applies all
+three manifests; `stop.sh` removes the workloads without ever deleting the
+volume claim or the namespace; the data lives on a PVC of its own. With a
+reachable cluster it also verifies that all nodes are Ready, both deployments
+have a ready pod, every pod is Running and the data volume is Bound. Set
+`NETMARK_TEST_STOP=1` to additionally run `stop.sh` and verify all pods are
+gone while the data volume survives.
+
 ---
 
 ## Using netmark as a Rust library
