@@ -845,6 +845,9 @@ Grafana configmaps — removing every pod — and ends the PostgreSQL
 port-forward, but it never touches the `netmark-postgres-data` persistent
 volume claim, the namespace or the postgres secret, so the PostgreSQL data
 persists and the next `init.sh` run starts with the same database.
+Cargo copies `stop.sh`, `init.sh` and `check.sh` beside the binary:
+`target/debug/` for `cargo build`, or `target/release/` for `cargo build --release`.
+Run the packaged `stop.sh` directly from either directory.
 Only pods in the selected namespace (`NAMESPACE`, default `netmark`) are
 removed; cluster infrastructure in other namespaces is left running. Shutdown
 exits non-zero if the cluster cannot be reached or pods cannot be removed.

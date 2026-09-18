@@ -2101,6 +2101,30 @@ fn the_kubernetes_cluster_includes_grafana_and_a_test_script() {
 }
 
 #[test]
+fn lifecycle_scripts_are_packaged_next_to_the_binary() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let executable = std::env::current_exe().unwrap();
+    let output = executable.parent().unwrap().parent().unwrap();
+    for script in ["init.sh", "check.sh", "stop.sh"] {
+        let packaged = output.join(script);
+        assert_eq!(
+            std::fs::read(&packaged).unwrap(),
+            std::fs::read(root.join(script)).unwrap(),
+            "{script} must be copied into the Cargo profile output directory"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_ne!(
+                std::fs::metadata(&packaged).unwrap().permissions().mode() & 0o111,
+                0,
+                "{script} must remain executable"
+            );
+        }
+    }
+}
+
+#[test]
 fn postgres_data_and_settings_use_the_shared_persistent_volume() {
     use serde::Deserialize;
     use serde_yaml::Value;

@@ -3,7 +3,7 @@
 FROM rust:1-alpine AS build
 RUN apk add --no-cache musl-dev
 WORKDIR /src
-COPY Cargo.toml Cargo.lock build.rs init.sh check.sh netmark.config ./
+COPY Cargo.toml Cargo.lock build.rs init.sh check.sh stop.sh netmark.config ./
 COPY src ./src
 COPY doc ./doc
 COPY examples ./examples
