@@ -812,7 +812,7 @@ The cluster is four containers, three of them sharing one pod:
 | Container | Where | What it does |
 | --- | --- | --- |
 | `postgres` | `k8s/postgres.yaml` | PostgreSQL with Timescale; holds all run metrics and all monitor data |
-| `volume` | `k8s/postgres.yaml` | Owns the persistent volume claim, checks it is writable and reports how full it is |
+| `volume` | `k8s/postgres.yaml` | Mounts the persistent volume claim, checks it is writable and reports how full it is |
 | `netmark` | `k8s/postgres.yaml` (Service in `k8s/netmark.yaml`) | The web server: the web CLI and the REST API on port 8080; its local sqlite database lives on the same pod/volume as `postgres` |
 | `grafana` | `k8s/grafana.yaml` | Grafana reading `netmark_metrics` (with `run_id` on every point) from PostgreSQL |
 
@@ -834,7 +834,7 @@ host, so after `init.sh` finishes:
 case per expectation — the API is reachable, the namespace exists, the
 `postgres`, `volume`, `netmark` and `grafana` containers are deployed, the
 postgres and grafana deployments have a ready replica, the data volume is
-bound, PostgreSQL accepts connections, the volume container owns the data
+bound, PostgreSQL accepts connections, the volume container mounts the data
 volume, the web server answers both `/api/v1/status` and the web CLI, and
 Grafana reports healthy — printing `ok` or `FAIL` for each and exiting
 non-zero if any case fails. Set `NETMARK_NAMESPACE`, `NETMARK_WEB` or
@@ -845,6 +845,23 @@ Grafana configmaps — removing every pod — and ends the PostgreSQL
 port-forward, but it never touches the `netmark-postgres-data` persistent
 volume claim, the namespace or the postgres secret, so the PostgreSQL data
 persists and the next `init.sh` run starts with the same database.
+Only pods in the selected namespace (`NAMESPACE`, default `netmark`) are
+removed; cluster infrastructure in other namespaces is left running. Shutdown
+exits non-zero if the cluster cannot be reached or pods cannot be removed.
+Keep this namespace dedicated to netmark: additional workload controllers must
+be stopped separately or they may recreate pods.
+
+Kubernetes storage is the PVC, not a running "volume container": the `volume`
+sidecar stops with its pod, but the PVC and its underlying storage remain.
+PostgreSQL explicitly uses `/var/lib/postgresql/data/pgdata` on that PVC for
+database files, WAL, `postgresql.conf`, `postgresql.auto.conf`, `pg_hba.conf`
+and `pg_ident.conf`. The sidecar sees the same files under `/data/pgdata`.
+Existing databases at the volume root are reused without moving or resetting
+their data or settings. New databases use a subdirectory so the sibling
+`netmark-log` directory cannot prevent initialization. PostgreSQL deployments
+use `Recreate` to prevent simultaneous database instances on the same storage.
+Do not delete the namespace, PVC or kind cluster if you want to retain data;
+persistent storage is not a substitute for backups.
 
 `test.sh` tests the whole lifecycle. It always runs static cases — `init.sh`
 creates the cluster, waits for every node and every pod, and applies all
