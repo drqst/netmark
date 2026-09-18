@@ -41,6 +41,11 @@ if ! kubectl cluster-info >/dev/null 2>&1; then
   fi
 fi
 
+# All nodes must be up before anything is scheduled: the control plane, the
+# database node and the app node from k8s/kind-config.yaml (or whatever nodes
+# the reachable cluster has).
+kubectl wait --for=condition=Ready node --all --timeout=180s
+
 if [ -n "${POSTGRES_USER:-}" ] && [ -n "${POSTGRES_PASSWORD:-}" ] && [ -n "${POSTGRES_DB:-}" ]; then
   # Ensure config generation works when postgres.env is absent by using manifest defaults
   kubectl -n "$NAMESPACE" create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
@@ -70,6 +75,10 @@ kubectl apply -f "$APP_MANIFEST"
 # Grafana reads the same external metrics database the CLI writes to.
 kubectl apply -f "$GRAFANA_MANIFEST"
 kubectl -n "$NAMESPACE" rollout status deployment/netmark-grafana --timeout=180s
+
+# Every pod in the namespace must be Ready before init.sh declares success:
+# the postgres pod (postgres + volume + netmark containers) and the Grafana pod.
+kubectl -n "$NAMESPACE" wait --for=condition=Ready pod --all --timeout=180s
 
 # Port-forward PostgreSQL to the host. The netmark web interface is exposed by
 # the kind/app node extraPortMapping (host 8080 -> node 30080) when kind is in
