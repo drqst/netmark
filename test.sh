@@ -93,6 +93,8 @@ check_contains "stop.sh deletes the postgres and grafana deployments" \
 check_contains "stop.sh deletes the services" "$ROOT/stop.sh" "delete service"
 check_contains "stop.sh waits for pods to be gone" \
   "$ROOT/stop.sh" "wait --for=delete pod --all"
+check_contains "stop.sh also removes standalone pods" \
+  "$ROOT/stop.sh" "delete pod --all"
 check_not_contains "stop.sh never deletes the data volume claim" \
   "$ROOT/stop.sh" "delete pvc"
 check_not_contains "stop.sh never deletes persistentvolumeclaims" \
@@ -108,6 +110,12 @@ check_contains "postgres data lives on a PersistentVolumeClaim" \
   "$ROOT/k8s/postgres.yaml" "kind: PersistentVolumeClaim"
 check_contains "the postgres pod mounts the data volume claim" \
   "$ROOT/k8s/postgres.yaml" "claimName: netmark-postgres-data"
+check_contains "postgres initializes in a dedicated persistent directory" \
+  "$ROOT/k8s/postgres.yaml" "value: /var/lib/postgresql/data/pgdata"
+check_contains "postgres reuses existing databases at the volume root" \
+  "$ROOT/k8s/postgres.yaml" 'if \[ -s /var/lib/postgresql/data/PG_VERSION \]'
+check_contains "postgres never rolls out two writers on the volume" \
+  "$ROOT/k8s/postgres.yaml" "type: Recreate"
 
 # --- Live checks: a reachable cluster ------------------------------------
 
@@ -148,10 +156,24 @@ if command -v kubectl >/dev/null 2>&1 && kubectl cluster-info >/dev/null 2>&1; t
         case_fail "data volume netmark-postgres-data is Bound" "phase: ${pvc:-missing}"
       fi
 
+      # Credentials expand inside the postgres container, not in the host shell.
+      # shellcheck disable=SC2016
+      if settings=$(kubectl -n "$namespace" exec deployment/netmark-postgres -c postgres -- \
+        sh -ec 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc "
+          SELECT setting FROM pg_settings
+          WHERE name IN ('\''data_directory'\'', '\''config_file'\'',
+                         '\''hba_file'\'', '\''ident_file'\'') ORDER BY name;"' 2>&1) \
+        && [ "$(printf '%s\n' "$settings" \
+        | grep -c '^/var/lib/postgresql/data\(/\|$\)')" -eq 4 ]; then
+        case_ok "postgres data and settings are on the persistent volume"
+      else
+        case_fail "postgres data and settings are on the persistent volume" "$settings"
+      fi
+
       if [ "${NETMARK_TEST_STOP:-0}" = "1" ]; then
         # Destructive: run stop.sh, then verify every pod is gone while the
         # data volume claim survives, so PostgreSQL data persists between runs.
-        output=$("$ROOT/stop.sh" 2>&1)
+        output=$(NAMESPACE="$namespace" "$ROOT/stop.sh" 2>&1)
         if [ $? -eq 0 ]; then
           case_ok "stop.sh runs successfully"
         else

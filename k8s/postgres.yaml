@@ -1,5 +1,5 @@
 # The netmark cluster keeps four containers: this file holds the PostgreSQL
-# container, the volume container that owns the data volume, and the netmark
+# container, the volume container that inspects the data volume, and the netmark
 # web server container itself, all in one pod so the always-on local
 # log/netmark.sqlite sits on the same pod (and the same data volume) as the
 # external PostgreSQL it complements; netmark.yaml holds only the Service that
@@ -39,6 +39,8 @@ metadata:
   namespace: netmark
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: netmark-postgres
@@ -47,6 +49,7 @@ spec:
       labels:
         app: netmark-postgres
     spec:
+      terminationGracePeriodSeconds: 120
       affinity:
         nodeAffinity:
           # Prefer the dedicated database node from kind-config.yaml, but still
@@ -68,6 +71,19 @@ spec:
           envFrom:
             - secretRef:
                 name: netmark-postgres
+          env:
+            # initdb stores the database, WAL and configuration files here,
+            # separate from netmark-log and any filesystem lost+found directory.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              # Keep databases initialized at the old volume root in place.
+              if [ -s /var/lib/postgresql/data/PG_VERSION ]; then
+                export PGDATA=/var/lib/postgresql/data
+              fi
+              exec docker-entrypoint.sh postgres
           readinessProbe:
             exec:
               command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
@@ -76,9 +92,8 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
-        # The volume container: it owns the persistent volume, prepares it for
-        # PostgreSQL before the database writes to it and then reports how full
-        # it is, so storage is inspectable without entering the database.
+        # The volume container inspects the same persistent volume as PostgreSQL.
+        # Storage belongs to the PVC, not this container, and survives pod deletion.
         - name: volume
           image: alpine:3.20
           imagePullPolicy: IfNotPresent

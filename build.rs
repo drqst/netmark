@@ -9,7 +9,7 @@ fn main() {
         .and_then(|path| path.parent())
         .and_then(|path| path.parent())
         .expect("unexpected Cargo output layout");
-    for name in ["init.sh", "check.sh", "netmark.config"] {
+    for name in ["init.sh", "check.sh", "stop.sh", "netmark.config"] {
         let source = PathBuf::from(name);
         let destination = target_debug.join(name);
         if let Err(error) = fs::copy(&source, &destination) {
@@ -18,5 +18,6 @@ fn main() {
     }
     println!("cargo:rerun-if-changed=init.sh");
     println!("cargo:rerun-if-changed=check.sh");
+    println!("cargo:rerun-if-changed=stop.sh");
     println!("cargo:rerun-if-changed=netmark.config");
 }

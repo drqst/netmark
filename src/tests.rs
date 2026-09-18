@@ -2101,6 +2101,174 @@ fn the_kubernetes_cluster_includes_grafana_and_a_test_script() {
 }
 
 #[test]
+fn lifecycle_scripts_are_packaged_next_to_the_binary() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let executable = std::env::current_exe().unwrap();
+    let output = executable.parent().unwrap().parent().unwrap();
+    for script in ["init.sh", "check.sh", "stop.sh"] {
+        let packaged = output.join(script);
+        assert_eq!(
+            std::fs::read(&packaged).unwrap(),
+            std::fs::read(root.join(script)).unwrap(),
+            "{script} must be copied into the Cargo profile output directory"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_ne!(
+                std::fs::metadata(&packaged).unwrap().permissions().mode() & 0o111,
+                0,
+                "{script} must remain executable"
+            );
+        }
+    }
+}
+
+#[test]
+fn postgres_data_and_settings_use_the_shared_persistent_volume() {
+    use serde::Deserialize;
+    use serde_yaml::Value;
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = std::fs::read_to_string(root.join("k8s/postgres.yaml")).unwrap();
+    let documents: Vec<Value> = serde_yaml::Deserializer::from_str(&manifest)
+        .map(|document| Value::deserialize(document).unwrap())
+        .collect();
+    let deployment = documents
+        .iter()
+        .find(|document| document["kind"] == "Deployment")
+        .unwrap();
+    assert_eq!(deployment["spec"]["strategy"]["type"], "Recreate");
+    let pod = &deployment["spec"]["template"]["spec"];
+    assert_eq!(
+        pod["volumes"][0]["persistentVolumeClaim"]["claimName"],
+        "netmark-postgres-data"
+    );
+    let containers = pod["containers"].as_sequence().unwrap();
+    let postgres = containers.iter().find(|c| c["name"] == "postgres").unwrap();
+    let volume = containers.iter().find(|c| c["name"] == "volume").unwrap();
+    let pgdata = postgres["env"]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .find(|env| env["name"] == "PGDATA")
+        .unwrap();
+    assert_eq!(pgdata["value"], "/var/lib/postgresql/data/pgdata");
+    assert_eq!(
+        postgres["volumeMounts"][0]["mountPath"],
+        "/var/lib/postgresql/data"
+    );
+    assert_eq!(
+        postgres["volumeMounts"][0]["name"],
+        volume["volumeMounts"][0]["name"]
+    );
+    assert_eq!(volume["volumeMounts"][0]["mountPath"], "/data");
+    let startup = postgres["args"][0].as_str().unwrap();
+    assert!(startup.contains("if [ -s /var/lib/postgresql/data/PG_VERSION ]"));
+    assert!(startup.contains("export PGDATA=/var/lib/postgresql/data"));
+    assert!(startup.contains("exec docker-entrypoint.sh postgres"));
+}
+
+#[cfg(unix)]
+#[test]
+fn stop_script_preserves_storage_and_reports_shutdown_failures() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let temporary = std::env::temp_dir().join(format!("netmark-stop-test-{}", std::process::id()));
+    std::fs::create_dir_all(&temporary).unwrap();
+    let kubectl = temporary.join("kubectl");
+    std::fs::write(
+        &kubectl,
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$CALL_LOG"
+case "$*" in
+  cluster-info) [ "$SCENARIO" != unreachable ]; exit $? ;;
+  'get namespace lifecycle-test --ignore-not-found -o name')
+    [ "$SCENARIO" != forbidden ] || exit 1
+    [ "$SCENARIO" != absent ] || exit 0
+    echo namespace/lifecycle-test; exit 0 ;;
+esac
+[ "$1 $2" = '-n lifecycle-test' ] || exit 99
+shift 2
+case "$*" in
+  'delete deployment netmark-postgres netmark-grafana --ignore-not-found --cascade=foreground --timeout=180s')
+    [ "$SCENARIO" != delete-failure ] ;;
+  'delete pod --all --ignore-not-found --timeout=180s') exit 0 ;;
+  'delete service netmark-postgres netmark-app netmark-grafana --ignore-not-found') exit 0 ;;
+  'delete configmap netmark-grafana-provisioning netmark-grafana-dashboards --ignore-not-found') exit 0 ;;
+  'wait --for=delete pod --all --timeout=180s') [ "$SCENARIO" != timeout ] ;;
+  'get pods -o name')
+    [ "$SCENARIO" != list-failure ] || exit 1
+    [ "$SCENARIO" != remaining ] || echo pod/still-running
+    exit 0 ;;
+  'get pvc netmark-postgres-data -o jsonpath={.status.phase}')
+    [ "$SCENARIO" != missing-pvc ] || exit 1
+    echo Bound ;;
+  *) exit 99 ;;
+esac
+"#,
+    )
+    .unwrap();
+    let pkill = temporary.join("pkill");
+    std::fs::write(&pkill, "#!/bin/sh\nexit 0\n").unwrap();
+    for executable in [&kubectl, &pkill] {
+        std::fs::set_permissions(executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = format!(
+        "{}:{}",
+        temporary.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    for (scenario, success) in [
+        ("stopped", true),
+        ("absent", true),
+        ("unreachable", false),
+        ("forbidden", false),
+        ("delete-failure", false),
+        ("timeout", false),
+        ("list-failure", false),
+        ("remaining", false),
+        ("missing-pvc", false),
+    ] {
+        let log = temporary.join(format!("{scenario}.log"));
+        let output = std::process::Command::new("sh")
+            .arg(root.join("stop.sh"))
+            .env("PATH", &path)
+            .env("NAMESPACE", "lifecycle-test")
+            .env("SCENARIO", scenario)
+            .env("CALL_LOG", &log)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            success,
+            "{scenario}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let calls = std::fs::read_to_string(log).unwrap();
+        for forbidden in [
+            "delete pvc",
+            "delete namespace",
+            "delete -f",
+            "delete secret",
+        ] {
+            assert!(!calls.contains(forbidden), "{scenario}: {calls}");
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            stdout.contains("All netmark pods stopped."),
+            scenario == "stopped"
+        );
+        if scenario == "stopped" {
+            assert!(calls.contains("delete pod --all"));
+            assert!(stdout.contains("phase: Bound"));
+        }
+    }
+    std::fs::remove_dir_all(temporary).unwrap();
+}
+
+#[test]
 fn sctp_and_webrtc_live_under_configure() {
     // The moved commands are documented where they now live, and the old
     // top-level words are gone from the command list and the help.
