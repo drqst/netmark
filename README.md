@@ -15,6 +15,8 @@ cargo build --release
 ./target/release/netmark                             # interactive; type `help`
 ./target/release/netmark profiles/udp-10kbps.yaml    # one run, exit 0 or 1
 ./init.sh                                            # Kubernetes: database + app with web CLI
+./stop.sh                                            # stop all pods; the postgres data volume is kept
+./test.sh                                            # test init.sh/stop.sh and the volume persistence
 ```
 
 ## What it does
@@ -33,7 +35,8 @@ cargo build --release
   node (PostgreSQL/Timescale on a persistent volume), an app node serving a
   **web interface with a web CLI**, and **Grafana** graphing the external metrics
   database (every point tagged with `run_id`); `./netmarkctl` controls the app
-  from the shell.
+  from the shell. `stop.sh` stops and removes every pod but keeps the data
+  volume, so PostgreSQL data persists between runs; `test.sh` tests all of it.
 
 ## Defaults
 

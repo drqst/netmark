@@ -121,58 +121,75 @@ if command -v kubectl >/dev/null 2>&1 && kubectl cluster-info >/dev/null 2>&1; t
   fi
 
   if kubectl get namespace "$namespace" >/dev/null 2>&1; then
-    for deployment in netmark-postgres netmark-grafana; do
-      ready=$(kubectl -n "$namespace" get deployment "$deployment" \
-        -o jsonpath='{.status.readyReplicas}' 2>/dev/null)
-      if [ "${ready:-0}" -ge 1 ] 2>/dev/null; then
-        case_ok "deployment $deployment has a ready pod"
+    if kubectl -n "$namespace" get deployment netmark-postgres >/dev/null 2>&1; then
+      for deployment in netmark-postgres netmark-grafana; do
+        ready=$(kubectl -n "$namespace" get deployment "$deployment" \
+          -o jsonpath='{.status.readyReplicas}' 2>/dev/null)
+        if [ "${ready:-0}" -ge 1 ] 2>/dev/null; then
+          case_ok "deployment $deployment has a ready pod"
+        else
+          case_fail "deployment $deployment has a ready pod" "ready replicas: ${ready:-0}"
+        fi
+      done
+
+      not_running=$(kubectl -n "$namespace" get pods --no-headers 2>/dev/null \
+        | awk '$3 != "Running"' | wc -l | tr -d ' ')
+      if [ "$not_running" = "0" ]; then
+        case_ok "every pod in namespace $namespace is Running"
       else
-        case_fail "deployment $deployment has a ready pod" "ready replicas: ${ready:-0}"
-      fi
-    done
-
-    not_running=$(kubectl -n "$namespace" get pods --no-headers 2>/dev/null \
-      | awk '$3 != "Running"' | wc -l | tr -d ' ')
-    if [ "$not_running" = "0" ]; then
-      case_ok "every pod in namespace $namespace is Running"
-    else
-      case_fail "every pod in namespace $namespace is Running" "$not_running pod(s) not Running"
-    fi
-
-    pvc=$(kubectl -n "$namespace" get pvc netmark-postgres-data \
-      -o jsonpath='{.status.phase}' 2>/dev/null)
-    if [ "$pvc" = "Bound" ]; then
-      case_ok "data volume netmark-postgres-data is Bound"
-    else
-      case_fail "data volume netmark-postgres-data is Bound" "phase: ${pvc:-missing}"
-    fi
-
-    if [ "${NETMARK_TEST_STOP:-0}" = "1" ]; then
-      # Destructive: run stop.sh, then verify every pod is gone while the
-      # data volume claim survives, so PostgreSQL data persists between runs.
-      output=$("$ROOT/stop.sh" 2>&1)
-      if [ $? -eq 0 ]; then
-        case_ok "stop.sh runs successfully"
-      else
-        case_fail "stop.sh runs successfully" "$output"
-      fi
-
-      pods_left=$(kubectl -n "$namespace" get pods --no-headers 2>/dev/null | wc -l | tr -d ' ')
-      if [ "$pods_left" = "0" ]; then
-        case_ok "stop.sh removed every pod"
-      else
-        case_fail "stop.sh removed every pod" "$pods_left pod(s) remain"
+        case_fail "every pod in namespace $namespace is Running" "$not_running pod(s) not Running"
       fi
 
       pvc=$(kubectl -n "$namespace" get pvc netmark-postgres-data \
         -o jsonpath='{.status.phase}' 2>/dev/null)
       if [ "$pvc" = "Bound" ]; then
-        case_ok "data volume survives stop.sh (postgres data persists)"
+        case_ok "data volume netmark-postgres-data is Bound"
       else
-        case_fail "data volume survives stop.sh (postgres data persists)" "phase: ${pvc:-missing}"
+        case_fail "data volume netmark-postgres-data is Bound" "phase: ${pvc:-missing}"
+      fi
+
+      if [ "${NETMARK_TEST_STOP:-0}" = "1" ]; then
+        # Destructive: run stop.sh, then verify every pod is gone while the
+        # data volume claim survives, so PostgreSQL data persists between runs.
+        output=$("$ROOT/stop.sh" 2>&1)
+        if [ $? -eq 0 ]; then
+          case_ok "stop.sh runs successfully"
+        else
+          case_fail "stop.sh runs successfully" "$output"
+        fi
+
+        pods_left=$(kubectl -n "$namespace" get pods --no-headers 2>/dev/null | wc -l | tr -d ' ')
+        if [ "$pods_left" = "0" ]; then
+          case_ok "stop.sh removed every pod"
+        else
+          case_fail "stop.sh removed every pod" "$pods_left pod(s) remain"
+        fi
+
+        pvc=$(kubectl -n "$namespace" get pvc netmark-postgres-data \
+          -o jsonpath='{.status.phase}' 2>/dev/null)
+        if [ "$pvc" = "Bound" ]; then
+          case_ok "data volume survives stop.sh (postgres data persists)"
+        else
+          case_fail "data volume survives stop.sh (postgres data persists)" "phase: ${pvc:-missing}"
+        fi
+      else
+        printf '%-58s skipped (set NETMARK_TEST_STOP=1)\n' "stop.sh live teardown test"
       fi
     else
-      printf '%-58s skipped (set NETMARK_TEST_STOP=1)\n' "stop.sh live teardown test"
+      # The stopped state left behind by stop.sh: no workloads, no pods, but
+      # the data volume claim (and the postgres data on it) still there.
+      pods_left=$(kubectl -n "$namespace" get pods --no-headers 2>/dev/null | wc -l | tr -d ' ')
+      if [ "$pods_left" = "0" ]; then
+        case_ok "stopped: no pods remain in namespace $namespace"
+      else
+        case_fail "stopped: no pods remain in namespace $namespace" "$pods_left pod(s) remain"
+      fi
+      if kubectl -n "$namespace" get pvc netmark-postgres-data >/dev/null 2>&1; then
+        case_ok "stopped: data volume still exists (postgres data persists)"
+      else
+        case_fail "stopped: data volume still exists (postgres data persists)" "pvc missing"
+      fi
+      printf '%-58s skipped (deployment stopped; run init.sh)\n' "running-state checks"
     fi
   else
     printf '%-58s skipped (run init.sh first)\n' "live pod/volume checks"
