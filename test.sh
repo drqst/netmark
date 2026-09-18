@@ -73,7 +73,13 @@ check_contains "init.sh creates the kind cluster" \
   "$ROOT/init.sh" "kind create cluster"
 check_contains "init.sh waits for all nodes to be Ready" \
   "$ROOT/init.sh" "wait --for=condition=Ready node --all"
+check_contains "init.sh waits for cluster DNS before deploying netmark" \
+  "$ROOT/init.sh" "wait_for_deployment_if_present kube-system coredns"
+check_contains "init.sh waits for the storage provisioner before deploying netmark" \
+  "$ROOT/init.sh" "wait_for_deployment_if_present local-path-storage local-path-provisioner"
 check_contains "init.sh deploys postgres" "$ROOT/init.sh" 'kubectl apply -f "$MANIFEST"'
+check_contains "init.sh waits for the postgres data volume to bind" \
+  "$ROOT/init.sh" "pvc/netmark-postgres-data --timeout=180s"
 check_contains "init.sh deploys the app service" \
   "$ROOT/init.sh" 'kubectl apply -f "$APP_MANIFEST"'
 check_contains "init.sh deploys grafana" \
