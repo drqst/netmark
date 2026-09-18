@@ -26,6 +26,14 @@ if ! command -v kubectl >/dev/null 2>&1; then
   exit 1
 fi
 
+wait_for_deployment_if_present() {
+  namespace=$1
+  deployment=$2
+  if kubectl -n "$namespace" get deployment "$deployment" >/dev/null 2>&1; then
+    kubectl -n "$namespace" rollout status "deployment/$deployment" --timeout=180s
+  fi
+}
+
 docker build -t netmark-tools:local -f "$PROJECT_ROOT/k8s/Dockerfile" "$PROJECT_ROOT/k8s"
 docker build -t netmark-app:local -f "$PROJECT_ROOT/k8s/Dockerfile.netmark" "$PROJECT_ROOT"
 
@@ -46,6 +54,11 @@ fi
 # the reachable cluster has).
 kubectl wait --for=condition=Ready node --all --timeout=180s
 
+# Fresh clusters can report Ready nodes before DNS/storage controllers are
+# stable enough to provision the netmark data volume.
+wait_for_deployment_if_present kube-system coredns
+wait_for_deployment_if_present local-path-storage local-path-provisioner
+
 if [ -n "${POSTGRES_USER:-}" ] && [ -n "${POSTGRES_PASSWORD:-}" ] && [ -n "${POSTGRES_DB:-}" ]; then
   # Ensure config generation works when postgres.env is absent by using manifest defaults
   kubectl -n "$NAMESPACE" create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
@@ -64,6 +77,8 @@ if command -v kind >/dev/null 2>&1 && kind get clusters 2>/dev/null | grep -qx "
 fi
 
 kubectl apply -f "$MANIFEST"
+kubectl -n "$NAMESPACE" wait --for=jsonpath='{.status.phase}'=Bound \
+  pvc/netmark-postgres-data --timeout=180s
 kubectl -n "$NAMESPACE" rollout status deployment/netmark-postgres --timeout=180s
 
 # Only the Service is left to apply for the web interface: the netmark

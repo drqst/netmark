@@ -2075,6 +2075,18 @@ fn the_kubernetes_cluster_includes_grafana_and_a_test_script() {
         init.contains("k8s/grafana.yaml") || init.contains("$GRAFANA_MANIFEST"),
         "init.sh does not deploy grafana"
     );
+    assert!(
+        init.contains("wait_for_deployment_if_present kube-system coredns"),
+        "init.sh does not wait for cluster DNS to become ready"
+    );
+    assert!(
+        init.contains("wait_for_deployment_if_present local-path-storage local-path-provisioner"),
+        "init.sh does not wait for the storage provisioner to become ready"
+    );
+    assert!(
+        init.contains("pvc/netmark-postgres-data"),
+        "init.sh does not wait for the postgres data volume to bind"
+    );
 
     let script = root.join("k8s/cluster-test.sh");
     let cases = std::fs::read_to_string(&script).unwrap();
