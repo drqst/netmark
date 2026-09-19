@@ -17,6 +17,39 @@ pub struct FileConfig {
     pub restapi: RestApiConfig,
     #[serde(default)]
     pub webrtc: WebRtcConfig,
+    #[serde(default)]
+    pub monitor: MonitorConfig,
+}
+
+/// Background monitor settings. The monitor can check an HTTP/HTTPS target
+/// (`monitor IP <url>`) or an ICMP target (`monitor ping <host>`). Checks are
+/// stored in the external metrics database when one is configured.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct MonitorConfig {
+    pub ping: PingConfig,
+    pub http: HttpMonitorConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct PingConfig {
+    /// Target host or IP address; null disables ICMP checks.
+    pub target: Option<String>,
+    /// Seconds between pings.
+    #[serde(default = "default_ping_interval_seconds")]
+    pub interval_seconds: u64,
+    /// When false the ICMP check is skipped even if a target is configured.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+fn default_ping_interval_seconds() -> u64 {
+    30
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct HttpMonitorConfig {
+    /// HTTP/HTTPS URL to check; null disables HTTP checks.
+    pub target: Option<String>,
 }
 
 /// The WebRTC data-channel layer that rides on top of the selected transport.
