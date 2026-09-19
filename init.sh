@@ -64,7 +64,7 @@ if command -v kind >/dev/null 2>&1 && kind get clusters 2>/dev/null | grep -qx "
 fi
 
 kubectl apply -f "$MANIFEST"
-kubectl -n "$NAMESPACE" rollout status deployment/netmark-postgres --timeout=180s
+kubectl -n "$NAMESPACE" rollout status deployment/netmark-postgres --timeout=300s
 
 # Only the Service is left to apply for the web interface: the netmark
 # container itself is already up as part of the netmark-postgres pod above, so
