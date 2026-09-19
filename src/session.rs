@@ -376,7 +376,7 @@ impl Session {
             }
             ["monitor", "ping", target]
                 if !matches!(
-                    target.as_ref(),
+                    *target,
                     "enable" | "disable" | "interval" | "status"
                 ) =>
             {

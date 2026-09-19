@@ -1840,6 +1840,19 @@ fn session_executes_commands_like_the_shell_cli() {
     assert!(help_tcp.contains("configure tcp"), "{help_tcp}");
 
     assert_eq!(
+        session.execute("monitor ping 127.0.0.1"),
+        "monitor ping target set to 127.0.0.1"
+    );
+    assert_eq!(session.execute("monitor ping enable"), "monitor ping enabled");
+    assert_eq!(
+        session.execute("monitor ping interval 10"),
+        "monitor ping interval set to 10 seconds"
+    );
+    assert_eq!(
+        session.execute("monitor ping status"),
+        "monitor ping target=127.0.0.1 enabled=true interval=10s"
+    );
+    assert_eq!(
         session.execute("nonsense"),
         "unknown command; type 'help' for commands"
     );
