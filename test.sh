@@ -84,6 +84,8 @@ check_contains "init.sh waits for the grafana rollout" \
   "$ROOT/init.sh" "rollout status deployment/netmark-grafana"
 check_contains "init.sh waits for all pods to be Ready" \
   "$ROOT/init.sh" "wait --for=condition=Ready pod --all"
+check_contains "init.sh reports the phase of a failed command" \
+  "$ROOT/init.sh" "init.sh: failed during"
 
 # stop.sh must stop and remove every pod, but never the data volume: it may
 # only delete the deployments/services/configmaps, not the PVC, not the
