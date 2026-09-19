@@ -195,6 +195,11 @@ pub fn client_command(clients: &Clients, id: u64, args: &[&str], log_dir: &std::
 
 pub const CLIENT_USAGE: &str = "client: list | add | delete <id> | <id> enable | <id> disable | <id> remote <ip> | <id> runtime <seconds> | <id> jitter <ms> | <id> webrtc <on|off|follow> | <id> http check <url> | <id> status";
 
+/// Normalise an ICMP target: accept a plain host or IP and keep it as-is.
+pub fn normalize_ping_target(target: &str) -> String {
+    target.trim().to_string()
+}
+
 /// Subcommand: client list — every client and its settings, one per line.
 pub fn list_clients(clients: &Clients) -> String {
     clients
@@ -296,7 +301,8 @@ pub fn load_default_metrics_sink() -> Option<Arc<ExternalSqlMetrics>> {
 }
 
 /// Subcommand: configure save — writes the current in-memory configuration
-/// (traffic settings, admin emails, external metrics target, SMTP server) to netmark.config.
+/// (traffic settings, admin emails, external metrics target, SMTP server,
+/// monitor settings) to netmark.config.
 pub fn save_configuration(
     path: &std::path::Path,
     config: &Config,
@@ -305,6 +311,7 @@ pub fn save_configuration(
     smtp: &Arc<Mutex<configuration::SmtpConfig>>,
     restapi: &Arc<Mutex<configuration::RestApiConfig>>,
     webrtc: &Arc<Mutex<crate::webrtc::Settings>>,
+    monitor: &crate::monitor::MonitorState,
 ) -> Result<(), String> {
     let mut document = configuration::load(path).unwrap_or_default();
     document.traffic = crate::traffic_config_from(config);
@@ -318,6 +325,7 @@ pub fn save_configuration(
     document.smtp = smtp.lock().unwrap().clone();
     document.restapi = restapi.lock().unwrap().clone();
     document.webrtc = crate::webrtc_config_from(&webrtc.lock().unwrap());
+    document.monitor = crate::monitor_config_from(monitor);
     let contents = serde_yaml::to_string(&document).map_err(|error| error.to_string())?;
     std::fs::write(path, contents).map_err(|error| error.to_string())
 }
@@ -332,6 +340,7 @@ pub fn reset_configuration(
     smtp: &Arc<Mutex<configuration::SmtpConfig>>,
     restapi: &Arc<Mutex<configuration::RestApiConfig>>,
     webrtc: &Arc<Mutex<crate::webrtc::Settings>>,
+    monitor: &Arc<crate::monitor::MonitorState>,
 ) {
     let file_config = configuration::load(path).unwrap_or_default();
     *config.lock().unwrap() = crate::config_from_file(&file_config);
@@ -345,6 +354,7 @@ pub fn reset_configuration(
     *smtp.lock().unwrap() = file_config.smtp;
     *restapi.lock().unwrap() = file_config.restapi;
     *webrtc.lock().unwrap() = crate::webrtc_settings(&file_config.webrtc);
+    monitor.apply_config(&file_config.monitor);
 }
 
 /// Subcommand: admin smtp enabled | admin smtp disabled — turns SMTP use on or
@@ -913,7 +923,9 @@ pub fn limits_table(limits: &crate::core::LimitSet, only: Option<PacketType>) ->
 
 pub const LIMITS_USAGE: &str = "configure limits: [<tcp|sctp|udp|ip>] status | <tcp|sctp|udp|ip> <parameter> <value> | <tcp|sctp|udp|ip> clear";
 
-pub const CONFIGURE_USAGE: &str = "configure: metrics <connection> | save | reset | smtp <host[:port]> | type <tcp|sctp|udp|ip> | <tcp|sctp|udp|ip> enable|disable | protocols | webrtc <enable|disable|channels|label|ordered|status> | sctp [status] | tcp bytes <bytes/sec> | tcp window <bytes> | tcp jitter <ms> | tcp maxjitter <ms> | udp_rate <packets/sec> | udp packetsize <bytes> | udp jitter <ms> | udp max jitter <ms> | bandwidth limit <bytes/sec> | limits <tcp|sctp|udp|ip> <parameter> <value>";
+pub const CONFIGURE_USAGE: &str = "configure: metrics <connection> | save | reset | smtp <host[:port]> | type <tcp|sctp|udp|ip> | <tcp|sctp|udp|ip> enable|disable | protocols | webrtc <enable|disable|channels|label|ordered|status> | sctp [status] | tcp bytes <bytes/sec> | tcp window <bytes> | tcp jitter <ms> | tcp maxjitter <ms> | udp_rate <packets/sec> | udp packetsize <bytes> | udp jitter <ms> | udp max jitter <ms> | bandwidth limit <bytes/sec> | limits <tcp|sctp|udp|ip> <parameter> <value> | monitor ping <host> | monitor ping enable|disable | monitor ping interval <seconds>";
+
+pub const MONITOR_USAGE: &str = "monitor: IP <url> | ping <host> | ping enable | ping disable | ping interval <seconds> | start | stop | history";
 
 /// Subcommand: client http check <url>
 pub fn client_http_check(log_dir: &std::path::Path, url: &str) -> String {
@@ -1474,8 +1486,36 @@ pub fn help_rows() -> Vec<Vec<String>> {
             "set HTTP or HTTPS monitor target".into(),
         ],
         vec![
+            "monitor ping <host>".into(),
+            "set ICMP ping monitor target".into(),
+        ],
+        vec![
+            "monitor ping enable | disable".into(),
+            "turn ICMP checks on or off".into(),
+        ],
+        vec![
+            "monitor ping interval <seconds>".into(),
+            "seconds between pings".into(),
+        ],
+        vec![
+            "monitor ping status".into(),
+            "show ICMP target, enabled flag and interval".into(),
+        ],
+        vec![
+            "configure monitor ping <host>".into(),
+            "set ICMP ping target so configure save persists it".into(),
+        ],
+        vec![
+            "configure monitor ping enable | disable".into(),
+            "persist ICMP on/off state".into(),
+        ],
+        vec![
+            "configure monitor ping interval <seconds>".into(),
+            "persist ICMP check interval".into(),
+        ],
+        vec![
             "monitor start | stop".into(),
-            "start or stop 30-second checks".into(),
+            "start or stop periodic checks".into(),
         ],
         vec![
             "monitor history".into(),

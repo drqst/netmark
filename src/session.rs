@@ -8,10 +8,11 @@
 //! API returns them as the body of `POST /api/v1/cli`.
 
 use crate::cli::{
-    self, CLIENT_USAGE, CONFIGURE_USAGE, Clients, StatusContext, client_command,
-    configure, help_for, list_clients, run_benchmark, run_selftest, save_configuration,
-    reset_configuration, sctp_help_rows, set_runtime, set_smtp_enabled, show_monitor_history,
-    smtp_status, status_rows, update_admin_email, webrtc_command,
+    self, CLIENT_USAGE, CONFIGURE_USAGE, MONITOR_USAGE, Clients, StatusContext, client_command,
+    configure, help_for, list_clients, normalize_http_target, normalize_ping_target,
+    run_benchmark, run_selftest, save_configuration, reset_configuration, sctp_help_rows,
+    set_runtime, set_smtp_enabled, show_monitor_history, smtp_status, status_rows,
+    update_admin_email, webrtc_command,
 };
 use crate::configuration::{FileConfig, RestApiConfig, SmtpConfig};
 use crate::core::{self, Config, DEFAULT_REMOTE, Metrics, SqlState, StartGate};
@@ -77,6 +78,8 @@ impl Session {
         let sql = Arc::new(SqlState::new());
         sql.enable()
             .expect("cannot initialize local SQLite database");
+        let monitor = Arc::new(MonitorState::new());
+        monitor.apply_config(&file_config.monitor);
         Session {
             config,
             clients,
@@ -88,7 +91,7 @@ impl Session {
             smtp: Arc::new(Mutex::new(file_config.smtp.clone())),
             webrtc: Arc::new(Mutex::new(crate::webrtc_settings(&file_config.webrtc))),
             restapi_config: Arc::new(Mutex::new(file_config.restapi.clone())),
-            monitor: Arc::new(MonitorState::new()),
+            monitor,
             log_dir,
             config_path,
             server_enabled: AtomicBool::new(false),
@@ -243,6 +246,7 @@ impl Session {
                     &self.smtp,
                     &self.restapi_config,
                     &self.webrtc,
+                    &self.monitor,
                 ) {
                     Ok(()) => "configuration saved to netmark.config".to_string(),
                     Err(error) => format!("config save error: {error}"),
@@ -257,6 +261,7 @@ impl Session {
                     &self.smtp,
                     &self.restapi_config,
                     &self.webrtc,
+                    &self.monitor,
                 );
                 "configuration reset to defaults".to_string()
             }
@@ -289,6 +294,29 @@ impl Session {
             }
             ["configure", "sctp", "status"] => {
                 format!("SCTP: {}", crate::restapi::sctp_status())
+            }
+            // Subcommand: configure monitor ping — persists through configure save.
+            ["configure", "monitor", "ping", "enable"] => {
+                self.monitor.set_kind(crate::monitor::MonitorKind::Icmp);
+                self.monitor.set_ping_enabled(true);
+                "monitor ping enabled".to_string()
+            }
+            ["configure", "monitor", "ping", "disable"] => {
+                self.monitor.set_ping_enabled(false);
+                "monitor ping disabled".to_string()
+            }
+            ["configure", "monitor", "ping", "interval", value] => match value.parse::<u64>() {
+                Ok(value) if value > 0 => {
+                    self.monitor.set_interval(value);
+                    format!("monitor ping interval set to {value} seconds")
+                }
+                _ => "monitor ping interval must be a positive number of seconds".to_string(),
+            },
+            ["configure", "monitor", "ping", target] => {
+                let target = normalize_ping_target(target);
+                self.monitor.set_target(target.clone());
+                self.monitor.set_kind(crate::monitor::MonitorKind::Icmp);
+                format!("monitor ping target set to {target}")
             }
             // Subcommand: configure <protocol> enable | disable
             ["configure", protocol, "enable"] => {
@@ -339,11 +367,48 @@ impl Session {
             }
             ["metrics", ..] => "metrics: enable | disable | status".to_string(),
             // Command: monitor
-            ["monitor"] => "monitor: IP <url> | start | stop | history".to_string(),
+            ["monitor"] => MONITOR_USAGE.to_string(),
             ["monitor", "IP", target] | ["monitor", "ip", target] => {
-                let target = cli::normalize_http_target(target);
+                let target = normalize_http_target(target);
                 self.monitor.set_target(target.clone());
+                self.monitor.set_kind(crate::monitor::MonitorKind::Http);
                 format!("monitor target set to {target}")
+            }
+            ["monitor", "ping", target]
+                if !matches!(
+                    target.as_ref(),
+                    "enable" | "disable" | "interval" | "status"
+                ) =>
+            {
+                let target = normalize_ping_target(target);
+                self.monitor.set_target(target.clone());
+                self.monitor.set_kind(crate::monitor::MonitorKind::Icmp);
+                format!("monitor ping target set to {target}")
+            }
+            ["monitor", "ping", "enable"] => {
+                self.monitor.set_kind(crate::monitor::MonitorKind::Icmp);
+                self.monitor.set_ping_enabled(true);
+                "monitor ping enabled".to_string()
+            }
+            ["monitor", "ping", "disable"] => {
+                self.monitor.set_ping_enabled(false);
+                "monitor ping disabled".to_string()
+            }
+            ["monitor", "ping", "interval", value] => match value.parse::<u64>() {
+                Ok(value) if value > 0 => {
+                    self.monitor.set_interval(value);
+                    format!("monitor ping interval set to {value} seconds")
+                }
+                _ => "monitor ping interval must be a positive number of seconds".to_string(),
+            },
+            ["monitor", "ping", "status"] | ["monitor", "ping"] => {
+                let snapshot = self.monitor.config_snapshot();
+                format!(
+                    "monitor ping target={} enabled={} interval={}s",
+                    snapshot.ping.target.as_deref().unwrap_or("none"),
+                    snapshot.ping.enabled,
+                    snapshot.ping.interval_seconds
+                )
             }
             ["monitor", "start"] => match self.monitor.start(&self.log_dir, &self.sql) {
                 Some(id) => format!("monitor started {id}"),
@@ -354,7 +419,7 @@ impl Session {
                 "monitor stopped".to_string()
             }
             ["monitor", "history"] => show_monitor_history(&self.log_dir),
-            ["monitor", ..] => "monitor: IP <url> | start | stop | history".to_string(),
+            ["monitor", ..] => MONITOR_USAGE.to_string(),
             // Command: selftest
             ["selftest"] => run_selftest(
                 &self.config,

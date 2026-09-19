@@ -37,6 +37,10 @@ pub fn config_from_file(file_config: &configuration::FileConfig) -> Config {
     config
 }
 
+pub fn monitor_config_from(state: &crate::monitor::MonitorState) -> configuration::MonitorConfig {
+    state.config_snapshot()
+}
+
 pub fn webrtc_settings(config: &configuration::WebRtcConfig) -> webrtc::Settings {
     webrtc::Settings {
         enabled: config.enabled,
