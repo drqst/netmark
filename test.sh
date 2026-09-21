@@ -93,8 +93,8 @@ check_contains "init.sh reports the phase of a failed command" \
 check_contains "stop.sh deletes the postgres and grafana deployments" \
   "$ROOT/stop.sh" "delete deployment netmark-postgres netmark-grafana"
 check_contains "stop.sh deletes the services" "$ROOT/stop.sh" "delete service"
-check_contains "stop.sh waits for pods to be gone" \
-  "$ROOT/stop.sh" "wait --for=delete pod --all"
+check_contains "stop.sh reports pod shutdown progress" \
+  "$ROOT/stop.sh" "Waiting for pods to terminate"
 check_contains "stop.sh also removes standalone pods" \
   "$ROOT/stop.sh" "delete pod --all"
 check_not_contains "stop.sh never deletes the data volume claim" \
@@ -118,6 +118,22 @@ check_contains "postgres reuses existing databases at the volume root" \
   "$ROOT/k8s/postgres.yaml" 'if \[ -s /var/lib/postgresql/data/PG_VERSION \]'
 check_contains "postgres never rolls out two writers on the volume" \
   "$ROOT/k8s/postgres.yaml" "type: Recreate"
+check_contains "postgres defaults to the requested admin user" \
+  "$ROOT/k8s/postgres.yaml" "POSTGRES_USER: admin"
+check_contains "postgres defaults to the requested password" \
+  "$ROOT/k8s/postgres.yaml" "POSTGRES_PASSWORD: password"
+check_contains "netmark never pulls its local image remotely" \
+  "$ROOT/k8s/postgres.yaml" "imagePullPolicy: Never"
+check_contains "netmark uses a loopback PostgreSQL connection URL" \
+  "$ROOT/k8s/postgres.yaml" "postgresql://%s:%s@127.0.0.1:5432/%s"
+check_contains "init.sh migrates credentials for existing PostgreSQL volumes" \
+  "$ROOT/init.sh" "configuring PostgreSQL credentials"
+check_contains "init.sh supports the legacy PostgreSQL role during migration" \
+  "$ROOT/init.sh" "postgres netmark"
+check_contains "grafana defaults to the requested admin user" \
+  "$ROOT/k8s/grafana.yaml" "value: admin"
+check_contains "grafana obtains the requested password from PostgreSQL credentials" \
+  "$ROOT/k8s/grafana.yaml" "key: POSTGRES_PASSWORD"
 
 # --- Live checks: a reachable cluster ------------------------------------
 
@@ -148,6 +164,22 @@ if command -v kubectl >/dev/null 2>&1 && kubectl cluster-info >/dev/null 2>&1; t
         case_ok "every pod in namespace $namespace is Running"
       else
         case_fail "every pod in namespace $namespace is Running" "$not_running pod(s) not Running"
+      fi
+
+      if postgres_version=$(kubectl -n "$namespace" exec deployment/netmark-postgres -c postgres -- \
+        sh -ec 'PGPASSWORD="$POSTGRES_PASSWORD" psql -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc "SELECT current_user"' 2>&1) \
+        && [ "$postgres_version" = "admin" ]; then
+        case_ok "postgres accepts the configured admin credentials"
+      else
+        case_fail "postgres accepts the configured admin credentials" "$postgres_version"
+      fi
+
+      if grafana_health=$(kubectl -n "$namespace" exec deployment/netmark-grafana -c grafana -- \
+        wget -qO- http://127.0.0.1:3000/api/health 2>&1) \
+        && printf '%s' "$grafana_health" | grep -q '"database":"ok"'; then
+        case_ok "grafana health endpoint reports a ready database"
+      else
+        case_fail "grafana health endpoint reports a ready database" "$grafana_health"
       fi
 
       pvc=$(kubectl -n "$namespace" get pvc netmark-postgres-data \

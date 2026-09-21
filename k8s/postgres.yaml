@@ -17,8 +17,8 @@ metadata:
   namespace: netmark
 type: Opaque
 stringData:
-  POSTGRES_USER: netmark
-  POSTGRES_PASSWORD: change-me
+  POSTGRES_USER: admin
+  POSTGRES_PASSWORD: password
   POSTGRES_DB: netmark
 ---
 apiVersion: v1
@@ -114,13 +114,16 @@ spec:
         # on a separate node with nothing to back it up.
         - name: netmark
           image: netmark-app:local
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Never
           command: ["/bin/sh", "-c"]
           # Write netmark.config next to the binary so the app picks up the
-          # external metrics database, then start the headless server.
+          # external metrics database after PostgreSQL accepts loopback
+          # connections, then start the headless server.
           args:
             - >-
-              printf 'metrics:\n  sql: "******netmark-postgres:5432/%s"\n'
+              until nc -z 127.0.0.1 5432; do sleep 2; done
+              &&
+              printf 'metrics:\n  sql: "postgresql://%s:%s@127.0.0.1:5432/%s"\n'
               "$POSTGRES_USER" "$POSTGRES_PASSWORD" "$POSTGRES_DB"
               > /opt/netmark/netmark.config
               && exec /opt/netmark/netmark --serve 0.0.0.0:8080

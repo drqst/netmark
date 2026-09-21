@@ -34,22 +34,32 @@ pkill -f "port-forward service/netmark-postgres" 2>/dev/null || true
 # volume claim (netmark-postgres-data) is never touched. Deleting the
 # manifests wholesale or the namespace itself would remove the PVC and lose
 # the PostgreSQL data.
+echo "Requesting netmark workload shutdown..."
 kubectl -n "$NAMESPACE" delete deployment netmark-postgres netmark-grafana \
-  --ignore-not-found --cascade=foreground --timeout=180s
-kubectl -n "$NAMESPACE" delete pod --all --ignore-not-found --timeout=180s
+  --ignore-not-found --cascade=foreground --wait=false
+kubectl -n "$NAMESPACE" delete pod --all --ignore-not-found --wait=false
 kubectl -n "$NAMESPACE" delete service netmark-postgres netmark-app netmark-grafana \
   --ignore-not-found
 kubectl -n "$NAMESPACE" delete configmap netmark-grafana-provisioning \
   netmark-grafana-dashboards --ignore-not-found
 
-# Wait until every pod is actually gone, not just marked for deletion.
-kubectl -n "$NAMESPACE" wait --for=delete pod --all --timeout=180s
-
-remaining=$(kubectl -n "$NAMESPACE" get pods -o name)
-if [ -n "$remaining" ]; then
-  echo "Pods remain in namespace $NAMESPACE; shutdown is incomplete." >&2
-  exit 1
-fi
+# PostgreSQL is allowed 120 seconds to flush and shut down cleanly. Report the
+# terminating pod names rather than leaving the caller with a silent wait.
+attempt=0
+while :; do
+  remaining=$(kubectl -n "$NAMESPACE" get pods -o name)
+  if [ -z "$remaining" ]; then
+    break
+  fi
+  if [ "$attempt" -ge 36 ]; then
+    echo "Pods remain in namespace $NAMESPACE after 180 seconds:" >&2
+    printf '%s\n' "$remaining" >&2
+    exit 1
+  fi
+  echo "Waiting for pods to terminate (${attempt}s elapsed): $remaining"
+  sleep 5
+  attempt=$((attempt + 5))
+done
 
 pvc_phase=$(kubectl -n "$NAMESPACE" get pvc netmark-postgres-data \
   -o jsonpath='{.status.phase}')

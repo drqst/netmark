@@ -69,7 +69,7 @@ data:
           "fieldConfig": {
             "defaults": {
               "custom": { "drawStyle": "line", "spanNulls": true },
-              "unit": "Bps"
+              "unit": "bytes"
             },
             "overrides": []
           },
@@ -81,11 +81,11 @@ data:
               "editorMode": "code",
               "format": "time_series",
               "rawQuery": true,
-              "rawSql": "SELECT $__timeGroupAlias(timestamp_utc::timestamptz, $__interval), run_id::text AS metric, AVG(sent_bytes_per_second) AS value FROM netmark_metrics WHERE $__timeFilter(timestamp_utc::timestamptz) AND ($run_id = 0 OR run_id = $run_id) GROUP BY 1, 2 ORDER BY 1",
+              "rawSql": "SELECT timestamp_utc::timestamptz AS time, 'Sent TCP, run ' || run_id::text AS metric, sent_tcp_bytes AS value FROM netmark_metrics WHERE protocol = 'tcp' AND $__timeFilter(timestamp_utc::timestamptz) AND ($run_id = 0 OR run_id = $run_id) UNION ALL SELECT timestamp_utc::timestamptz, 'Received TCP, run ' || run_id::text, received_tcp_bytes FROM netmark_metrics WHERE protocol = 'tcp' AND $__timeFilter(timestamp_utc::timestamptz) AND ($run_id = 0 OR run_id = $run_id) ORDER BY 1",
               "refId": "A"
             }
           ],
-          "title": "Upload bandwidth by run_id",
+          "title": "TCP traffic by run",
           "type": "timeseries"
         },
         {
@@ -93,7 +93,7 @@ data:
           "fieldConfig": {
             "defaults": {
               "custom": { "drawStyle": "line", "spanNulls": true },
-              "unit": "Bps"
+              "unit": "bytes"
             },
             "overrides": []
           },
@@ -105,11 +105,11 @@ data:
               "editorMode": "code",
               "format": "time_series",
               "rawQuery": true,
-              "rawSql": "SELECT $__timeGroupAlias(timestamp_utc::timestamptz, $__interval), run_id::text AS metric, AVG(received_bytes_per_second) AS value FROM netmark_metrics WHERE $__timeFilter(timestamp_utc::timestamptz) AND ($run_id = 0 OR run_id = $run_id) GROUP BY 1, 2 ORDER BY 1",
+              "rawSql": "SELECT timestamp_utc::timestamptz AS time, 'Sent SCTP, run ' || run_id::text AS metric, sent_tcp_bytes AS value FROM netmark_metrics WHERE protocol = 'sctp' AND $__timeFilter(timestamp_utc::timestamptz) AND ($run_id = 0 OR run_id = $run_id) UNION ALL SELECT timestamp_utc::timestamptz, 'Received SCTP, run ' || run_id::text, received_tcp_bytes FROM netmark_metrics WHERE protocol = 'sctp' AND $__timeFilter(timestamp_utc::timestamptz) AND ($run_id = 0 OR run_id = $run_id) ORDER BY 1",
               "refId": "A"
             }
           ],
-          "title": "Download bandwidth by run_id",
+          "title": "SCTP traffic by run",
           "type": "timeseries"
         },
         {
@@ -117,7 +117,7 @@ data:
           "fieldConfig": {
             "defaults": {
               "custom": { "drawStyle": "line", "spanNulls": true },
-              "unit": "ms"
+              "unit": "bytes"
             },
             "overrides": []
           },
@@ -129,11 +129,11 @@ data:
               "editorMode": "code",
               "format": "time_series",
               "rawQuery": true,
-              "rawSql": "SELECT $__timeGroupAlias(timestamp_utc::timestamptz, $__interval), run_id::text AS metric, AVG(jitter_millis) AS value FROM netmark_metrics WHERE $__timeFilter(timestamp_utc::timestamptz) AND ($run_id = 0 OR run_id = $run_id) GROUP BY 1, 2 ORDER BY 1",
+              "rawSql": "SELECT timestamp_utc::timestamptz AS time, 'Sent UDP, run ' || run_id::text AS metric, sent_udp_bytes AS value FROM netmark_metrics WHERE protocol = 'udp' AND $__timeFilter(timestamp_utc::timestamptz) AND ($run_id = 0 OR run_id = $run_id) UNION ALL SELECT timestamp_utc::timestamptz, 'Received UDP, run ' || run_id::text, received_udp_bytes FROM netmark_metrics WHERE protocol = 'udp' AND $__timeFilter(timestamp_utc::timestamptz) AND ($run_id = 0 OR run_id = $run_id) ORDER BY 1",
               "refId": "A"
             }
           ],
-          "title": "Jitter by run_id",
+          "title": "UDP traffic by run",
           "type": "timeseries"
         },
         {
@@ -141,7 +141,7 @@ data:
           "fieldConfig": {
             "defaults": {
               "custom": { "drawStyle": "line", "spanNulls": true },
-              "unit": "short"
+              "unit": "bytes"
             },
             "overrides": []
           },
@@ -153,11 +153,11 @@ data:
               "editorMode": "code",
               "format": "time_series",
               "rawQuery": true,
-              "rawSql": "SELECT $__timeGroupAlias(timestamp_utc::timestamptz, $__interval), run_id::text AS metric, AVG(lost_udp_packets) AS value FROM netmark_metrics WHERE $__timeFilter(timestamp_utc::timestamptz) AND ($run_id = 0 OR run_id = $run_id) GROUP BY 1, 2 ORDER BY 1",
+              "rawSql": "SELECT timestamp_utc::timestamptz AS time, 'Sent raw IP, run ' || run_id::text AS metric, sent_ip_bytes AS value FROM netmark_metrics WHERE protocol = 'ip' AND $__timeFilter(timestamp_utc::timestamptz) AND ($run_id = 0 OR run_id = $run_id) UNION ALL SELECT timestamp_utc::timestamptz, 'Received raw IP, run ' || run_id::text, received_ip_bytes FROM netmark_metrics WHERE protocol = 'ip' AND $__timeFilter(timestamp_utc::timestamptz) AND ($run_id = 0 OR run_id = $run_id) ORDER BY 1",
               "refId": "A"
             }
           ],
-          "title": "Lost UDP packets by run_id",
+          "title": "Raw IP traffic by run",
           "type": "timeseries"
         },
         {
@@ -171,11 +171,11 @@ data:
               "editorMode": "code",
               "format": "table",
               "rawQuery": true,
-              "rawSql": "SELECT timestamp_utc, run_id, sent_tcp_bytes, received_tcp_bytes, sent_udp_bytes, received_udp_bytes, sent_ip_bytes, received_ip_bytes, sent_bytes_per_second, received_bytes_per_second, lost_udp_packets, out_of_order_udp_packets, jitter_millis FROM netmark_metrics WHERE $__timeFilter(timestamp_utc::timestamptz) AND ($run_id = 0 OR run_id = $run_id) ORDER BY timestamp_utc DESC LIMIT 200",
+              "rawSql": "SELECT timestamp_utc, run_id, protocol, sent_tcp_bytes, received_tcp_bytes, sent_udp_bytes, received_udp_bytes, sent_ip_bytes, received_ip_bytes, sent_bytes_per_second, received_bytes_per_second, lost_udp_packets, out_of_order_udp_packets, jitter_millis FROM netmark_metrics WHERE $__timeFilter(timestamp_utc::timestamptz) AND ($run_id = 0 OR run_id = $run_id) ORDER BY timestamp_utc DESC LIMIT 200",
               "refId": "A"
             }
           ],
-          "title": "Metrics rows (run_id on every entry)",
+          "title": "Metrics rows by protocol",
           "type": "table"
         }
       ],

@@ -822,8 +822,9 @@ host, so after `init.sh` finishes:
 
 - the web interface and web CLI are at <http://127.0.0.1:8080>,
 - Grafana is at <http://127.0.0.1:3000> (anonymous viewer; admin password is the
-  PostgreSQL password), with a provisioned dashboard that groups bandwidth,
-  jitter and loss by `run_id`,
+  PostgreSQL password), with a provisioned PostgreSQL dashboard that shows
+  sent and received TCP, SCTP, UDP and raw-IP traffic in separate graphs by
+  `run_id`,
 - `./netmarkctl <command>` controls the same service from the shell,
 - PostgreSQL is port-forwarded to `127.0.0.1:5433` and the connection string is
   written into `netmark.config` for a host-side netmark, so both the local

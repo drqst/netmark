@@ -165,6 +165,7 @@ fn metrics_database_random_data_round_trip() {
     sink.write(
         &timestamp(),
         run_id,
+        "udp",
         &values,
         lost,
         out_of_order,
@@ -174,8 +175,15 @@ fn metrics_database_random_data_round_trip() {
     )
     .unwrap();
     drop(sink);
-    let row: (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) = Connection::open(&path)
-        .unwrap()
+    let connection = Connection::open(&path).unwrap();
+    let protocol: String = connection
+        .query_row(
+            "SELECT protocol FROM netmark_metrics WHERE run_id = ?1",
+            params![run_id],
+            |row| row.get(0),
+        )
+        .expect("no protocol found in netmark_metrics");
+    let row: (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) = connection
         .query_row(
             "SELECT run_id, sent_tcp_bytes, sent_udp_bytes, received_tcp_bytes, received_udp_bytes, lost_udp_packets, out_of_order_udp_packets, jitter_millis, sent_ip_bytes, received_ip_bytes, sent_bytes_per_second, received_bytes_per_second FROM netmark_metrics WHERE run_id = ?1",
             params![run_id],
@@ -197,6 +205,7 @@ fn metrics_database_random_data_round_trip() {
             },
         )
         .expect("no data found in netmark_metrics; write or read failed");
+    assert_eq!(protocol, "udp");
     assert_eq!(
         row,
         (
@@ -228,6 +237,7 @@ fn sqlite_metrics_can_be_read_back() {
     sink.write(
         "2026-08-28T00:00:00.000Z",
         7,
+        "tcp",
         &[1, 1024, 2, 2048, 3, 3072, 4, 4096, 8, 8192, 9, 9216],
         5,
         6,
@@ -325,7 +335,7 @@ fn three_second_udp_client_server_logs_match() {
     let external = ExternalSqlMetrics::connect(&format!("sqlite://{}", metrics_db_path.display()))
         .unwrap();
     external
-        .write(&timestamp(), run_id, &sent, 0, 0, 0, 0, 0)
+        .write(&timestamp(), run_id, "udp", &sent, 0, 0, 0, 0, 0)
         .unwrap();
     let client_log_path = test_dir.join("client.log");
     let server_log_path = test_dir.join("server.log");

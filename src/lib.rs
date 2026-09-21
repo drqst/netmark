@@ -362,6 +362,7 @@ pub fn record_final_metrics(
         let _ = sink.write(
             &core::timestamp(),
             run_id,
+            outcome.protocol,
             &metrics.run_totals(),
             lost,
             out_of_order,

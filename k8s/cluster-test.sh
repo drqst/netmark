@@ -88,7 +88,7 @@ else
 fi
 
 check "postgres accepts connections" kubectl -n "$namespace" exec \
-  deployment/netmark-postgres -c postgres -- pg_isready -U netmark
+  deployment/netmark-postgres -c postgres -- pg_isready -U admin -d netmark
 
 check "volume container owns the data volume" kubectl -n "$namespace" exec \
   deployment/netmark-postgres -c volume -- test -d /data
