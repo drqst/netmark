@@ -19,6 +19,68 @@ cargo build --release
 ./test.sh                                            # test init.sh/stop.sh and the volume persistence
 ```
 
+## Linux Release Bundle
+
+Build a portable `release/` directory for another Linux host with:
+
+```sh
+./package-release.sh
+scp -r release user@other-linux:/opt/netmark
+ssh user@other-linux 'cd /opt/netmark && ./netmark'
+```
+
+The directory contains `netmark` and `netmarkctl` side by side, plus the
+profiles, configuration, lifecycle scripts, Kubernetes manifests, and source
+build context required by `./init.sh`. On the target host, run `./check.sh` to
+see required Docker and Kubernetes prerequisites, then run `./init.sh` or use
+the binary directly:
+
+```sh
+cd /opt/netmark
+./netmark profiles/udp-10kbps.yaml
+./netmarkctl help
+```
+
+## Kubernetes Metrics
+
+`./init.sh` installs kind automatically on x86_64 Linux when it is missing,
+builds and loads the local application image, and returns to the prompt after
+PostgreSQL, netmark and Grafana are ready. PostgreSQL remains available through
+a background port-forward at `127.0.0.1:5433`; its log is
+`/tmp/netmark-postgres-port-forward.log`. `./stop.sh` removes the workloads,
+stops that port-forward, and returns after its bounded PostgreSQL shutdown wait.
+The database volume remains in place for the next startup.
+
+The local PostgreSQL and Grafana administrator credentials are `admin` /
+`password`; the database is `netmark`. Add other database accounts after
+startup when needed:
+
+```sh
+kubectl -n netmark exec deployment/netmark-postgres -c postgres -- \
+  psql -U admin -d netmark -c "CREATE ROLE analyst LOGIN PASSWORD 'change-me';"
+```
+
+Every completed run creates one `netmark_metrics` row. Its `protocol` column
+separates `tcp`, `sctp`, `udp`, and `ip` runs in the shared table. UDP sequence
+numbers are written to `lost_udp_packets` and `out_of_order_udp_packets` for
+each run. Grafana at <http://127.0.0.1:3000> includes TCP, SCTP, UDP and raw-IP
+panels that query these protocol-specific rows.
+
+```sh
+kubectl -n netmark exec deployment/netmark-postgres -c postgres -- \
+  psql -U admin -d netmark -c \
+  "SELECT run_id, lost_udp_packets, out_of_order_udp_packets
+   FROM netmark_metrics WHERE protocol = 'udp' ORDER BY timestamp_utc DESC;"
+```
+
+```sh
+./init.sh
+./netmarkctl run profiles/udp-10kbps.yaml
+curl -u admin:password http://127.0.0.1:3000/api/dashboards/uid/netmark-metrics-dash
+./k8s/cluster-test.sh
+./stop.sh
+```
+
 ## What it does
 
 - **Transports:** TCP, UDP, and raw IPv4 (protocol 253, needs `CAP_NET_RAW`).

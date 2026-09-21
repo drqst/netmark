@@ -9,7 +9,13 @@ fn main() {
         .and_then(|path| path.parent())
         .and_then(|path| path.parent())
         .expect("unexpected Cargo output layout");
-    for name in ["init.sh", "check.sh", "stop.sh", "netmark.config"] {
+    for name in [
+        "init.sh",
+        "check.sh",
+        "stop.sh",
+        "netmarkctl",
+        "netmark.config",
+    ] {
         let source = PathBuf::from(name);
         let destination = target_debug.join(name);
         if let Err(error) = fs::copy(&source, &destination) {

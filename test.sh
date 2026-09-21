@@ -71,6 +71,8 @@ done
 # for every pod to be Ready.
 check_contains "init.sh creates the kind cluster" \
   "$ROOT/init.sh" "kind create cluster"
+check_contains "init.sh installs a missing kind binary" \
+  "$ROOT/init.sh" "kind.sigs.k8s.io/dl/v0.33.0/kind-linux-amd64"
 check_contains "init.sh waits for all nodes to be Ready" \
   "$ROOT/init.sh" "wait --for=condition=Ready node --all"
 check_contains "init.sh deploys postgres" "$ROOT/init.sh" 'kubectl apply -f "$MANIFEST"'
@@ -86,6 +88,10 @@ check_contains "init.sh waits for all pods to be Ready" \
   "$ROOT/init.sh" "wait --for=condition=Ready pod --all"
 check_contains "init.sh reports the phase of a failed command" \
   "$ROOT/init.sh" "init.sh: failed during"
+check_not_contains "init.sh returns after starting the port-forward" \
+  "$ROOT/init.sh" 'wait "$FORWARD_PID"'
+check_contains "init.sh creates the netmark web port-forward" \
+  "$ROOT/init.sh" "port-forward service/netmark-app 8080:8080"
 
 # stop.sh must stop and remove every pod, but never the data volume: it may
 # only delete the deployments/services/configmaps, not the PVC, not the
@@ -134,6 +140,10 @@ check_contains "grafana defaults to the requested admin user" \
   "$ROOT/k8s/grafana.yaml" "value: admin"
 check_contains "grafana obtains the requested password from PostgreSQL credentials" \
   "$ROOT/k8s/grafana.yaml" "key: POSTGRES_PASSWORD"
+check_contains "grafana provisions the protocol dashboard" \
+  "$ROOT/k8s/grafana.yaml" "netmark-metrics-dash"
+check_contains "grafana dashboard has protocol panels" \
+  "$ROOT/k8s/grafana.yaml" "Raw IP traffic by run"
 
 # --- Live checks: a reachable cluster ------------------------------------
 
@@ -167,19 +177,33 @@ if command -v kubectl >/dev/null 2>&1 && kubectl cluster-info >/dev/null 2>&1; t
       fi
 
       if postgres_version=$(kubectl -n "$namespace" exec deployment/netmark-postgres -c postgres -- \
-        sh -ec 'PGPASSWORD="$POSTGRES_PASSWORD" psql -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc "SELECT current_user"' 2>&1) \
+        sh -ec 'PGPASSWORD=password psql -h 127.0.0.1 -U admin -d netmark -Atc "SELECT current_user"' 2>&1) \
         && [ "$postgres_version" = "admin" ]; then
-        case_ok "postgres accepts the configured admin credentials"
+        case_ok "postgres accepts admin/password credentials"
       else
-        case_fail "postgres accepts the configured admin credentials" "$postgres_version"
+        case_fail "postgres accepts admin/password credentials" "$postgres_version"
       fi
 
       if grafana_health=$(kubectl -n "$namespace" exec deployment/netmark-grafana -c grafana -- \
-        wget -qO- http://127.0.0.1:3000/api/health 2>&1) \
-        && printf '%s' "$grafana_health" | grep -q '"database":"ok"'; then
-        case_ok "grafana health endpoint reports a ready database"
+        wget -qO- --header='Authorization: Basic YWRtaW46cGFzc3dvcmQ=' \
+        http://127.0.0.1:3000/api/datasources/uid/netmark-metrics/health 2>&1) \
+        && printf '%s' "$grafana_health" \
+        | grep -qi '"status"[[:space:]]*:[[:space:]]*"ok"'; then
+        case_ok "grafana connects to PostgreSQL as admin"
       else
-        case_fail "grafana health endpoint reports a ready database" "$grafana_health"
+        case_fail "grafana connects to PostgreSQL as admin" "$grafana_health"
+      fi
+
+      if dashboard=$(kubectl -n "$namespace" exec deployment/netmark-grafana -c grafana -- \
+        wget -qO- --header='Authorization: Basic YWRtaW46cGFzc3dvcmQ=' \
+        http://127.0.0.1:3000/api/dashboards/uid/netmark-metrics-dash 2>&1) \
+        && printf '%s' "$dashboard" | grep -q 'TCP traffic by run' \
+        && printf '%s' "$dashboard" | grep -q 'SCTP traffic by run' \
+        && printf '%s' "$dashboard" | grep -q 'UDP traffic by run' \
+        && printf '%s' "$dashboard" | grep -q 'Raw IP traffic by run'; then
+        case_ok "grafana protocol dashboard is provisioned"
+      else
+        case_fail "grafana protocol dashboard is provisioned" "$dashboard"
       fi
 
       pvc=$(kubectl -n "$namespace" get pvc netmark-postgres-data \

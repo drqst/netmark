@@ -2,7 +2,9 @@ use crate::core::SqlState;
 use crate::metrics::ExternalSqlMetrics;
 use reqwest::blocking::Client;
 use std::fs::OpenOptions;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -14,14 +16,38 @@ use std::time::{Duration, Instant};
 /// disconnected while the monitor is running.
 pub type ExternalSql = Arc<Mutex<Option<Arc<ExternalSqlMetrics>>>>;
 
+#[derive(Clone, Copy)]
+pub enum MonitorProtocol {
+    Http,
+    Icmp,
+}
+
+impl MonitorProtocol {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "http" => Some(Self::Http),
+            "icmp" => Some(Self::Icmp),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Icmp => "icmp",
+        }
+    }
+}
+
 pub struct MonitorState {
-    target: Mutex<Option<String>>,
+    target: Mutex<Option<(MonitorProtocol, String)>>,
     running: AtomicBool,
     monitor_id: AtomicU64,
     next_monitor_id: AtomicU64,
     calls: AtomicU64,
     successes: AtomicU64,
     failures: AtomicU64,
+    interval_seconds: AtomicU64,
 }
 
 impl MonitorState {
@@ -34,14 +60,26 @@ impl MonitorState {
             calls: AtomicU64::new(0),
             successes: AtomicU64::new(0),
             failures: AtomicU64::new(0),
+            interval_seconds: AtomicU64::new(30),
         }
     }
-    pub fn set_target(&self, target: String) {
-        *self.target.lock().unwrap() = Some(target);
+    pub fn set_target(&self, protocol: MonitorProtocol, target: String) {
+        *self.target.lock().unwrap() = Some((protocol, target));
     }
     /// Subcommand: monitor start. Only the start status is kept locally; the
     /// checks themselves go to the external database.
     pub fn start(&self, log_dir: &Path, sql: &SqlState) -> Option<u64> {
+        self.start_with_interval(log_dir, sql, 30)
+    }
+    /// Subcommand: monitor start <seconds>.
+    pub fn start_with_interval(
+        &self,
+        log_dir: &Path,
+        sql: &SqlState,
+        interval_seconds: u64,
+    ) -> Option<u64> {
+        self.interval_seconds
+            .store(interval_seconds, Ordering::Relaxed);
         if self.running.swap(true, Ordering::Relaxed) {
             None
         } else {
@@ -92,16 +130,30 @@ impl MonitorState {
             };
             while !std::thread::panicking() {
                 if self.running.load(Ordering::Relaxed)
-                    && let Some(target) = self.target.lock().unwrap().clone()
+                    && let Some((protocol, target)) = self.target.lock().unwrap().clone()
                 {
                         let call_id = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
                         let timestamp = crate::core::timestamp();
                         let started = Instant::now();
-                        let result = client
-                            .get(&target)
-                            .send()
-                            .and_then(|response| response.error_for_status())
-                            .and_then(|response| response.bytes().map(|_| ()));
+                        let result: Result<(), String> = match protocol {
+                            MonitorProtocol::Http => client
+                                .get(&target)
+                                .send()
+                                .and_then(|response| response.error_for_status())
+                                .and_then(|response| response.bytes().map(|_| ()))
+                                .map_err(|error| error.to_string()),
+                            MonitorProtocol::Icmp => Command::new("ping")
+                                .args(["-c", "1", "-W", "10", &target])
+                                .output()
+                                .map_err(|error| error.to_string())
+                                .and_then(|output| {
+                                    if output.status.success() {
+                                        Ok(())
+                                    } else {
+                                        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+                                    }
+                                }),
+                        };
                         let latency_millis = started.elapsed().as_millis() as u64;
                         let (word, detail) = match result {
                             Ok(_) => {
@@ -138,6 +190,7 @@ impl MonitorState {
                                 &timestamp,
                                 self.monitor_id.load(Ordering::Relaxed),
                                 call_id,
+                                protocol.as_str(),
                                 &target,
                                 word,
                                 latency_millis,
@@ -151,10 +204,16 @@ impl MonitorState {
                             );
                         }
                 }
-                thread::sleep(Duration::from_secs(30));
+                thread::sleep(Duration::from_secs(
+                    self.interval_seconds.load(Ordering::Relaxed),
+                ));
             }
         });
     }
+}
+
+pub fn valid_icmp_target(value: &str) -> bool {
+    value.parse::<IpAddr>().is_ok()
 }
 
 impl Default for MonitorState {

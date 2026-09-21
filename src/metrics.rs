@@ -21,7 +21,8 @@ impl ExternalSqlMetrics {
                 Client::connect(connection_string, NoTls).map_err(|error| error.to_string())?;
             client.batch_execute("CREATE TABLE IF NOT EXISTS netmark_metrics (timestamp_utc TEXT NOT NULL, run_id BIGINT NOT NULL, sent_tcp_bytes BIGINT NOT NULL, sent_udp_bytes BIGINT NOT NULL, received_tcp_bytes BIGINT NOT NULL, received_udp_bytes BIGINT NOT NULL, lost_udp_packets BIGINT NOT NULL, out_of_order_udp_packets BIGINT NOT NULL, jitter_millis BIGINT NOT NULL, sent_ip_bytes BIGINT NOT NULL DEFAULT 0, received_ip_bytes BIGINT NOT NULL DEFAULT 0, sent_bytes_per_second BIGINT NOT NULL DEFAULT 0, received_bytes_per_second BIGINT NOT NULL DEFAULT 0)").map_err(|error| error.to_string())?;
             client.batch_execute("ALTER TABLE netmark_metrics ADD COLUMN IF NOT EXISTS protocol TEXT NOT NULL DEFAULT 'unknown'").map_err(|error| error.to_string())?;
-            client.batch_execute("CREATE TABLE IF NOT EXISTS netmark_monitor (timestamp_utc TEXT NOT NULL, monitor_id BIGINT NOT NULL, call_id BIGINT NOT NULL, target TEXT NOT NULL, result TEXT NOT NULL, latency_millis BIGINT NOT NULL, detail TEXT NOT NULL)").map_err(|error| error.to_string())?;
+            client.batch_execute("CREATE TABLE IF NOT EXISTS netmark_monitor (timestamp_utc TEXT NOT NULL, monitor_id BIGINT NOT NULL, call_id BIGINT NOT NULL, protocol TEXT NOT NULL DEFAULT 'http', target TEXT NOT NULL, result TEXT NOT NULL, latency_millis BIGINT NOT NULL, detail TEXT NOT NULL)").map_err(|error| error.to_string())?;
+            client.batch_execute("ALTER TABLE netmark_monitor ADD COLUMN IF NOT EXISTS protocol TEXT NOT NULL DEFAULT 'http'").map_err(|error| error.to_string())?;
             Ok(Self {
                 target: connection_string.to_string(),
                 backend: Mutex::new(Backend::Postgres(client)),
@@ -33,7 +34,8 @@ impl ExternalSqlMetrics {
             let connection = Connection::open(path).map_err(|error| error.to_string())?;
             connection.execute_batch("CREATE TABLE IF NOT EXISTS netmark_metrics (timestamp_utc TEXT NOT NULL, run_id INTEGER NOT NULL, sent_tcp_bytes INTEGER NOT NULL, sent_udp_bytes INTEGER NOT NULL, received_tcp_bytes INTEGER NOT NULL, received_udp_bytes INTEGER NOT NULL, lost_udp_packets INTEGER NOT NULL, out_of_order_udp_packets INTEGER NOT NULL, jitter_millis INTEGER NOT NULL, sent_ip_bytes INTEGER NOT NULL DEFAULT 0, received_ip_bytes INTEGER NOT NULL DEFAULT 0, sent_bytes_per_second INTEGER NOT NULL DEFAULT 0, received_bytes_per_second INTEGER NOT NULL DEFAULT 0)").map_err(|error| error.to_string())?;
             let _ = connection.execute_batch("ALTER TABLE netmark_metrics ADD COLUMN protocol TEXT NOT NULL DEFAULT 'unknown'");
-            connection.execute_batch("CREATE TABLE IF NOT EXISTS netmark_monitor (timestamp_utc TEXT NOT NULL, monitor_id INTEGER NOT NULL, call_id INTEGER NOT NULL, target TEXT NOT NULL, result TEXT NOT NULL, latency_millis INTEGER NOT NULL, detail TEXT NOT NULL)").map_err(|error| error.to_string())?;
+            connection.execute_batch("CREATE TABLE IF NOT EXISTS netmark_monitor (timestamp_utc TEXT NOT NULL, monitor_id INTEGER NOT NULL, call_id INTEGER NOT NULL, protocol TEXT NOT NULL DEFAULT 'http', target TEXT NOT NULL, result TEXT NOT NULL, latency_millis INTEGER NOT NULL, detail TEXT NOT NULL)").map_err(|error| error.to_string())?;
+            let _ = connection.execute_batch("ALTER TABLE netmark_monitor ADD COLUMN protocol TEXT NOT NULL DEFAULT 'http'");
             Ok(Self {
                 target: connection_string.to_string(),
                 backend: Mutex::new(Backend::Sqlite(connection)),
@@ -115,6 +117,7 @@ impl ExternalSqlMetrics {
         timestamp: &str,
         monitor_id: u64,
         call_id: u64,
+        protocol: &str,
         target: &str,
         result: &str,
         latency_millis: u64,
@@ -123,11 +126,12 @@ impl ExternalSqlMetrics {
         match &mut *self.backend.lock().unwrap() {
             Backend::Sqlite(connection) => connection
                 .execute(
-                    "INSERT INTO netmark_monitor VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    "INSERT INTO netmark_monitor (timestamp_utc, monitor_id, call_id, protocol, target, result, latency_millis, detail) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                     params![
                         timestamp,
                         monitor_id,
                         call_id,
+                        protocol,
                         target,
                         result,
                         latency_millis,
@@ -138,11 +142,12 @@ impl ExternalSqlMetrics {
                 .map_err(|error| error.to_string()),
             Backend::Postgres(client) => client
                 .execute(
-                    "INSERT INTO netmark_monitor VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                    "INSERT INTO netmark_monitor (timestamp_utc, monitor_id, call_id, protocol, target, result, latency_millis, detail) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
                     &[
                         &timestamp,
                         &(monitor_id as i64),
                         &(call_id as i64),
+                        &protocol,
                         &target,
                         &result,
                         &(latency_millis as i64),

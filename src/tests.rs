@@ -257,6 +257,42 @@ fn sqlite_metrics_can_be_read_back() {
 }
 
 #[test]
+fn metrics_rows_are_partitioned_by_protocol() {
+    let path = std::env::temp_dir().join(format!(
+        "netmark-protocol-metrics-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let sink = ExternalSqlMetrics::connect(&format!("sqlite://{}", path.display())).unwrap();
+    let values = [0, 100, 0, 200, 0, 300, 0, 400, 0, 500, 0, 600];
+    for (run_id, protocol) in [(1, "tcp"), (2, "sctp"), (3, "udp"), (4, "ip")] {
+        sink.write(
+            "2026-09-21T00:00:00.000Z",
+            run_id,
+            protocol,
+            &values,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+        .unwrap();
+    }
+    drop(sink);
+    let connection = Connection::open(&path).unwrap();
+    let protocols: Vec<String> = connection
+        .prepare("SELECT protocol FROM netmark_metrics ORDER BY run_id")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(protocols, ["tcp", "sctp", "udp", "ip"]);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn three_second_udp_client_server_logs_match() {
     let _test_lock = TIMED_TEST_LOCK.lock().unwrap();
     let started = Instant::now();
@@ -2098,7 +2134,8 @@ fn the_kubernetes_cluster_includes_grafana_and_a_test_script() {
         "postgres accepts connections",
         "web server reports live status",
         "web CLI answers the status command",
-        "grafana reports healthy",
+        "grafana datasource reaches PostgreSQL",
+        "grafana protocol dashboard is provisioned",
     ] {
         assert!(cases.contains(expectation), "no cluster test for {expectation}");
     }
@@ -2202,15 +2239,17 @@ esac
 [ "$1 $2" = '-n lifecycle-test' ] || exit 99
 shift 2
 case "$*" in
-  'delete deployment netmark-postgres netmark-grafana --ignore-not-found --cascade=foreground --timeout=180s')
+    'delete deployment netmark-postgres netmark-grafana --ignore-not-found --cascade=foreground --wait=false')
     [ "$SCENARIO" != delete-failure ] ;;
-  'delete pod --all --ignore-not-found --timeout=180s') exit 0 ;;
+    'delete pod --all --ignore-not-found --wait=false') exit 0 ;;
   'delete service netmark-postgres netmark-app netmark-grafana --ignore-not-found') exit 0 ;;
   'delete configmap netmark-grafana-provisioning netmark-grafana-dashboards --ignore-not-found') exit 0 ;;
   'wait --for=delete pod --all --timeout=180s') [ "$SCENARIO" != timeout ] ;;
   'get pods -o name')
     [ "$SCENARIO" != list-failure ] || exit 1
-    [ "$SCENARIO" != remaining ] || echo pod/still-running
+        case "$SCENARIO" in
+            remaining|timeout) echo pod/still-running ;;
+        esac
     exit 0 ;;
   'get pvc netmark-postgres-data -o jsonpath={.status.phase}')
     [ "$SCENARIO" != missing-pvc ] || exit 1
@@ -2248,6 +2287,14 @@ esac
             .env("NAMESPACE", "lifecycle-test")
             .env("SCENARIO", scenario)
             .env("CALL_LOG", &log)
+            .env(
+                "STOP_TIMEOUT_SECONDS",
+                if scenario == "timeout" || scenario == "remaining" {
+                    "0"
+                } else {
+                    "360"
+                },
+            )
             .output()
             .unwrap();
         assert_eq!(

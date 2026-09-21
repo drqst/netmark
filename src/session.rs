@@ -339,22 +339,41 @@ impl Session {
             }
             ["metrics", ..] => "metrics: enable | disable | status".to_string(),
             // Command: monitor
-            ["monitor"] => "monitor: IP <url> | start | stop | history".to_string(),
-            ["monitor", "IP", target] | ["monitor", "ip", target] => {
+            ["monitor"] => "monitor: <http|icmp> <URL|IP> | start [seconds] | stop | history".to_string(),
+            ["monitor", protocol, target] if protocol.eq_ignore_ascii_case("http") => {
                 let target = cli::normalize_http_target(target);
-                self.monitor.set_target(target.clone());
-                format!("monitor target set to {target}")
+                self.monitor
+                    .set_target(crate::monitor::MonitorProtocol::Http, target.clone());
+                format!("HTTP monitor target set to {target}")
+            }
+            ["monitor", protocol, target] if protocol.eq_ignore_ascii_case("icmp") => {
+                if !crate::monitor::valid_icmp_target(target) {
+                    return "ICMP monitor target must be an IP address".to_string();
+                }
+                self.monitor
+                    .set_target(crate::monitor::MonitorProtocol::Icmp, (*target).to_string());
+                format!("ICMP monitor target set to {target}")
             }
             ["monitor", "start"] => match self.monitor.start(&self.log_dir, &self.sql) {
                 Some(id) => format!("monitor started {id}"),
                 None => "monitor already running".to_string(),
+            },
+            ["monitor", "start", seconds] => match seconds.parse::<u64>() {
+                Ok(seconds) if seconds > 0 => match self
+                    .monitor
+                    .start_with_interval(&self.log_dir, &self.sql, seconds)
+                {
+                    Some(id) => format!("monitor started {id}; checking every {seconds} seconds"),
+                    None => "monitor already running".to_string(),
+                },
+                _ => "monitor interval must be a positive number of seconds".to_string(),
             },
             ["monitor", "stop"] => {
                 self.monitor.stop(&self.log_dir, &self.sql);
                 "monitor stopped".to_string()
             }
             ["monitor", "history"] => show_monitor_history(&self.log_dir),
-            ["monitor", ..] => "monitor: IP <url> | start | stop | history".to_string(),
+            ["monitor", ..] => "monitor: <http|icmp> <URL|IP> | start [seconds] | stop | history".to_string(),
             // Command: selftest
             ["selftest"] => run_selftest(
                 &self.config,

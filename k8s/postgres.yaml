@@ -49,7 +49,7 @@ spec:
       labels:
         app: netmark-postgres
     spec:
-      terminationGracePeriodSeconds: 120
+      terminationGracePeriodSeconds: 300
       affinity:
         nodeAffinity:
           # Prefer the dedicated database node from kind-config.yaml, but still

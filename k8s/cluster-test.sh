@@ -93,32 +93,47 @@ check "postgres accepts connections" kubectl -n "$namespace" exec \
 check "volume container owns the data volume" kubectl -n "$namespace" exec \
   deployment/netmark-postgres -c volume -- test -d /data
 
-grafana=${NETMARK_GRAFANA:-http://127.0.0.1:3000}
-
-if command -v curl >/dev/null 2>&1; then
-  status=$(curl -fsS --max-time 5 "$web/api/v1/status" 2>&1)
+if command -v kubectl >/dev/null 2>&1; then
+  status=$(kubectl -n "$namespace" exec deployment/netmark-postgres -c netmark -- \
+    wget -qO- http://127.0.0.1:8080/api/v1/status 2>&1)
   if [ $? -eq 0 ] && printf '%s' "$status" | grep -q '"running"'; then
     case_ok "web server reports live status"
   else
     case_fail "web server reports live status" "$(printf '%s' "$status" | tr '\n' ' ')"
   fi
 
-  reply=$(curl -fsS --max-time 5 -X POST "$web/api/v1/cli" \
-    -H 'Content-Type: application/json' -d '{"command":"status"}' 2>&1)
+  reply=$(kubectl -n "$namespace" exec deployment/netmark-postgres -c netmark -- \
+    wget -qO- --header='Content-Type: application/json' \
+    --post-data='{"command":"status"}' http://127.0.0.1:8080/api/v1/cli 2>&1)
   if [ $? -eq 0 ] && printf '%s' "$reply" | grep -q 'Web server'; then
     case_ok "web CLI answers the status command"
   else
     case_fail "web CLI answers the status command" "$(printf '%s' "$reply" | tr '\n' ' ')"
   fi
 
-  grafana_health=$(curl -fsS --max-time 5 "$grafana/api/health" 2>&1)
-  if [ $? -eq 0 ] && printf '%s' "$grafana_health" | grep -qi 'database'; then
-    case_ok "grafana reports healthy"
+  grafana_health=$(kubectl -n "$namespace" exec deployment/netmark-grafana -c grafana -- \
+    wget -qO- --header='Authorization: Basic YWRtaW46cGFzc3dvcmQ=' \
+    http://127.0.0.1:3000/api/datasources/uid/netmark-metrics/health 2>&1)
+  if [ $? -eq 0 ] && printf '%s' "$grafana_health" \
+    | grep -qi '"status"[[:space:]]*:[[:space:]]*"ok"'; then
+    case_ok "grafana datasource reaches PostgreSQL"
   else
-    case_fail "grafana reports healthy" "$(printf '%s' "$grafana_health" | tr '\n' ' ')"
+    case_fail "grafana datasource reaches PostgreSQL" "$(printf '%s' "$grafana_health" | tr '\n' ' ')"
+  fi
+
+  dashboard=$(kubectl -n "$namespace" exec deployment/netmark-grafana -c grafana -- \
+    wget -qO- --header='Authorization: Basic YWRtaW46cGFzc3dvcmQ=' \
+    http://127.0.0.1:3000/api/dashboards/uid/netmark-metrics-dash 2>&1)
+  if [ $? -eq 0 ] && printf '%s' "$dashboard" | grep -q 'TCP traffic by run' \
+    && printf '%s' "$dashboard" | grep -q 'SCTP traffic by run' \
+    && printf '%s' "$dashboard" | grep -q 'UDP traffic by run' \
+    && printf '%s' "$dashboard" | grep -q 'Raw IP traffic by run'; then
+    case_ok "grafana protocol dashboard is provisioned"
+  else
+    case_fail "grafana protocol dashboard is provisioned" "$(printf '%s' "$dashboard" | tr '\n' ' ')"
   fi
 else
-  case_fail "web server is reachable" "curl is missing"
+  case_fail "web server is reachable" "kubectl is missing"
 fi
 
 printf '\n%d cases, %d failed\n' "$cases" "$failures"

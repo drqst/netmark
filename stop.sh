@@ -10,6 +10,7 @@ set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 NAMESPACE=${NAMESPACE:-netmark}
+STOP_TIMEOUT_SECONDS=${STOP_TIMEOUT_SECONDS:-360}
 
 if ! command -v kubectl >/dev/null 2>&1; then
   echo "kubectl is required" >&2
@@ -27,8 +28,9 @@ if [ -z "$namespace" ]; then
   exit 0
 fi
 
-# End the PostgreSQL port-forward init.sh left running on 127.0.0.1:5433.
+# End the PostgreSQL and web port-forwards init.sh left running on the host.
 pkill -f "port-forward service/netmark-postgres" 2>/dev/null || true
+pkill -f "port-forward service/netmark-app" 2>/dev/null || true
 
 # Delete the workloads and their Services, one by one, so the persistent
 # volume claim (netmark-postgres-data) is never touched. Deleting the
@@ -43,7 +45,7 @@ kubectl -n "$NAMESPACE" delete service netmark-postgres netmark-app netmark-graf
 kubectl -n "$NAMESPACE" delete configmap netmark-grafana-provisioning \
   netmark-grafana-dashboards --ignore-not-found
 
-# PostgreSQL is allowed 120 seconds to flush and shut down cleanly. Report the
+# PostgreSQL is allowed six minutes to flush and shut down cleanly. Report the
 # terminating pod names rather than leaving the caller with a silent wait.
 attempt=0
 while :; do
@@ -51,8 +53,8 @@ while :; do
   if [ -z "$remaining" ]; then
     break
   fi
-  if [ "$attempt" -ge 36 ]; then
-    echo "Pods remain in namespace $NAMESPACE after 180 seconds:" >&2
+  if [ "$attempt" -ge "$STOP_TIMEOUT_SECONDS" ]; then
+    echo "Pods remain in namespace $NAMESPACE after ${STOP_TIMEOUT_SECONDS} seconds:" >&2
     printf '%s\n' "$remaining" >&2
     exit 1
   fi

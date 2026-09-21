@@ -1470,12 +1470,12 @@ pub fn help_rows() -> Vec<Vec<String>> {
             "reset configuration to defaults and reload netmark.config".into(),
         ],
         vec![
-            "monitor IP <url>".into(),
-            "set HTTP or HTTPS monitor target".into(),
+            "monitor <http|icmp> <URL|IP>".into(),
+            "set an HTTP URL or ICMP IP monitor target".into(),
         ],
         vec![
-            "monitor start | stop".into(),
-            "start or stop 30-second checks".into(),
+            "monitor start [seconds] | stop".into(),
+            "start checks every 30 seconds or the requested interval".into(),
         ],
         vec![
             "monitor history".into(),
