@@ -1,0 +1,170 @@
+# The netmark cluster keeps four containers: this file holds the PostgreSQL
+# container, the volume container that inspects the data volume, and the netmark
+# web server container itself, all in one pod so the always-on local
+# log/netmark.sqlite sits on the same pod (and the same data volume) as the
+# external PostgreSQL it complements; netmark.yaml holds only the Service that
+# exposes the web server; grafana.yaml holds Grafana for the external metrics
+# database.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: netmark
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: netmark-postgres
+  namespace: netmark
+type: Opaque
+stringData:
+  POSTGRES_USER: admin
+  POSTGRES_PASSWORD: password
+  POSTGRES_DB: netmark
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: netmark-postgres-data
+  namespace: netmark
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: netmark-postgres
+  namespace: netmark
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: netmark-postgres
+  template:
+    metadata:
+      labels:
+        app: netmark-postgres
+    spec:
+      terminationGracePeriodSeconds: 300
+      affinity:
+        nodeAffinity:
+          # Prefer the dedicated database node from kind-config.yaml, but still
+          # schedule on single-node clusters such as Docker Desktop.
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: netmark.io/role
+                    operator: In
+                    values: [database]
+      containers:
+        - name: postgres
+          image: timescale/timescaledb:latest-pg16
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: postgres
+              containerPort: 5432
+          envFrom:
+            - secretRef:
+                name: netmark-postgres
+          env:
+            # initdb stores the database, WAL and configuration files here,
+            # separate from netmark-log and any filesystem lost+found directory.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              # Keep databases initialized at the old volume root in place.
+              if [ -s /var/lib/postgresql/data/PG_VERSION ]; then
+                export PGDATA=/var/lib/postgresql/data
+              fi
+              exec docker-entrypoint.sh postgres
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+        # The volume container inspects the same persistent volume as PostgreSQL.
+        # Storage belongs to the PVC, not this container, and survives pod deletion.
+        - name: volume
+          image: alpine:3.20
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - >-
+              test -w /data || echo "warning: the data volume is not writable";
+              while true; do
+              echo "netmark data volume: $(df -h /data | tail -n 1)";
+              sleep 300;
+              done
+          volumeMounts:
+            - name: data
+              mountPath: /data
+        # The netmark web server itself. It runs in this same pod (rather than a
+        # pod of its own) so its always-on local log/netmark.sqlite lands on the
+        # same data volume as the external PostgreSQL, instead of being stranded
+        # on a separate node with nothing to back it up.
+        - name: netmark
+          image: netmark-app:local
+          imagePullPolicy: Never
+          command: ["/bin/sh", "-c"]
+          # Write netmark.config next to the binary so the app picks up the
+          # external metrics database after PostgreSQL accepts loopback
+          # connections, then start the headless server.
+          args:
+            - >-
+              until nc -z 127.0.0.1 5432; do sleep 2; done
+              &&
+              printf 'metrics:\n  sql: "postgresql://%s:%s@127.0.0.1:5432/%s"\n'
+              "$POSTGRES_USER" "$POSTGRES_PASSWORD" "$POSTGRES_DB"
+              > /opt/netmark/netmark.config
+              && exec /opt/netmark/netmark --serve 0.0.0.0:8080
+          envFrom:
+            - secretRef:
+                name: netmark-postgres
+          ports:
+            - name: web
+              containerPort: 8080
+            - name: traffic-tcp
+              containerPort: 9000
+            - name: traffic-udp
+              containerPort: 9001
+              protocol: UDP
+          readinessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: web
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          volumeMounts:
+            # subPath keeps the sqlite log directory out of PostgreSQL's own
+            # data directory while still living on the same volume/pod.
+            - name: data
+              mountPath: /opt/netmark/log
+              subPath: netmark-log
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: netmark-postgres-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: netmark-postgres
+  namespace: netmark
+spec:
+  type: ClusterIP
+  selector:
+    app: netmark-postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
