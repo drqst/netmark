@@ -1,0 +1,25 @@
+# Raw IPv4 traffic: netmark's payload carried directly in IP packets with no
+# transport header, using protocol number 253. Opening a raw socket needs
+# CAP_NET_RAW, so run as root or: sudo setcap cap_net_raw+ep target/release/netmark
+server:
+  enabled: true
+clients:
+  - id: 0
+    enabled: true
+    remote: 127.0.0.1
+traffic:
+  udp_rate: 20
+  packet_type: ip
+  tcp_bytes_per_second: 1024
+  udp_packet_size: 1024
+  client_runtime: 3
+  server_runtime: 3
+  jitter_millis: 0
+  client_jitter_millis: 0
+  server_jitter_millis: 0
+  max_tcp_jitter_millis: 1000
+  max_udp_jitter_millis: 1000
+  limit: 0
+metrics:
+  sql: null
+duration_seconds: 3

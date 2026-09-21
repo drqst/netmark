@@ -1,0 +1,140 @@
+#!/bin/sh
+# Test cases for a running netmark Kubernetes cluster. Run it after init.sh:
+#
+#   ./k8s/cluster-test.sh
+#
+# Every case prints "ok" or "FAIL"; the script exits non-zero if any case fails,
+# so it can be used as a smoke test in a pipeline.
+set -u
+
+namespace=${NETMARK_NAMESPACE:-netmark}
+web=${NETMARK_WEB:-http://127.0.0.1:8080}
+failures=0
+cases=0
+
+case_ok() {
+  cases=$((cases + 1))
+  printf '%-46s ok\n' "$1"
+}
+
+case_fail() {
+  cases=$((cases + 1))
+  failures=$((failures + 1))
+  # Kubernetes errors are long and repetitive, so only the tail of the first
+  # line is kept: that is the part that names the actual problem.
+  printf '%-46s FAIL: %s\n' "$1" "$(printf '%s' "$2" | tr "\n" " " | tail -c 160)"
+}
+
+check() {
+  name=$1
+  shift
+  output=$("$@" 2>&1)
+  if [ $? -eq 0 ]; then
+    case_ok "$name"
+  else
+    case_fail "$name" "$(printf '%s' "$output" | tr '\n' ' ')"
+  fi
+}
+
+if ! command -v kubectl >/dev/null 2>&1; then
+  printf 'kubectl is missing - install it and run init.sh first\n' >&2
+  exit 1
+fi
+
+check "kubernetes api reachable" kubectl cluster-info
+check "namespace $namespace exists" kubectl get namespace "$namespace"
+
+# The cluster is four containers: postgres, its volume container and the
+# netmark web server all in one pod (so log/netmark.sqlite lives with the
+# external PostgreSQL), plus Grafana graphing the external metrics DB.
+containers=$(kubectl -n "$namespace" get deployment netmark-postgres \
+  -o jsonpath='{.spec.template.spec.containers[*].name}' 2>/dev/null)
+case " $containers " in
+  *" postgres "*) case_ok "postgres container is deployed" ;;
+  *) case_fail "postgres container is deployed" "containers: ${containers:-none}" ;;
+esac
+case " $containers " in
+  *" volume "*) case_ok "volume container is deployed" ;;
+  *) case_fail "volume container is deployed" "containers: ${containers:-none}" ;;
+esac
+case " $containers " in
+  *" netmark "*) case_ok "netmark container shares the postgres pod" ;;
+  *) case_fail "netmark container shares the postgres pod" "containers: ${containers:-none}" ;;
+esac
+
+grafana_containers=$(kubectl -n "$namespace" get deployment netmark-grafana \
+  -o jsonpath='{.spec.template.spec.containers[*].name}' 2>/dev/null)
+case " $grafana_containers " in
+  *" grafana "*) case_ok "grafana container is deployed" ;;
+  *) case_fail "grafana container is deployed" "containers: ${grafana_containers:-none}" ;;
+esac
+
+for deployment in netmark-postgres netmark-grafana; do
+  ready=$(kubectl -n "$namespace" get deployment "$deployment" \
+    -o jsonpath='{.status.readyReplicas}' 2>/dev/null)
+  if [ "${ready:-0}" -ge 1 ] 2>/dev/null; then
+    case_ok "deployment $deployment is ready"
+  else
+    case_fail "deployment $deployment is ready" "ready replicas: ${ready:-0}"
+  fi
+done
+
+bound=$(kubectl -n "$namespace" get pvc netmark-postgres-data \
+  -o jsonpath='{.status.phase}' 2>/dev/null)
+if [ "$bound" = "Bound" ]; then
+  case_ok "data volume is bound"
+else
+  case_fail "data volume is bound" "phase: ${bound:-missing}"
+fi
+
+check "postgres accepts connections" kubectl -n "$namespace" exec \
+  deployment/netmark-postgres -c postgres -- pg_isready -U admin -d netmark
+
+check "volume container owns the data volume" kubectl -n "$namespace" exec \
+  deployment/netmark-postgres -c volume -- test -d /data
+
+if command -v kubectl >/dev/null 2>&1; then
+  status=$(kubectl -n "$namespace" exec deployment/netmark-postgres -c netmark -- \
+    wget -qO- http://127.0.0.1:8080/api/v1/status 2>&1)
+  if [ $? -eq 0 ] && printf '%s' "$status" | grep -q '"running"'; then
+    case_ok "web server reports live status"
+  else
+    case_fail "web server reports live status" "$(printf '%s' "$status" | tr '\n' ' ')"
+  fi
+
+  reply=$(kubectl -n "$namespace" exec deployment/netmark-postgres -c netmark -- \
+    wget -qO- --header='Content-Type: application/json' \
+    --post-data='{"command":"status"}' http://127.0.0.1:8080/api/v1/cli 2>&1)
+  if [ $? -eq 0 ] && printf '%s' "$reply" | grep -q 'Web server'; then
+    case_ok "web CLI answers the status command"
+  else
+    case_fail "web CLI answers the status command" "$(printf '%s' "$reply" | tr '\n' ' ')"
+  fi
+
+  grafana_health=$(kubectl -n "$namespace" exec deployment/netmark-grafana -c grafana -- \
+    wget -qO- --header='Authorization: Basic YWRtaW46cGFzc3dvcmQ=' \
+    http://127.0.0.1:3000/api/datasources/uid/netmark-metrics/health 2>&1)
+  if [ $? -eq 0 ] && printf '%s' "$grafana_health" \
+    | grep -qi '"status"[[:space:]]*:[[:space:]]*"ok"'; then
+    case_ok "grafana datasource reaches PostgreSQL"
+  else
+    case_fail "grafana datasource reaches PostgreSQL" "$(printf '%s' "$grafana_health" | tr '\n' ' ')"
+  fi
+
+  dashboard=$(kubectl -n "$namespace" exec deployment/netmark-grafana -c grafana -- \
+    wget -qO- --header='Authorization: Basic YWRtaW46cGFzc3dvcmQ=' \
+    http://127.0.0.1:3000/api/dashboards/uid/netmark-metrics-dash 2>&1)
+  if [ $? -eq 0 ] && printf '%s' "$dashboard" | grep -q 'TCP traffic by run' \
+    && printf '%s' "$dashboard" | grep -q 'SCTP traffic by run' \
+    && printf '%s' "$dashboard" | grep -q 'UDP traffic by run' \
+    && printf '%s' "$dashboard" | grep -q 'Raw IP traffic by run'; then
+    case_ok "grafana protocol dashboard is provisioned"
+  else
+    case_fail "grafana protocol dashboard is provisioned" "$(printf '%s' "$dashboard" | tr '\n' ' ')"
+  fi
+else
+  case_fail "web server is reachable" "kubectl is missing"
+fi
+
+printf '\n%d cases, %d failed\n' "$cases" "$failures"
+[ "$failures" -eq 0 ] || exit 1

@@ -1,0 +1,28 @@
+# UDP traffic wrapped in WebRTC data-channel frames, spread over two channels.
+server:
+  enabled: true
+clients:
+  - id: 0
+    enabled: true
+    remote: 127.0.0.1
+traffic:
+  udp_rate: 20
+  packet_type: udp
+  tcp_bytes_per_second: 10240
+  udp_packet_size: 1024
+  client_runtime: 3
+  server_runtime: 3
+  jitter_millis: 0
+  client_jitter_millis: 0
+  server_jitter_millis: 0
+  max_tcp_jitter_millis: 1000
+  max_udp_jitter_millis: 1000
+  limit: 0
+webrtc:
+  enabled: true
+  channels: 2
+  label: netmark
+  ordered: true
+metrics:
+  sql: null
+duration_seconds: 3

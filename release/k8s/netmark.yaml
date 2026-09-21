@@ -1,0 +1,20 @@
+# The web interface (a web CLI that takes the same commands as the shell CLI,
+# with a live stats panel above it) and REST API on port 8080 are served by the
+# "netmark" container, which now runs inside the same pod as PostgreSQL (see
+# postgres.yaml) so its always-on local log/netmark.sqlite lives on that pod's
+# data volume. This file only holds the Service that exposes it; Grafana, which
+# graphs the external metrics database, is deployed by grafana.yaml.
+apiVersion: v1
+kind: Service
+metadata:
+  name: netmark-app
+  namespace: netmark
+spec:
+  type: NodePort
+  selector:
+    app: netmark-postgres
+  ports:
+    - name: web
+      port: 8080
+      targetPort: web
+      nodePort: 30080
